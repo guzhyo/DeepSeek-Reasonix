@@ -31,7 +31,7 @@ jobs:
             go build -ldflags="-s -w" -trimpath \
             -o android/app/src/main/jniLibs/arm64-v8a/libreasonix.so \
             ./cmd/reasonix
-          echo "Go binary built: $(ls -lh android/app/src/main/jniLibs/arm64-v8a/libreasonix.so)"
+          ls -lh android/app/src/main/jniLibs/arm64-v8a/libreasonix.so
 
       - name: Set up JDK 17
         uses: actions/setup-java@v4
@@ -44,11 +44,21 @@ jobs:
         with:
           packages: 'platforms;android-34 build-tools;34.0.0 ndk;25.2.9519653 cmake;3.22.1'
 
-      - name: Setup Gradle
+      - name: Setup Gradle Wrapper
         working-directory: android
         run: |
-          gradle wrapper --gradle-version 8.2
+          # Download Gradle 8.7 to bootstrap wrapper (AGP 8.1.4 compatible)
+          curl -sL "https://services.gradle.org/distributions/gradle-8.7-bin.zip" -o /tmp/gradle.zip
+          unzip -q /tmp/gradle.zip -d /tmp/
+          # Temporarily move build.gradle so bootstrapper doesn't eval it
+          mv build.gradle build.gradle.bak 2>/dev/null || true
+          mv app/build.gradle app/build.gradle.bak 2>/dev/null || true
+          /tmp/gradle-8.7/bin/gradle wrapper --gradle-version 8.7
+          mv build.gradle.bak build.gradle 2>/dev/null || true
+          mv app/build.gradle.bak app/build.gradle 2>/dev/null || true
           chmod +x gradlew
+          echo "Gradle wrapper version:"
+          ./gradlew --version | head -3
 
       - name: Build APK
         working-directory: android
