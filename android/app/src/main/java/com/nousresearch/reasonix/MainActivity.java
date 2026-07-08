@@ -4,6 +4,7 @@ import android.app.Activity;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
+import android.os.Environment;
 import android.view.ViewGroup;
 import android.webkit.WebChromeClient;
 import android.webkit.WebSettings;
@@ -14,6 +15,7 @@ import android.widget.TextView;
 import android.widget.Toast;
 import java.io.BufferedReader;
 import java.io.File;
+import java.io.FileInputStream;
 import java.io.InputStreamReader;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
@@ -28,8 +30,6 @@ public class MainActivity extends Activity {
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         mainHandler = new Handler(Looper.getMainLooper());
-
-        // Extract binary and launch
         new Thread(new Runnable() {
             public void run() { extractAndLaunch(); }
         }).start();
@@ -38,22 +38,42 @@ public class MainActivity extends Activity {
     private void extractAndLaunch() {
         try {
             String libDir = getApplicationInfo().nativeLibraryDir;
-            File source = new File(libDir, "libreasonix.so");
+            File binary = new File(libDir, "libreasonix.so");
+            File appCfg = new File(getFilesDir(), "reasonix.toml");
 
-            // Write config
-            File cfgFile = new File(getFilesDir(), "reasonix.toml");
-            String apiKey = "YOUR_DEEPSEEK_API_KEY";  // TODO: config screen
-            String cfg = "[model]\ndefault = \"deepseek-v4-flash\"\n\n"
-                + "[provider.deepseek]\napi_key = \"" + apiKey + "\"\n"
-                + "api_base = \"https://api.deepseek.com/v1\"\n\n"
-                + "[sandbox]\nbash = \"off\"\n";
-            java.io.FileWriter fw = new java.io.FileWriter(cfgFile);
-            fw.write(cfg);
-            fw.close();
+            // Try shared storage config first
+            File sharedCfg = new File(
+                Environment.getExternalStorageDirectory(),
+                "termux_workspace/reasonix.toml");
+
+            if (!sharedCfg.exists()) {
+                // Check other common locations
+                sharedCfg = new File("/sdcard/termux_workspace/reasonix.toml");
+            }
+
+            if (sharedCfg.exists()) {
+                // Copy shared config to app dir
+                copyFile(sharedCfg, appCfg);
+            } else if (!appCfg.exists()) {
+                // No config found — write a minimal one with note
+                String cfg = "# No config found. Create reasonix.toml in\n"
+                    + "# /sdcard/termux_workspace/ with your API key.\n"
+                    + "# Example:\n"
+                    + "# [provider.deepseek]\n"
+                    + "# api_key = \"sk-...\"\n"
+                    + "# api_base = \"https://api.deepseek.com/v1\"\n"
+                    + "# [model]\n"
+                    + "# default = \"deepseek-v4-flash\"\n"
+                    + "# [sandbox]\n"
+                    + "# bash = \"off\"\n";
+                java.io.FileWriter fw = new java.io.FileWriter(appCfg);
+                fw.write(cfg);
+                fw.close();
+            }
 
             // Start serve process
             ProcessBuilder pb = new ProcessBuilder(
-                source.getAbsolutePath(),
+                binary.getAbsolutePath(),
                 "serve",
                 "--addr", "127.0.0.1:0"
             );
@@ -66,21 +86,12 @@ public class MainActivity extends Activity {
             BufferedReader reader = new BufferedReader(
                 new InputStreamReader(serveProcess.getInputStream()));
             Pattern portPattern = Pattern.compile("127\\.0\\.0\\.1:(\\d+)");
-
             String line;
             while ((line = reader.readLine()) != null) {
                 Matcher m = portPattern.matcher(line);
                 if (m.find()) {
                     servePort = Integer.parseInt(m.group(1));
                     break;
-                }
-                if (line.contains("serve")) {
-                    // Try to find any port in the line
-                    Matcher m2 = Pattern.compile(":(\\d{4,5})").matcher(line);
-                    if (m2.find()) {
-                        servePort = Integer.parseInt(m2.group(1));
-                        break;
-                    }
                 }
             }
 
@@ -91,16 +102,29 @@ public class MainActivity extends Activity {
                 });
             } else {
                 mainHandler.post(new Runnable() {
-                    public void run() { showError("Could not find serve port"); }
+                    public void run() {
+                        showError("Could not find serve port.\n\n"
+                            + "Put reasonix.toml in /sdcard/termux_workspace/");
+                    }
                 });
             }
 
         } catch (Exception e) {
             final String msg = e.getMessage();
             mainHandler.post(new Runnable() {
-                public void run() { showError("Launch failed: " + msg); }
+                public void run() { showError("Launch: " + msg); }
             });
         }
+    }
+
+    private void copyFile(File src, File dst) throws Exception {
+        FileInputStream in = new FileInputStream(src);
+        java.io.FileOutputStream out = new java.io.FileOutputStream(dst);
+        byte[] buf = new byte[8192];
+        int n;
+        while ((n = in.read(buf)) > 0) out.write(buf, 0, n);
+        in.close();
+        out.close();
     }
 
     private void setupWebView(int port) {
@@ -112,13 +136,12 @@ public class MainActivity extends Activity {
         settings.setMixedContentMode(WebSettings.MIXED_CONTENT_ALWAYS_ALLOW);
 
         webView.setWebViewClient(new WebViewClient() {
-            public void onReceivedError(WebView view, int errorCode, 
+            public void onReceivedError(WebView view, int errorCode,
                 String description, String failingUrl) {
-                Toast.makeText(MainActivity.this, 
-                    "WebView error: " + description, Toast.LENGTH_LONG).show();
+                Toast.makeText(MainActivity.this,
+                    "Error: " + description, Toast.LENGTH_LONG).show();
             }
         });
-
         webView.setWebChromeClient(new WebChromeClient());
 
         FrameLayout layout = new FrameLayout(this);
@@ -128,15 +151,14 @@ public class MainActivity extends Activity {
                 ViewGroup.LayoutParams.MATCH_PARENT));
         setContentView(layout);
 
-        String url = "http://127.0.0.1:" + port + "/";
-        webView.loadUrl(url);
+        webView.loadUrl("http://127.0.0.1:" + port + "/");
     }
 
     private void showError(String message) {
         FrameLayout layout = new FrameLayout(this);
         TextView errorText = new TextView(this);
-        errorText.setText("Error: " + message);
-        errorText.setTextSize(16);
+        errorText.setText(message);
+        errorText.setTextSize(14);
         errorText.setPadding(48, 48, 48, 48);
         layout.addView(errorText,
             new FrameLayout.LayoutParams(
@@ -147,8 +169,6 @@ public class MainActivity extends Activity {
 
     protected void onDestroy() {
         super.onDestroy();
-        if (serveProcess != null) {
-            serveProcess.destroy();
-        }
+        if (serveProcess != null) serveProcess.destroy();
     }
 }
