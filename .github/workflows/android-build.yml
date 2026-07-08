@@ -42,23 +42,19 @@ jobs:
       - name: Setup Android SDK
         uses: android-actions/setup-android@v3
         with:
-          packages: 'platforms;android-34 build-tools;34.0.0 ndk;25.2.9519653 cmake;3.22.1'
+          packages: 'platforms;android-34 build-tools;34.0.0'
 
       - name: Setup Gradle Wrapper
         working-directory: android
         run: |
-          # Download Gradle 8.7 to bootstrap wrapper (AGP 8.1.4 compatible)
           curl -sL "https://services.gradle.org/distributions/gradle-8.7-bin.zip" -o /tmp/gradle.zip
           unzip -q /tmp/gradle.zip -d /tmp/
-          # Temporarily move build.gradle so bootstrapper doesn't eval it
           mv build.gradle build.gradle.bak 2>/dev/null || true
           mv app/build.gradle app/build.gradle.bak 2>/dev/null || true
           /tmp/gradle-8.7/bin/gradle wrapper --gradle-version 8.7
           mv build.gradle.bak build.gradle 2>/dev/null || true
           mv app/build.gradle.bak app/build.gradle 2>/dev/null || true
           chmod +x gradlew
-          echo "Gradle wrapper version:"
-          ./gradlew --version | head -3
 
       - name: Build APK
         working-directory: android
