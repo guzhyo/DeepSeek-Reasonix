@@ -131,8 +131,18 @@ public class MainActivity extends Activity {
         new Thread(new Runnable() {
             public void run() {
                 try {
-                    String libDir = getApplicationInfo().nativeLibraryDir;
-                    File binary = new File(libDir, "libreasonix.so");
+                    // Extract binary from assets (works on all devices)
+                    File binary = new File(getFilesDir(), "reasonix");
+                    if (!binary.exists()) {
+                        java.io.InputStream in = getAssets().open("reasonix");
+                        java.io.FileOutputStream out = new java.io.FileOutputStream(binary);
+                        byte[] buf = new byte[8192];
+                        int n;
+                        while ((n = in.read(buf)) > 0) out.write(buf, 0, n);
+                        in.close();
+                        out.close();
+                        binary.setExecutable(true);
+                    }
 
                     // Write config to app private dir
                     File cfgFile = new File(getFilesDir(), "reasonix.toml");
