@@ -66,6 +66,7 @@ jobs:
           echo "APK: $APK"
           # Generate debug keystore if needed
           if [ ! -f ~/.android/debug.keystore ]; then
+            mkdir -p ~/.android
             keytool -genkey -v -keystore ~/.android/debug.keystore \
               -alias androiddebugkey -keyalg RSA -keysize 2048 -validity 10000 \
               -storepass android -keypass android \
