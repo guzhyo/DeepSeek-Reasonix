@@ -15,7 +15,6 @@ import android.webkit.WebView;
 import android.webkit.WebViewClient;
 import android.widget.Button;
 import android.widget.EditText;
-import android.widget.FrameLayout;
 import android.widget.LinearLayout;
 import android.widget.TextView;
 import java.io.BufferedReader;
@@ -86,12 +85,11 @@ public class MainActivity extends Activity {
         Button saveBtn = new Button(this);
         saveBtn.setText("Save & Launch");
         saveBtn.setTextSize(16);
-        saveBtn.setPadding(32, 16, 32, 16);
-        LinearLayout.LayoutParams btnParams = new LinearLayout.LayoutParams(
+        LinearLayout.LayoutParams bp = new LinearLayout.LayoutParams(
             ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
-        btnParams.topMargin = 32;
-        btnParams.gravity = Gravity.CENTER_HORIZONTAL;
-        saveBtn.setLayoutParams(btnParams);
+        bp.topMargin = 32;
+        bp.gravity = Gravity.CENTER_HORIZONTAL;
+        saveBtn.setLayoutParams(bp);
 
         TextView statusText = new TextView(this);
         statusText.setTextSize(12);
@@ -102,12 +100,8 @@ public class MainActivity extends Activity {
             public void onClick(View v) {
                 String key = keyInput.getText().toString().trim();
                 String base = baseInput.getText().toString().trim();
-                if (key.isEmpty()) {
-                    statusText.setText("Please enter API key");
-                    return;
-                }
-                prefs.edit().putString("api_key", key)
-                    .putString("api_base", base).apply();
+                if (key.isEmpty()) { statusText.setText("Please enter API key"); return; }
+                prefs.edit().putString("api_key", key).putString("api_base", base).apply();
                 statusText.setText("Saving...");
                 startServe(key);
             }
@@ -118,8 +112,27 @@ public class MainActivity extends Activity {
         setContentView(layout);
     }
 
+    private File findBinary() {
+        // Primary: nativeLibraryDir
+        String nativeDir = getApplicationInfo().nativeLibraryDir;
+        File f = new File(nativeDir, "libreasonix.so");
+        if (f.exists()) return f;
+
+        // Fallback: search all ABI subdirs under lib/
+        File libDir = new File(nativeDir).getParentFile();
+        if (libDir != null && libDir.isDirectory()) {
+            File[] subs = libDir.listFiles();
+            if (subs != null) {
+                for (File sub : subs) {
+                    File c = new File(sub, "libreasonix.so");
+                    if (c.exists()) return c;
+                }
+            }
+        }
+        return null;
+    }
+
     private void startServe(String apiKey) {
-        // Show loading
         LinearLayout layout = new LinearLayout(this);
         layout.setGravity(Gravity.CENTER);
         TextView loading = new TextView(this);
@@ -131,20 +144,15 @@ public class MainActivity extends Activity {
         new Thread(new Runnable() {
             public void run() {
                 try {
-                    // Extract binary from assets (works on all devices)
-                    File binary = new File(getFilesDir(), "reasonix");
-                    if (!binary.exists()) {
-                        java.io.InputStream in = getAssets().open("reasonix");
-                        java.io.FileOutputStream out = new java.io.FileOutputStream(binary);
-                        byte[] buf = new byte[8192];
-                        int n;
-                        while ((n = in.read(buf)) > 0) out.write(buf, 0, n);
-                        in.close();
-                        out.close();
-                        binary.setExecutable(true);
+                    File binary = findBinary();
+                    if (binary == null) {
+                        mainHandler.post(new Runnable() {
+                            public void run() { showError("Binary not found"); }
+                        });
+                        return;
                     }
 
-                    // Write config to app private dir
+                    // Write config
                     File cfgFile = new File(getFilesDir(), "reasonix.toml");
                     String base = prefs.getString("api_base", "https://api.deepseek.com/v1");
                     String cfg = "[model]\ndefault = \"deepseek-v4-flash\"\n\n"
@@ -170,10 +178,7 @@ public class MainActivity extends Activity {
                     String line;
                     while ((line = reader.readLine()) != null) {
                         Matcher m = pat.matcher(line);
-                        if (m.find()) {
-                            servePort = Integer.parseInt(m.group(1));
-                            break;
-                        }
+                        if (m.find()) { servePort = Integer.parseInt(m.group(1)); break; }
                     }
 
                     final int port = servePort;
@@ -199,10 +204,8 @@ public class MainActivity extends Activity {
         s.setJavaScriptEnabled(true);
         s.setDomStorageEnabled(true);
         s.setMixedContentMode(WebSettings.MIXED_CONTENT_ALWAYS_ALLOW);
-
         webView.setWebViewClient(new WebViewClient());
         webView.setWebChromeClient(new WebChromeClient());
-
         setContentView(webView);
         webView.loadUrl("http://127.0.0.1:" + port + "/");
     }
