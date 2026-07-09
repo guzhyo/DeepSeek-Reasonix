@@ -64,8 +64,14 @@ jobs:
         run: |
           APK="${{ github.workspace }}/android/app/build/outputs/apk/debug/app-debug.apk"
           echo "APK: $APK"
-          ls -la "$APK"
-          # Extract arm64-v8a binary and inject as arm64
+          # Generate debug keystore if needed
+          if [ ! -f ~/.android/debug.keystore ]; then
+            keytool -genkey -v -keystore ~/.android/debug.keystore \
+              -alias androiddebugkey -keyalg RSA -keysize 2048 -validity 10000 \
+              -storepass android -keypass android \
+              -dname "CN=Android Debug,O=Android,C=US"
+          fi
+          # Inject lib/arm64/libreasonix.so
           mkdir -p /tmp/apkfix/lib/arm64
           unzip -o "$APK" "lib/arm64-v8a/libreasonix.so" -d /tmp/apkfix/
           cp /tmp/apkfix/lib/arm64-v8a/libreasonix.so /tmp/apkfix/lib/arm64/libreasonix.so
@@ -74,14 +80,9 @@ jobs:
           # Re-sign
           $ANDROID_HOME/build-tools/34.0.0/apksigner sign \
             --ks ~/.android/debug.keystore \
-            --ks-pass pass:android \
-            "$APK" 2>/dev/null || \
-          $ANDROID_HOME/build-tools/34.0.0/apksigner sign \
-            --ks ~/.android/debug.keystore \
-            --ks-pass pass:android \
-            "$APK"
+            --ks-pass pass:android --ks-key-alias androiddebugkey \
+            --key-pass pass:android "$APK"
           echo "Re-signed"
-          # Verify
           unzip -l "$APK" | grep libreasonix
 
       - name: Upload APK
