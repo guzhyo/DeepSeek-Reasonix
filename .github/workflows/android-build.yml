@@ -60,6 +60,28 @@ jobs:
         working-directory: android
         run: ./gradlew assembleDebug --stacktrace --no-daemon
 
+      - name: Inject arm64 ABI for Huawei devices
+        run: |
+          APK=$(ls android/app/build/outputs/apk/debug/*.apk | head -1)
+          echo "APK: $APK"
+          # Extract arm64-v8a binary and inject as arm64
+          mkdir -p /tmp/apkfix/lib/arm64
+          unzip -o "$APK" "lib/arm64-v8a/libreasonix.so" -d /tmp/apkfix/
+          cp /tmp/apkfix/lib/arm64-v8a/libreasonix.so /tmp/apkfix/lib/arm64/libreasonix.so
+          cd /tmp/apkfix && zip -0 -r "$APK" lib/
+          echo "Injected lib/arm64/libreasonix.so"
+          # Re-sign
+          $ANDROID_HOME/build-tools/34.0.0/apksigner sign \
+            --ks ~/.android/debug.keystore \
+            --ks-pass pass:android \
+            --key-pass pass:android \
+            "$APK" 2>/dev/null || \
+          $ANDROID_HOME/build-tools/34.0.0/apksigner sign \
+            --ks ~/.android/debug.keystore \
+            --ks-pass pass:android \
+            "$APK"
+          echo "Re-signed"
+
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:

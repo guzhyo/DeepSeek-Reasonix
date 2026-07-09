@@ -19,13 +19,10 @@ import android.widget.LinearLayout;
 import android.widget.TextView;
 import java.io.BufferedReader;
 import java.io.File;
-import java.io.FileOutputStream;
 import java.io.FileWriter;
-import java.io.InputStream;
 import java.io.InputStreamReader;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
-import java.util.zip.ZipFile;
 
 public class MainActivity extends Activity {
 
@@ -116,69 +113,22 @@ public class MainActivity extends Activity {
     }
 
     private String findBinaryPath() {
-        StringBuilder diag = new StringBuilder();
-
-        // Strategy 1: extract from APK's lib/ to app dir
-        try {
-            String apkPath = getApplicationInfo().sourceDir;
-            diag.append("APK: ").append(apkPath).append("\n");
-            ZipFile zf = new ZipFile(apkPath);
-            java.util.Enumeration entries = zf.entries();
-            while (entries.hasMoreElements()) {
-                String name = ((java.util.zip.ZipEntry) entries.nextElement()).getName();
-                if (name.endsWith("libreasonix.so")) {
-                    diag.append("Found in APK: ").append(name).append("\n");
-                    // Extract to app private dir
-                    File dest = new File(getFilesDir(), "reasonix");
-                    if (!dest.exists() || dest.length() == 0) {
-                        InputStream in = zf.getInputStream(zf.getEntry(name));
-                        FileOutputStream out = new FileOutputStream(dest);
-                        byte[] buf = new byte[8192];
-                        int n;
-                        while ((n = in.read(buf)) > 0) out.write(buf, 0, n);
-                        in.close();
-                        out.close();
-                        dest.setExecutable(true, false);
-                    }
-                    zf.close();
-                    if (dest.exists() && dest.canExecute()) {
-                        return dest.getAbsolutePath();
-                    }
-                    diag.append("Extracted but can't execute: ").append(dest.getAbsolutePath()).append("\n");
-                }
-            }
-            zf.close();
-        } catch (Exception e) {
-            diag.append("Zip error: ").append(e.getMessage()).append("\n");
-        }
-
-        // Strategy 2: check nativeLibraryDir and sibling dirs
+        // nativeLibraryDir now includes lib/arm64/ after APK injection
         String nativeDir = getApplicationInfo().nativeLibraryDir;
-        diag.append("NativeDir: ").append(nativeDir).append("\n");
         File f = new File(nativeDir, "libreasonix.so");
         if (f.exists()) return f.getAbsolutePath();
 
+        // Fallback: search sibling ABI dirs
         File libDir = new File(nativeDir).getParentFile();
         if (libDir != null && libDir.isDirectory()) {
             File[] subs = libDir.listFiles();
             if (subs != null) {
-                diag.append("Lib subdirs: ");
                 for (File sub : subs) {
-                    diag.append(sub.getName()).append(" ");
                     File c = new File(sub, "libreasonix.so");
                     if (c.exists()) return c.getAbsolutePath();
                 }
-                diag.append("\n");
             }
         }
-
-        // Store diagnostic for error display
-        try {
-            FileWriter fw = new FileWriter(new File(getFilesDir(), "diag.txt"));
-            fw.write(diag.toString());
-            fw.close();
-        } catch (Exception e) {}
-
         return null;
     }
 
@@ -196,21 +146,8 @@ public class MainActivity extends Activity {
                 try {
                     String binaryPath = findBinaryPath();
                     if (binaryPath == null) {
-                        // Read diagnostic
-                        String diag = "";
-                        try {
-                            File f = new File(getFilesDir(), "diag.txt");
-                            if (f.exists()) {
-                                byte[] b = new byte[(int) f.length()];
-                                java.io.FileInputStream fi = new java.io.FileInputStream(f);
-                                fi.read(b);
-                                fi.close();
-                                diag = new String(b);
-                            }
-                        } catch (Exception e) {}
-                        final String msg = diag.isEmpty() ? "Binary not found" : diag;
                         mainHandler.post(new Runnable() {
-                            public void run() { showError(msg); }
+                            public void run() { showError("Binary not found"); }
                         });
                         return;
                     }
