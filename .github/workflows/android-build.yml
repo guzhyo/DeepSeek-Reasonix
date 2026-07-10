@@ -31,6 +31,10 @@ jobs:
             go build -ldflags="-s -w" -trimpath \
             -o android/app/src/main/jniLibs/arm64-v8a/libreasonix.so \
             ./cmd/reasonix
+          # Also copy to arm64 for Huawei devices
+          mkdir -p android/app/src/main/jniLibs/arm64
+          cp android/app/src/main/jniLibs/arm64-v8a/libreasonix.so \
+             android/app/src/main/jniLibs/arm64/libreasonix.so
           ls -lh android/app/src/main/jniLibs/arm64-v8a/libreasonix.so
 
       - name: Set up JDK 17

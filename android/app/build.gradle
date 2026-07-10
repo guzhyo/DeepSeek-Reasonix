@@ -34,17 +34,3 @@ android {
 
 dependencies {
 }
-
-// Copy native libs to arm64/ for Huawei devices after merge
-tasks.register('copyArm64Libs', Copy) {
-    dependsOn 'mergeDebugNativeLibs'
-    from layout.buildDirectory.dir('intermediates/merged_jni_libs/debug/mergeDebugJniLibFolders/out/arm64-v8a')
-    into layout.buildDirectory.dir('intermediates/merged_jni_libs/debug/mergeDebugJniLibFolders/out/arm64')
-    include '*.so'
-}
-
-tasks.whenTaskAdded { task ->
-    if (task.name == 'mergeDebugNativeLibs') {
-        task.finalizedBy 'copyArm64Libs'
-    }
-}
