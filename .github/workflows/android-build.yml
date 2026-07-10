@@ -64,21 +64,32 @@ jobs:
         run: |
           APK="${{ github.workspace }}/android/app/build/outputs/apk/debug/app-debug.apk"
           echo "APK: $APK"
-          # Generate debug keystore if needed
-          if [ ! -f ~/.android/debug.keystore ]; then
-            mkdir -p ~/.android
-            keytool -genkey -v -keystore ~/.android/debug.keystore \
-              -alias androiddebugkey -keyalg RSA -keysize 2048 -validity 10000 \
-              -storepass android -keypass android \
-              -dname "CN=Android Debug,O=Android,C=US"
-          fi
-          # Inject lib/arm64/libreasonix.so
-          mkdir -p /tmp/apkfix/lib/arm64
-          unzip -o "$APK" "lib/arm64-v8a/libreasonix.so" -d /tmp/apkfix/
-          cp /tmp/apkfix/lib/arm64-v8a/libreasonix.so /tmp/apkfix/lib/arm64/libreasonix.so
-          cd /tmp/apkfix && zip -0 -r "$APK" lib/
-          echo "Injected lib/arm64/libreasonix.so"
-          # Re-sign
+          python3 << 'PYEOF'
+          import zipfile, os
+          apk_path = os.environ['APK_PATH']
+          tmp = apk_path + '.tmp'
+          with zipfile.ZipFile(apk_path, 'r') as zin:
+              data = zin.read('lib/arm64-v8a/libreasonix.so')
+              with zipfile.ZipFile(tmp, 'w', zipfile.ZIP_DEFLATED) as zout:
+                  for item in zin.infolist():
+                      if not item.filename.startswith('META-INF/'):
+                          zout.writestr(item, zin.read(item.filename))
+                  info = zipfile.ZipInfo('lib/arm64/libreasonix.so')
+                  zout.writestr(info, data)
+          os.replace(tmp, apk_path)
+          print(f'APK updated: {os.path.getsize(apk_path)} bytes')
+          PYEOF
+        env:
+          APK_PATH: ${{ github.workspace }}/android/app/build/outputs/apk/debug/app-debug.apk
+
+      - name: Re-sign APK
+        run: |
+          APK="${{ github.workspace }}/android/app/build/outputs/apk/debug/app-debug.apk"
+          mkdir -p ~/.android
+          keytool -genkey -v -keystore ~/.android/debug.keystore \
+            -alias androiddebugkey -keyalg RSA -keysize 2048 -validity 10000 \
+            -storepass android -keypass android \
+            -dname "CN=Android Debug,O=Android,C=US" 2>/dev/null || true
           $ANDROID_HOME/build-tools/34.0.0/apksigner sign \
             --ks ~/.android/debug.keystore \
             --ks-pass pass:android --ks-key-alias androiddebugkey \
