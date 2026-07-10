@@ -34,26 +34,3 @@ android {
 
 dependencies {
 }
-
-// After mergeDebugNativeLibs, directly modify the packaging input
-tasks.whenTaskAdded { task ->
-    if (task.name == 'packageDebug') {
-        task.doFirst {
-            // Find the merged native libs output
-            def mergedDir = file("$buildDir/intermediates/merged_jni_libs/debug/out")
-            if (mergedDir.exists()) {
-                def srcDir = new File(mergedDir, 'arm64-v8a')
-                def dstDir = new File(mergedDir, 'arm64')
-                if (srcDir.exists()) {
-                    dstDir.mkdirs()
-                    copy {
-                        from srcDir
-                        into dstDir
-                        include '*.so'
-                    }
-                    logger.lifecycle("Injected arm64/ native libs before packaging")
-                }
-            }
-        }
-    }
-}

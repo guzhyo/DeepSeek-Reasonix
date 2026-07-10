@@ -31,10 +31,6 @@ jobs:
             go build -ldflags="-s -w" -trimpath \
             -o android/app/src/main/jniLibs/arm64-v8a/libreasonix.so \
             ./cmd/reasonix
-          # Also copy to arm64 for Huawei devices
-          mkdir -p android/app/src/main/jniLibs/arm64
-          cp android/app/src/main/jniLibs/arm64-v8a/libreasonix.so \
-             android/app/src/main/jniLibs/arm64/libreasonix.so
           ls -lh android/app/src/main/jniLibs/arm64-v8a/libreasonix.so
 
       - name: Set up JDK 17
@@ -63,6 +59,9 @@ jobs:
       - name: Build APK
         working-directory: android
         run: ./gradlew assembleDebug --stacktrace --no-daemon
+
+      - name: Inject arm64 ABI + re-sign
+        run: python3 android/inject_arm64.py android/app/build/outputs/apk/debug/app-debug.apk
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
