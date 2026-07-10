@@ -34,3 +34,25 @@ android {
 
 dependencies {
 }
+
+// After mergeDebugNativeLibs, copy .so to arm64/ inside the merged libs output
+tasks.whenTaskAdded { task ->
+    if (task.name == 'mergeDebugNativeLibs') {
+        task.doLast {
+            def outDir = task.outputDir
+            if (outDir != null && outDir.exists()) {
+                def srcDir = new File(outDir, 'arm64-v8a')
+                def dstDir = new File(outDir, 'arm64')
+                if (srcDir.exists()) {
+                    dstDir.mkdirs()
+                    copy {
+                        from srcDir
+                        into dstDir
+                        include '*.so'
+                    }
+                    logger.lifecycle("Copied native libs to arm64/ for Huawei compat")
+                }
+            }
+        }
+    }
+}
