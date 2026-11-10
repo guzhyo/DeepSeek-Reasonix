@@ -11,13 +11,14 @@ import (
 	tea "charm.land/bubbletea/v2"
 
 	"reasonix/internal/agent"
+	"reasonix/internal/config"
 	"reasonix/internal/control"
 	"reasonix/internal/event"
 	"reasonix/internal/provider"
 )
 
-// TestResumeDispatchOpensPicker proves bare "/resume" writes the session list
-// to the scrollback (above the input) AND opens the interactive picker overlay.
+// TestResumeDispatchOpensPicker proves bare "/resume" opens the interactive
+// picker without duplicating the same list in transcript scrollback.
 func TestResumeDispatchOpensPicker(t *testing.T) {
 	dir := t.TempDir()
 	saveTestSession(t, filepath.Join(dir, "a.jsonl"), "alpha prompt")
@@ -26,7 +27,7 @@ func TestResumeDispatchOpensPicker(t *testing.T) {
 	exec := agent.New(nil, nil, agent.NewSession("sys"), agent.Options{}, event.Discard)
 	m := newTestChatTUI()
 	m.width = 80
-	m.ctrl = control.New(control.Options{Executor: exec, SessionDir: dir, Label: "test"})
+	m.ctrl = newOwnedTestController(t, control.Options{Executor: exec, SessionDir: dir, Label: "test"})
 
 	if cmd := m.runSlashCommand("/resume"); cmd != nil {
 		t.Fatal("/resume should not return a tea.Cmd")
@@ -34,13 +35,197 @@ func TestResumeDispatchOpensPicker(t *testing.T) {
 	if m.resumePick == nil {
 		t.Fatal("bare /resume should open the picker")
 	}
-	if len(m.resumePick.sessions) != 2 {
-		t.Fatalf("picker should have 2 sessions, got %d", len(m.resumePick.sessions))
+	if len(m.resumePick.entries) != 2 {
+		t.Fatalf("picker should have 2 sessions, got %d", len(m.resumePick.entries))
 	}
-	// Session list must also appear in the scrollback transcript (above input).
 	out := strings.Join(m.transcript, "\n")
-	if !strings.Contains(out, "alpha prompt") || !strings.Contains(out, "beta prompt") {
-		t.Fatalf("scrollback should contain session previews:\n%s", out)
+	if strings.Contains(out, "alpha prompt") || strings.Contains(out, "beta prompt") {
+		t.Fatalf("picker previews should not be duplicated in scrollback:\n%s", out)
+	}
+}
+
+func TestOrderResumeSessionsGroupsRecoveryCopiesAndPrefersNewestLeaf(t *testing.T) {
+	base := time.Date(2026, 8, 3, 12, 0, 0, 0, time.UTC)
+	root := agent.SessionInfo{Path: "/sessions/root.jsonl", ModTime: base.Add(4 * time.Minute)}
+	olderLeaf := agent.SessionInfo{
+		Path: "/sessions/recovery-old.jsonl", ModTime: base.Add(2 * time.Minute),
+		Recovered: true, ParentID: "root",
+	}
+	newerLeaf := agent.SessionInfo{
+		Path: "/sessions/recovery-new.jsonl", ModTime: base.Add(3 * time.Minute),
+		Recovered: true, ParentID: "root",
+	}
+	other := agent.SessionInfo{Path: "/sessions/other.jsonl", ModTime: base.Add(time.Minute)}
+
+	got := orderResumeSessions([]agent.SessionInfo{root, newerLeaf, olderLeaf, other})
+	want := []string{newerLeaf.Path, olderLeaf.Path, root.Path, other.Path}
+	if len(got) != len(want) {
+		t.Fatalf("ordered sessions len = %d, want %d", len(got), len(want))
+	}
+	for i := range want {
+		if got[i].Path != want[i] {
+			t.Fatalf("ordered[%d] = %q, want %q (all=%v)", i, got[i].Path, want[i], got)
+		}
+	}
+}
+
+func TestNewestResumeTargetIgnoresRecoveryPickerLeafPreference(t *testing.T) {
+	dir := t.TempDir()
+	rootPath := filepath.Join(dir, "root.jsonl")
+	recoveryPath := filepath.Join(dir, "recovery.jsonl")
+	saveTestSession(t, rootPath, "latest parent prompt")
+	saveTestSession(t, recoveryPath, "older recovery prompt")
+
+	base := time.Date(2026, 8, 3, 12, 0, 0, 0, time.UTC)
+	if err := agent.SaveBranchMetaPreserveUpdated(rootPath, agent.BranchMeta{
+		ID: "root", CreatedAt: base, UpdatedAt: base.Add(4 * time.Minute),
+		SchemaVersion: agent.BranchMetaCountsVersion, Turns: 1, Preview: "latest parent prompt",
+	}); err != nil {
+		t.Fatalf("save root meta: %v", err)
+	}
+	if err := agent.SaveBranchMetaPreserveUpdated(recoveryPath, agent.BranchMeta{
+		ID: "recovery", ParentID: "root", Recovered: true,
+		CreatedAt: base, UpdatedAt: base.Add(3 * time.Minute),
+		SchemaVersion: agent.BranchMetaCountsVersion, Turns: 1, Preview: "older recovery prompt",
+	}); err != nil {
+		t.Fatalf("save recovery meta: %v", err)
+	}
+
+	grouped := mergedResumeSessions(dir)
+	if len(grouped) != 2 || grouped[0].Path != recoveryPath {
+		t.Fatalf("interactive resume order = %+v, want recovery leaf grouped first", grouped)
+	}
+	latest, ok := newestResumeTarget(dir)
+	if !ok {
+		t.Fatal("newestResumeTarget found no session")
+	}
+	if latest.path != rootPath {
+		t.Fatalf("--continue session = %q, want chronologically newest %q", latest.path, rootPath)
+	}
+}
+
+func TestRunResumeKeepsCompletedIndexStableAcrossRecoveryGC(t *testing.T) {
+	dir := t.TempDir()
+	parentPath := filepath.Join(dir, "recovery-parent.jsonl")
+	disk := agent.NewSession("sys")
+	disk.Add(provider.Message{Role: provider.RoleUser, Content: "shared prompt"})
+	disk.Add(provider.Message{Role: provider.RoleAssistant, Content: "disk answer"})
+	if err := disk.Save(parentPath); err != nil {
+		t.Fatalf("save parent: %v", err)
+	}
+	stale := agent.NewSession("sys")
+	stale.Add(provider.Message{Role: provider.RoleUser, Content: "shared prompt"})
+	stale.Add(provider.Message{Role: provider.RoleAssistant, Content: "recovered answer"})
+	recovery, err := stale.SaveRecoveryBranch(agent.RecoveryBranchOptions{OriginalPath: parentPath})
+	if err != nil {
+		t.Fatalf("save recovery branch: %v", err)
+	}
+	covered, err := agent.LoadSession(parentPath)
+	if err != nil {
+		t.Fatalf("load recovery parent: %v", err)
+	}
+	covered.Replace(append([]provider.Message(nil), stale.Snapshot()...))
+	covered.Add(provider.Message{Role: provider.RoleUser, Content: "later parent turn"})
+	if err := covered.SaveRewrite(parentPath); err != nil {
+		t.Fatalf("cover recovery branch in parent: %v", err)
+	}
+	recoveryMeta, ok, err := agent.LoadBranchMeta(recovery.Path)
+	if err != nil || !ok {
+		t.Fatalf("load recovery meta: ok=%v err=%v", ok, err)
+	}
+	recoveryMeta.UpdatedAt = time.Now().Add(-2 * agent.RecoveryGCGracePeriod)
+	if err := agent.SaveBranchMetaPreserveUpdated(recovery.Path, recoveryMeta); err != nil {
+		t.Fatalf("age recovery branch: %v", err)
+	}
+
+	targetPath := filepath.Join(dir, "wanted.jsonl")
+	saveTestSession(t, targetPath, "WANTED-SESSION")
+	targetMeta, ok, err := agent.LoadBranchMeta(targetPath)
+	if err != nil || !ok {
+		t.Fatalf("load target meta: ok=%v err=%v", ok, err)
+	}
+	targetMeta.UpdatedAt = time.Now().Add(-4 * agent.RecoveryGCGracePeriod)
+	if err := agent.SaveBranchMetaPreserveUpdated(targetPath, targetMeta); err != nil {
+		t.Fatalf("age target session: %v", err)
+	}
+
+	candidates, err := agent.ReclaimableRecoveryBranches(dir, time.Now(), agent.RecoveryGCGracePeriod)
+	if err != nil || len(candidates) != 1 || candidates[0] != recovery.Path {
+		t.Fatalf("recovery GC precondition = %v err=%v, want %q", candidates, err, recovery.Path)
+	}
+
+	active := agent.NewSession("sys")
+	active.Add(provider.Message{Role: provider.RoleUser, Content: "active prompt"})
+	exec := agent.New(nil, nil, active, agent.Options{}, event.Discard)
+	ctrl := newOwnedTestController(t, control.Options{Executor: exec, SessionDir: dir, Label: "test"})
+	activePath := filepath.Join(dir, "active-unpersisted.jsonl")
+	ctrl.SetSessionPath(activePath)
+	m := newTestChatTUI()
+	m.width = 80
+	m.ctrl = ctrl
+	// The user reads the index off a list rendered while the controller is
+	// alive, so compute it the same way once the never-snapshotted session's
+	// catalog metadata settles and both listings agree on the rows.
+	waitForCatalogMetadata(t, dir, agent.BranchID(activePath))
+	sessions := mergedResumeSessions(dir)
+	targetIndex := 0
+	for i, session := range sessions {
+		if session.Path == targetPath {
+			targetIndex = i + 1
+		}
+	}
+	if targetIndex != len(sessions) || targetIndex < 2 {
+		t.Fatalf("target index = %d in %+v, want a trailing row shifted by GC", targetIndex, sessions)
+	}
+
+	m.runResumeCommand("/resume " + strconv.Itoa(targetIndex))
+
+	if got := ctrl.SessionPath(); got != targetPath {
+		t.Fatalf("session path = %q, want completed index target %q", got, targetPath)
+	}
+	if _, err := os.Stat(recovery.Path); err != nil {
+		t.Fatalf("numeric resume mutated its displayed session list: %v", err)
+	}
+}
+
+func TestCapResumeSessionGroupsDoesNotSplitRecoveryFamily(t *testing.T) {
+	base := time.Date(2026, 8, 3, 12, 0, 0, 0, time.UTC)
+	sessions := make([]agent.SessionInfo, 0, 12)
+	for i := range 9 {
+		sessions = append(sessions, agent.SessionInfo{
+			Path:    filepath.Join("/sessions", "standalone-"+strconv.Itoa(i)+".jsonl"),
+			ModTime: base.Add(time.Duration(20-i) * time.Minute),
+		})
+	}
+	sessions = append(sessions,
+		agent.SessionInfo{Path: "/sessions/root.jsonl", ModTime: base.Add(3 * time.Minute)},
+		agent.SessionInfo{Path: "/sessions/recovery-a.jsonl", ModTime: base.Add(2 * time.Minute), Recovered: true, ParentID: "root"},
+		agent.SessionInfo{Path: "/sessions/recovery-b.jsonl", ModTime: base.Add(time.Minute), Recovered: true, ParentID: "root"},
+	)
+
+	entries := make([]resumeEntry, 0, len(sessions))
+	for _, session := range orderResumeSessions(sessions) {
+		entries = append(entries, resumeEntry{session: session, target: cliResumeTarget{path: session.Path}})
+	}
+	got := capResumeEntries(entries, resumeListCap)
+	if len(got) != 9 {
+		t.Fatalf("capped sessions len = %d, want 9 complete standalone groups", len(got))
+	}
+	for _, entry := range got {
+		if entry.session.Recovered || agent.BranchID(entry.session.Path) == "root" {
+			t.Fatalf("cap split recovery family instead of omitting it: %+v", got)
+		}
+	}
+}
+
+func TestSessionPickerLabelIdentifiesRecoveryParent(t *testing.T) {
+	session := agent.SessionInfo{
+		Path: "/sessions/recovery.jsonl", Preview: "keep working", Turns: 3,
+		Recovered: true, ParentID: "20260803-long-parent-id",
+	}
+	label := sessionPickerLabel(session)
+	if recoverySessionBadge(session) == "" || !strings.Contains(label, "20260803") {
+		t.Fatalf("recovery picker label = %q, want recovery badge and short parent id", label)
 	}
 }
 
@@ -49,7 +234,7 @@ func TestResumeDispatchOpensPicker(t *testing.T) {
 func TestResumePickerNavigateAndSelect(t *testing.T) {
 	dir := t.TempDir()
 	exec := agent.New(nil, nil, agent.NewSession("sys"), agent.Options{}, event.Discard)
-	ctrl := control.New(control.Options{Executor: exec, SessionDir: dir, Label: "test"})
+	ctrl := newOwnedTestController(t, control.Options{Executor: exec, SessionDir: dir, Label: "test"})
 
 	// Create two saved sessions.
 	aPath := filepath.Join(dir, "a.jsonl")
@@ -76,8 +261,8 @@ func TestResumePickerNavigateAndSelect(t *testing.T) {
 	if m.resumePick == nil {
 		t.Fatal("bare /resume should open the picker")
 	}
-	if len(m.resumePick.sessions) != 2 {
-		t.Fatalf("picker should have 2 sessions, got %d", len(m.resumePick.sessions))
+	if len(m.resumePick.entries) != 2 {
+		t.Fatalf("picker should have 2 sessions, got %d", len(m.resumePick.entries))
 	}
 
 	// The first session (default selection) is the most recent, which is b.jsonl.
@@ -104,7 +289,7 @@ func TestResumePickerEscDismisses(t *testing.T) {
 
 	exec := agent.New(nil, nil, agent.NewSession("sys"), agent.Options{}, event.Discard)
 	m := newTestChatTUI()
-	m.ctrl = control.New(control.Options{Executor: exec, SessionDir: dir, Label: "test"})
+	m.ctrl = newOwnedTestController(t, control.Options{Executor: exec, SessionDir: dir, Label: "test"})
 
 	m.runSlashCommand("/resume")
 	if m.resumePick == nil {
@@ -126,7 +311,7 @@ func TestResumeDispatchSwitchesAndReplays(t *testing.T) {
 	active := agent.NewSession("sys")
 	active.Add(provider.Message{Role: provider.RoleUser, Content: "active prompt"})
 	exec := agent.New(nil, nil, active, agent.Options{}, event.Discard)
-	ctrl := control.New(control.Options{Executor: exec, SessionDir: dir, Label: "test"})
+	ctrl := newOwnedTestController(t, control.Options{Executor: exec, SessionDir: dir, Label: "test"})
 	ctrl.SetSessionPath(filepath.Join(dir, "active.jsonl"))
 	if err := ctrl.Snapshot(); err != nil {
 		t.Fatal(err)
@@ -140,7 +325,7 @@ func TestResumeDispatchSwitchesAndReplays(t *testing.T) {
 	m.ctrl = ctrl
 
 	target := 0
-	for i, s := range recentSessions(dir) {
+	for i, s := range mergedResumeSessions(dir) {
 		if s.Path == otherPath {
 			target = i + 1
 		}
@@ -165,11 +350,11 @@ func TestResumeDispatchSwitchesAndReplays(t *testing.T) {
 func TestResumeWhileScrolledUpPinsViewportToBottom(t *testing.T) {
 	dir := t.TempDir()
 	active := agent.NewSession("sys")
-	for i := 0; i < 18; i++ {
+	for i := range 18 {
 		active.Add(provider.Message{Role: provider.RoleUser, Content: "active prompt " + strconv.Itoa(i)})
 	}
 	exec := agent.New(nil, nil, active, agent.Options{}, event.Discard)
-	ctrl := control.New(control.Options{Executor: exec, SessionDir: dir, Label: "test"})
+	ctrl := newOwnedTestController(t, control.Options{Executor: exec, SessionDir: dir, Label: "test"})
 	activePath := filepath.Join(dir, "active.jsonl")
 	ctrl.SetSessionPath(activePath)
 	if err := ctrl.Snapshot(); err != nil {
@@ -180,7 +365,7 @@ func TestResumeWhileScrolledUpPinsViewportToBottom(t *testing.T) {
 	saveTestSession(t, otherPath, "OTHER-SESSION-PROMPT")
 
 	target := 0
-	for i, s := range recentSessions(dir) {
+	for i, s := range mergedResumeSessions(dir) {
 		if s.Path == otherPath {
 			target = i + 1
 		}
@@ -222,6 +407,17 @@ func TestResumeWhileScrolledUpPinsViewportToBottom(t *testing.T) {
 	}
 }
 
+// mergedResumeSessions projects the merged picker rows onto the legacy row
+// shape the older listing tests assert against.
+func mergedResumeSessions(dir string) []agent.SessionInfo {
+	entries := mergedResumeEntries(dir, resumeListCap)
+	out := make([]agent.SessionInfo, 0, len(entries))
+	for _, entry := range entries {
+		out = append(out, entry.session)
+	}
+	return out
+}
+
 func saveTestSession(t *testing.T, path, prompt string) {
 	t.Helper()
 	s := agent.NewSession("sys")
@@ -240,7 +436,7 @@ func TestResumeArgCompletionListsSessions(t *testing.T) {
 
 	exec := agent.New(nil, nil, agent.NewSession("sys"), agent.Options{}, event.Discard)
 	m := newTestChatTUI()
-	m.ctrl = control.New(control.Options{Executor: exec, SessionDir: dir, Label: "test"})
+	m.ctrl = newOwnedTestController(t, control.Options{Executor: exec, SessionDir: dir, Label: "test"})
 
 	m.input.SetValue("/resume ")
 	m.updateCompletion()
@@ -261,7 +457,7 @@ func TestResumeAcceptChainsIntoSessionMenu(t *testing.T) {
 
 	exec := agent.New(nil, nil, agent.NewSession("sys"), agent.Options{}, event.Discard)
 	m := newTestChatTUI()
-	m.ctrl = control.New(control.Options{Executor: exec, SessionDir: dir, Label: "test"})
+	m.ctrl = newOwnedTestController(t, control.Options{Executor: exec, SessionDir: dir, Label: "test"})
 
 	m.input.SetValue("/resu")
 	m.updateCompletion()
@@ -282,7 +478,7 @@ func TestRunResumeSwitchesSession(t *testing.T) {
 	active := agent.NewSession("sys")
 	active.Add(provider.Message{Role: provider.RoleUser, Content: "active prompt"})
 	exec := agent.New(nil, nil, active, agent.Options{}, event.Discard)
-	ctrl := control.New(control.Options{Executor: exec, SessionDir: dir, Label: "test"})
+	ctrl := newOwnedTestController(t, control.Options{Executor: exec, SessionDir: dir, Label: "test"})
 	activePath := filepath.Join(dir, "active.jsonl")
 	ctrl.SetSessionPath(activePath)
 	if err := ctrl.Snapshot(); err != nil {
@@ -297,7 +493,7 @@ func TestRunResumeSwitchesSession(t *testing.T) {
 	m.ctrl = ctrl
 
 	target := 0
-	for i, s := range recentSessions(dir) {
+	for i, s := range mergedResumeSessions(dir) {
 		if s.Path == otherPath {
 			target = i + 1
 		}
@@ -314,5 +510,63 @@ func TestRunResumeSwitchesSession(t *testing.T) {
 	hist := ctrl.History()
 	if len(hist) == 0 || hist[len(hist)-1].Content != "other prompt" {
 		t.Fatalf("history not loaded from target: %+v", hist)
+	}
+}
+
+// TestResumeEntriesIncludeOtherProjects proves the picker surfaces the newest
+// session of other known projects (#9477): a user who worked here over SSH
+// resumes from any directory, not only the original workspace root.
+func TestResumeEntriesIncludeOtherProjects(t *testing.T) {
+	currentDir := t.TempDir()
+	current := filepath.Join(currentDir, "current.jsonl")
+	saveResumeTestSession(t, current, "current project work")
+
+	otherRoot := t.TempDir()
+	otherDir := config.ProjectSessionDir(otherRoot)
+	if otherDir == "" {
+		t.Skip("project session dir unavailable")
+	}
+	if err := os.MkdirAll(otherDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// The process-wide test home is shared by every test in this binary; the
+	// saved project must not leak into later tests' cross-project resume rows.
+	projectsFile := filepath.Join(config.ReasonixHomeDir(), "desktop-projects.json")
+	previousProjects, projectsReadErr := os.ReadFile(projectsFile)
+	t.Cleanup(func() {
+		if projectsReadErr != nil {
+			os.Remove(projectsFile)
+			return
+		}
+		_ = os.WriteFile(projectsFile, previousProjects, 0o644)
+	})
+	if err := os.WriteFile(projectsFile,
+		[]byte(`{"projects":[{"root":`+strconv.Quote(filepath.ToSlash(otherRoot))+`}]}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	other := filepath.Join(otherDir, "other.jsonl")
+	saveResumeTestSession(t, other, "other project work")
+
+	entries := resumeEntries(currentDir)
+	if len(entries) != 2 {
+		t.Fatalf("resumeEntries = %d entries, want current + other project", len(entries))
+	}
+	if entries[0].project != "" || entries[0].session.Path != current {
+		t.Fatalf("first entry = %+v, want the current directory session", entries[0])
+	}
+	if entries[1].project == "" {
+		t.Fatalf("second entry = %+v, want a project label for the other project", entries[1])
+	}
+	if entries[1].session.Path != other {
+		t.Fatalf("second entry path = %q, want %q", entries[1].session.Path, other)
+	}
+}
+
+func saveResumeTestSession(t *testing.T, path, content string) {
+	t.Helper()
+	s := agent.NewSession("sys")
+	s.Add(provider.Message{Role: provider.RoleUser, Content: content})
+	if err := s.Save(path); err != nil {
+		t.Fatal(err)
 	}
 }

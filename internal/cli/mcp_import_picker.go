@@ -33,7 +33,7 @@ func (m *chatTUI) openMCPImportPicker() {
 		m.notice("mcp import: no candidates found")
 		return
 	}
-	m.completion = completion{}
+	m.dismissCompletion()
 	m.mcpImport = newMCPImportPicker(candidates)
 }
 
@@ -70,19 +70,19 @@ func (m chatTUI) handleMCPImportKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 			m.notice("mcp import: " + err.Error())
 			return m, nil
 		}
-		m.host = m.ctrl.Host()
+		m.refreshHostAndInvalidateSlashCatalog()
 		m.notice(fmt.Sprintf("imported %d selected MCP servers from cc-switch (%d added, %d updated, %d connected, %d failed, %d skipped)", total, added, updated, connected, failed, skipped))
 	}
 	return m, nil
 }
 
-func (m chatTUI) renderMCPImport() string {
+func (m chatTUI) renderMCPImportPanel() panelContent {
 	p := m.mcpImport
 	if p == nil {
-		return ""
+		return panelContent{}
 	}
 	w := max(m.width, 10)
-	var b strings.Builder
+	var b panelBuilder
 	b.WriteString(accent("Import MCP from cc-switch") + "\n")
 	b.WriteString(dim("Space select · Enter import · Esc cancel") + "\n\n")
 	for i, c := range p.candidates {
@@ -99,7 +99,8 @@ func (m chatTUI) renderMCPImport() string {
 		if i == p.cursor {
 			line = reverse(line)
 		}
+		b.MarkFocus(i == p.cursor, i)
 		b.WriteString(line + "\n")
 	}
-	return choicePanelStyle.Width(w).Render(strings.TrimRight(b.String(), "\n"))
+	return b.body().trimTrailingNewlines().render(choicePanelStyle.Width(w), m.width)
 }

@@ -1,6 +1,8 @@
 // Run: tsx src/__tests__/composer-profile.test.ts
 
 import {
+  composerProfileFromMeta,
+  composerProfileFromTab,
   composerProfileMode,
   controllerComposerProfileCollaborationMode,
   displayedComposerProfileCollaborationMode,
@@ -46,8 +48,7 @@ function tab(overrides: Partial<LooseTabMeta> = {}): TabMeta {
     running: false,
     mode: "normal",
     collaborationMode: "normal",
-    toolApprovalMode: "ask",
-    tokenMode: "full",
+    toolApprovalMode: "workspace-write",
     goal: "",
     goalStatus: "stopped",
     active: true,
@@ -65,8 +66,7 @@ function meta(overrides: Partial<LooseMeta> = {}): Meta {
     autoApproveTools: false,
     bypass: false,
     collaborationMode: "normal",
-    toolApprovalMode: "ask",
-    tokenMode: "full",
+    toolApprovalMode: "workspace-write",
     goal: "",
     goalStatus: "stopped",
     ...overrides,
@@ -76,8 +76,28 @@ function meta(overrides: Partial<LooseMeta> = {}): Meta {
 console.log("\ncomposer profile");
 
 {
+  const goalView = {
+    id: "goal-1", revision: 2, objective: "finish the migration", phase: "paused" as const,
+    maxGoalRounds: null, roundsStarted: 4, createdAt: "2026-09-13T10:00:00Z",
+    updatedAt: "2026-09-13T10:10:00Z", activation: "disarmed" as const, stopReason: "user-paused",
+  };
+  eq(composerProfileFromTab(tab({ goal: "finish the migration", goalStatus: "stopped", goalView })).goal,
+    "finish the migration", "paused lifecycle goal remains visible from tab metadata");
+  eq(composerProfileFromMeta(meta({ goal: "finish the migration", goalStatus: "stopped", goalView })).goal,
+    "finish the migration", "paused lifecycle goal remains visible from controller metadata");
+}
+
+{
   let profiles: ComposerProfilesByTab = {};
-  profiles = hydrateComposerProfilesFromTabs(profiles, [tab({ tokenMode: "economy" })]);
+  profiles = hydrateComposerProfilesFromTabs(profiles, [tab({ toolApprovalMode: "auto" })]);
+  eq(profiles["tab-1"].toolApprovalMode, "workspace-write", "legacy auto hydrates as workspace write");
+  profiles = hydrateComposerProfileFromMeta(profiles, "tab-1", meta({ toolApprovalMode: "auto" }));
+  eq(Boolean(profiles["tab-1"].pending.toolApprovalMode), false, "workspace write is acknowledged by legacy meta");
+}
+
+{
+  let profiles: ComposerProfilesByTab = {};
+  profiles = hydrateComposerProfilesFromTabs(profiles, [tab()]);
   profiles = patchComposerProfile(
     profiles,
     "tab-1",
@@ -93,14 +113,13 @@ console.log("\ncomposer profile");
     ["collaborationMode", "goal"],
   );
 
-  profiles = hydrateComposerProfilesFromTabs(profiles, [tab({ tokenMode: "economy" })]);
+  profiles = hydrateComposerProfilesFromTabs(profiles, [tab()]);
 
   eq(displayedComposerProfileCollaborationMode(profiles["tab-1"]), "plan", "stale tab hydration keeps locally selected plan mode");
-  eq(profiles["tab-1"].tokenMode, "economy", "token saver remains independent of collaboration mode changes");
   eq(composerProfileMode(profiles["tab-1"]), "plan", "compat mode keeps the plan axis enabled");
   eq(Boolean(profiles["tab-1"].pending.collaborationMode), true, "pending plan stays pending until backend acknowledges it");
 
-  profiles = hydrateComposerProfilesFromTabs(profiles, [tab({ mode: "plan", collaborationMode: "plan", tokenMode: "economy" })]);
+  profiles = hydrateComposerProfilesFromTabs(profiles, [tab({ mode: "plan", collaborationMode: "plan" })]);
 
   eq(displayedComposerProfileCollaborationMode(profiles["tab-1"]), "plan", "acknowledged tab hydration keeps plan visible");
   eq(Boolean(profiles["tab-1"].pending.collaborationMode), false, "backend acknowledgement clears pending plan");
@@ -109,16 +128,22 @@ console.log("\ncomposer profile");
 {
   let profiles: ComposerProfilesByTab = {};
   profiles = hydrateComposerProfilesFromTabs(profiles, [tab()]);
-  profiles = patchComposerProfile(profiles, "tab-1", profiles["tab-1"], { tokenMode: "economy" }, ["tokenMode"]);
-  profiles = hydrateComposerProfileFromMeta(profiles, "tab-1", meta({ tokenMode: "full" }));
+  profiles = patchComposerProfile(
+    profiles,
+    "tab-1",
+    profiles["tab-1"],
+    { collaborationMode: "normal", goalDraftMode: false, goal: "", toolApprovalMode: "workspace-write" },
+    ["toolApprovalMode"],
+  );
+  profiles = hydrateComposerProfileFromMeta(profiles, "tab-1", meta({ toolApprovalMode: "ask" }));
 
-  eq(profiles["tab-1"].tokenMode, "economy", "stale meta cannot erase a pending token saver selection");
-  eq(Boolean(profiles["tab-1"].pending.tokenMode), true, "token saver stays pending while meta is stale");
+  eq(profiles["tab-1"].toolApprovalMode, "workspace-write", "stale meta cannot erase a pending workspace-write selection");
+  eq(Boolean(profiles["tab-1"].pending.toolApprovalMode), true, "workspace-write selection stays pending while meta is stale");
 
-  profiles = hydrateComposerProfileFromMeta(profiles, "tab-1", meta({ tokenMode: "economy" }));
+  profiles = hydrateComposerProfileFromMeta(profiles, "tab-1", meta({ toolApprovalMode: "auto" }));
 
-  eq(profiles["tab-1"].tokenMode, "economy", "acknowledged token saver remains enabled");
-  eq(Boolean(profiles["tab-1"].pending.tokenMode), false, "token saver pending clears after matching meta");
+  eq(profiles["tab-1"].toolApprovalMode, "workspace-write", "acknowledged workspace-write remains enabled");
+  eq(Boolean(profiles["tab-1"].pending.toolApprovalMode), false, "workspace-write pending clears after matching meta");
 }
 
 {
@@ -141,7 +166,7 @@ console.log("\ncomposer profile");
 {
   let profiles: ComposerProfilesByTab = {};
   profiles = hydrateComposerProfilesFromTabs(profiles, [tab(), tab({ id: "tab-2" })]);
-  profiles = patchComposerProfile(profiles, "tab-2", profiles["tab-2"], { tokenMode: "economy" }, ["tokenMode"]);
+  profiles = patchComposerProfile(profiles, "tab-2", profiles["tab-2"], { toolApprovalMode: "workspace-write" }, ["toolApprovalMode"]);
   profiles = hydrateComposerProfilesFromTabs(profiles, [tab()]);
 
   eq(Boolean(profiles["tab-2"]), false, "tab hydration removes profiles for closed tabs");
@@ -152,10 +177,10 @@ console.log("\ncomposer profile");
   profiles = hydrateComposerProfilesFromTabs(profiles, [tab({ toolApprovalMode: "auto" })]);
   profiles = hydrateComposerProfilesFromTabs(profiles, [tab({ toolApprovalMode: "" })]);
 
-  eq(profiles["tab-1"].toolApprovalMode, "auto", "blank tab payload does not demote explicit auto approval mode to ask");
+  eq(profiles["tab-1"].toolApprovalMode, "workspace-write", "blank tab payload does not demote workspace write to read only");
 
   profiles = hydrateComposerProfileFromMeta(profiles, "tab-1", meta({ toolApprovalMode: "" }));
-  eq(profiles["tab-1"].toolApprovalMode, "auto", "blank meta payload does not demote explicit auto approval mode to ask");
+  eq(profiles["tab-1"].toolApprovalMode, "workspace-write", "blank meta payload does not demote workspace write to read only");
 }
 
 {

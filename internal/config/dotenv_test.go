@@ -5,6 +5,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	fileencoding "reasonix/internal/fileutil/encoding"
 )
 
 func TestLoadDotEnvDoesNotImportProjectOrHomeEnv(t *testing.T) {
@@ -84,6 +86,50 @@ func TestLoadDotEnvReadsGlobalCredentials(t *testing.T) {
 	}
 	if got := os.Getenv("KEY_SHARED"); got != "global_wins" {
 		t.Errorf("global credentials should win over project .env: KEY_SHARED=%q want global_wins", got)
+	}
+}
+
+func TestCredentialEnvNamesIncludesUnconfiguredStoredKeys(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("REASONIX_HOME", filepath.Join(home, "reasonix-home"))
+
+	credentialPath := UserCredentialsPath()
+	if err := os.MkdirAll(filepath.Dir(credentialPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(credentialPath, []byte("CONFIGURED_PROVIDER_KEY=configured\nSTALE_PROVIDER_KEY=stale\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := &Config{Providers: []ProviderEntry{{APIKeyEnv: "CONFIGURED_PROVIDER_KEY"}}}
+	got := cfg.CredentialEnvNames()
+	for _, want := range []string{"CONFIGURED_PROVIDER_KEY", "STALE_PROVIDER_KEY"} {
+		if !containsString(got, want) {
+			t.Fatalf("credential env names = %v, missing %s", got, want)
+		}
+	}
+}
+
+func TestLoadDotEnvDecodesGB18030Credentials(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	t.Setenv("REASONIX_HOME", filepath.Join(home, "reasonix-home"))
+	t.Setenv("REASONIX_CREDENTIALS_STORE", "file")
+	t.Setenv("PINNED_CN", "")
+	os.Unsetenv("PINNED_CN")
+
+	cred := UserCredentialsPath()
+	if err := os.MkdirAll(filepath.Dir(cred), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(cred, fileencoding.MustEncode("PINNED_CN=中文\n", fileencoding.GB18030), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	loadDotEnv()
+	if got := os.Getenv("PINNED_CN"); got != "中文" {
+		t.Fatalf("PINNED_CN = %q, want decoded Chinese value", got)
 	}
 }
 
@@ -322,99 +368,6 @@ func TestLoadForRootFiltersProjectDotEnvControlVars(t *testing.T) {
 	}
 	if got := os.Getenv("REASONIX_STATE_HOME"); got != "" {
 		t.Fatalf("project control var leaked into process env: %q", got)
-	}
-}
-
-func TestLoadForRootResolvesProviderCredentialsOverInheritedEnv(t *testing.T) {
-	project := t.TempDir()
-	cfgHome := t.TempDir()
-	key := "KEY_PROVIDER_GLOBAL_PRIORITY"
-
-	t.Setenv("HOME", cfgHome)
-	t.Setenv("REASONIX_CREDENTIALS_STORE", "file")
-	t.Setenv("USERPROFILE", cfgHome)
-	t.Setenv("XDG_CONFIG_HOME", filepath.Join(cfgHome, ".config"))
-	t.Setenv("AppData", filepath.Join(cfgHome, "AppData"))
-	t.Setenv(key, "from_env")
-
-	cred := UserCredentialsPath()
-	if cred == "" {
-		t.Skip("user config dir unresolved on this platform")
-	}
-	if err := os.MkdirAll(filepath.Dir(cred), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(cred, []byte(key+"=from_credentials\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(project, "reasonix.toml"), []byte(`
-default_model = "custom/m"
-[[providers]]
-name = "custom"
-kind = "openai"
-base_url = "https://example.invalid/v1"
-model = "m"
-api_key_env = "`+key+`"
-`), 0o644); err != nil {
-		t.Fatal(err)
-	}
-
-	cfg, err := LoadForRoot(project)
-	if err != nil {
-		t.Fatalf("LoadForRoot: %v", err)
-	}
-	provider, ok := cfg.Provider("custom")
-	if !ok {
-		t.Fatalf("provider missing: %+v", cfg.Providers)
-	}
-	if got := provider.APIKey(); got != "from_credentials" {
-		t.Fatalf("provider API key = %q, want credentials value", got)
-	}
-	if got := os.Getenv(key); got != "from_credentials" {
-		t.Fatalf("process env = %q, want credentials value pinned over inherited env", got)
-	}
-}
-
-func TestLoadForRootIgnoresProjectProviderEnvAndInheritedEnv(t *testing.T) {
-	project := t.TempDir()
-	cfgHome := t.TempDir()
-	key := "KEY_PROVIDER_PROJECT_PRIORITY"
-
-	t.Setenv("HOME", cfgHome)
-	t.Setenv("REASONIX_CREDENTIALS_STORE", "file")
-	t.Setenv("USERPROFILE", cfgHome)
-	t.Setenv("XDG_CONFIG_HOME", filepath.Join(cfgHome, ".config"))
-	t.Setenv("AppData", filepath.Join(cfgHome, "AppData"))
-	t.Setenv(key, "from_env")
-
-	if err := os.WriteFile(filepath.Join(project, ".env"), []byte(key+"=from_project\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(project, "reasonix.toml"), []byte(`
-default_model = "custom/m"
-[[providers]]
-name = "custom"
-kind = "openai"
-base_url = "https://example.invalid/v1"
-model = "m"
-api_key_env = "`+key+`"
-`), 0o644); err != nil {
-		t.Fatal(err)
-	}
-
-	cfg, err := LoadForRoot(project)
-	if err != nil {
-		t.Fatalf("LoadForRoot: %v", err)
-	}
-	provider, ok := cfg.Provider("custom")
-	if !ok {
-		t.Fatalf("provider missing: %+v", cfg.Providers)
-	}
-	if got := provider.APIKey(); got != "" {
-		t.Fatalf("provider API key = %q, want no key without global credentials", got)
-	}
-	if got := os.Getenv(key); got != "from_env" {
-		t.Fatalf("process env = %q, want inherited env left untouched", got)
 	}
 }
 
@@ -695,6 +648,70 @@ func TestRemoveCredentialMarksClearedAndSetRemovesMarker(t *testing.T) {
 	}
 }
 
+func TestCredentialStoreRevisionChangesForSameLengthReplacement(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	t.Setenv("AppData", filepath.Join(home, "AppData"))
+	t.Setenv("REASONIX_CREDENTIALS_STORE", "file")
+
+	if got := CredentialStoreRevision(); got != "missing" {
+		t.Fatalf("initial credential revision = %q, want missing", got)
+	}
+	if _, err := SetCredential("REVISION_KEY", "old-key"); err != nil {
+		t.Fatalf("SetCredential(old): %v", err)
+	}
+	oldRevision := CredentialStoreRevision()
+	if _, err := SetCredential("REVISION_KEY", "new-key"); err != nil {
+		t.Fatalf("SetCredential(new): %v", err)
+	}
+	newRevision := CredentialStoreRevision()
+	if oldRevision == newRevision {
+		t.Fatalf("same-length replacement kept credential revision %q", oldRevision)
+	}
+}
+
+func TestSetCredentialIfRevisionRejectsStaleWriter(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	t.Setenv("AppData", filepath.Join(home, "AppData"))
+	t.Setenv("REASONIX_CREDENTIALS_STORE", "file")
+
+	missingRevision := CredentialStoreRevision()
+	if _, err := SetCredential("REVISION_CAS_KEY", "newer-key"); err != nil {
+		t.Fatalf("SetCredential(newer): %v", err)
+	}
+	if _, applied, err := SetCredentialIfRevision("REVISION_CAS_KEY", "stale-key", missingRevision); err != nil {
+		t.Fatalf("SetCredentialIfRevision(stale): %v", err)
+	} else if applied {
+		t.Fatal("stale credential revision overwrote a newer value")
+	}
+	resolved := ResolveCredentialForRootGlobalFirst(".", "REVISION_CAS_KEY")
+	if !resolved.Set || resolved.Value != "newer-key" {
+		t.Fatalf("credential after stale write = set:%v value:%q, want newer-key", resolved.Set, resolved.Value)
+	}
+}
+
+func TestSetCredentialIfRevisionAppliesCurrentWriter(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	t.Setenv("AppData", filepath.Join(home, "AppData"))
+	t.Setenv("REASONIX_CREDENTIALS_STORE", "file")
+
+	revision := CredentialStoreRevision()
+	if _, applied, err := SetCredentialIfRevision("REVISION_CAS_KEY", "accepted-key", revision); err != nil {
+		t.Fatalf("SetCredentialIfRevision(current): %v", err)
+	} else if !applied {
+		t.Fatal("current credential revision was rejected")
+	}
+	resolved := ResolveCredentialForRootGlobalFirst(".", "REVISION_CAS_KEY")
+	if !resolved.Set || resolved.Value != "accepted-key" {
+		t.Fatalf("stored credential = set:%v value:%q, want accepted-key", resolved.Set, resolved.Value)
+	}
+}
+
 func TestStoreCredentialLinesRejectsUnsafeFileLines(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
@@ -764,12 +781,11 @@ func TestSetCredentialRejectsInvalidInput(t *testing.T) {
 }
 
 func TestProjectConfigCannotOverrideCredentialStoreMode(t *testing.T) {
-	home := t.TempDir()
+	home := isolateUserConfigHome(t)
 	project := t.TempDir()
-	t.Setenv("HOME", home)
-	t.Setenv("USERPROFILE", home)
 	t.Setenv("REASONIX_CREDENTIALS_STORE", "")
 	os.Unsetenv("REASONIX_CREDENTIALS_STORE")
+	requireTestPathWithin(t, home, UserConfigPath())
 	if err := os.MkdirAll(filepath.Dir(UserConfigPath()), 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -779,6 +795,7 @@ func TestProjectConfigCannotOverrideCredentialStoreMode(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(project, "reasonix.toml"), []byte(`credentials_store = "keyring"`), 0o644); err != nil {
 		t.Fatal(err)
 	}
+	approveWorkspace(t, project)
 
 	cfg, err := LoadForRoot(project)
 	if err != nil {

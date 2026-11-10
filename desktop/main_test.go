@@ -1,17 +1,55 @@
 package main
 
 import (
+	"context"
+	"fmt"
 	"os"
-	"path/filepath"
+	"strings"
 	"testing"
 
-	"github.com/wailsapp/wails/v2/pkg/options/linux"
+	"reasonix/internal/skill/skillwatch"
+	"reasonix/internal/testenv"
 )
+
+// TestLifecycleDiagnosticsUsePreShellOwnershipGate pins the ordering that keeps
+// a superseded process from consuming lifecycle evidence: the host RPC service
+// claims diagnostics ownership before it serves its first request.
+func TestLifecycleDiagnosticsUsePreShellOwnershipGate(t *testing.T) {
+	source, err := os.ReadFile("host_rpc.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	beforeServe, _, ok := strings.Cut(string(source), "server.Serve(")
+	if !ok {
+		t.Fatal("host_rpc.go no longer contains the host RPC serve boundary")
+	}
+	if !strings.Contains(beforeServe, "prepareDesktopDiagnostics(app)") {
+		t.Fatal("host service must claim diagnostics ownership before serving")
+	}
+
+	appSource, err := os.ReadFile("app.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, afterStartup, ok := strings.Cut(string(appSource), "func (a *App) startup(ctx context.Context) {")
+	if !ok {
+		t.Fatal("app.go no longer contains App.startup")
+	}
+	startupBody, _, ok := strings.Cut(afterStartup, "\n}")
+	if !ok || !strings.Contains(startupBody, "initializeLifecycleDiagnostics(a)") {
+		t.Fatal("previous lifecycle consumption must remain owned by startup")
+	}
+}
 
 // TestMain isolates user config/state/cache dirs for the whole package. Without
 // this, tests that persist desktop state, sessions, cache, or CLI-style config
 // can leak into the developer's real Reasonix directories.
 func TestMain(m *testing.M) {
+	// The watcher helper re-executes os.Executable(), which here is this test
+	// binary: serve the pipe instead of re-running the suite.
+	if skillwatch.MaybeRunHelper() {
+		return
+	}
 	dir, err := os.MkdirTemp("", "reasonix-desktop-test")
 	if err != nil {
 		os.Exit(1)
@@ -23,73 +61,35 @@ func TestMain(m *testing.M) {
 	os.Setenv("REASONIX_STATE_HOME", dir+"/state")
 	os.Setenv("REASONIX_CACHE_HOME", dir+"/cache")
 	os.Setenv("AppData", dir)
+	// Tests fail closed for telemetry. Any test that expects a request must
+	// replace the relevant endpoint with an httptest.Server explicitly.
+	crashEndpoint = "http://127.0.0.1:0/v1/report"
+	pingEndpoint = "http://127.0.0.1:0/v1/ping"
+	metricsEndpoint = "http://127.0.0.1:0/v1/metrics"
+	// Neutralize the host event bridge for the whole test binary: there is no
+	// shell to emit to here. Tests that assert on runtime events install their
+	// own capture through the per-instance runtimeEvents.emit hook, which takes
+	// precedence.
+	runtimeEventsEmitFallback = func(context.Context, string, ...any) {}
 	code := m.Run()
+	// Fixtures build an App without shutdownBody, which is what releases the
+	// cached session services. Their state lives under the scratch home removed
+	// below, not a per-test t.TempDir, so this is debt, not a cleanup failure.
+	if note := testenv.ReportLeakedFileLocks(); note != "" {
+		fmt.Fprintln(os.Stderr, note)
+	}
 	os.RemoveAll(dir)
 	os.Exit(code)
 }
 
-func TestWindowsWebview2GPUDisabled(t *testing.T) {
-	oldChannel := channel
-	t.Cleanup(func() {
-		channel = oldChannel
-		os.Unsetenv(disableWebview2GPUEnv)
-	})
-
-	tests := []struct {
-		name    string
-		channel string
-		env     string
-		want    bool
-	}{
-		{name: "stable default keeps gpu", channel: "stable", want: false},
-		{name: "canary default disables gpu", channel: "canary", want: true},
-		{name: "env enables fallback", channel: "stable", env: "1", want: true},
-		{name: "env disables canary fallback", channel: "canary", env: "0", want: false},
-		{name: "truthy env", channel: "stable", env: "yes", want: true},
-		{name: "falsey env", channel: "canary", env: "off", want: false},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			channel = tt.channel
-			if tt.env == "" {
-				os.Unsetenv(disableWebview2GPUEnv)
-			} else {
-				os.Setenv(disableWebview2GPUEnv, tt.env)
-			}
-			if got := windowsWebview2GPUDisabled(); got != tt.want {
-				t.Fatalf("windowsWebview2GPUDisabled() = %v, want %v", got, tt.want)
-			}
-		})
-	}
-}
-
-func TestLinuxWebviewGpuPolicyDisablesGpuWithoutAccessibleRenderNode(t *testing.T) {
-	glob := filepath.Join(t.TempDir(), "renderD*")
-
-	if got := linuxWebviewGpuPolicy(glob); got != linux.WebviewGpuPolicyNever {
-		t.Fatalf("linuxWebviewGpuPolicy() = %v, want %v", got, linux.WebviewGpuPolicyNever)
-	}
-}
-
-func TestLinuxWebviewGpuPolicyDisablesGpuForInaccessibleRenderNode(t *testing.T) {
-	dir := t.TempDir()
-	if err := os.Mkdir(filepath.Join(dir, "renderD128"), 0o700); err != nil {
-		t.Fatal(err)
-	}
-
-	if got := linuxWebviewGpuPolicy(filepath.Join(dir, "renderD*")); got != linux.WebviewGpuPolicyNever {
-		t.Fatalf("linuxWebviewGpuPolicy() = %v, want %v", got, linux.WebviewGpuPolicyNever)
-	}
-}
-
-func TestLinuxWebviewGpuPolicyKeepsOnDemandWithAccessibleRenderNode(t *testing.T) {
-	dir := t.TempDir()
-	if err := os.WriteFile(filepath.Join(dir, "renderD128"), nil, 0o600); err != nil {
-		t.Fatal(err)
-	}
-
-	if got := linuxWebviewGpuPolicy(filepath.Join(dir, "renderD*")); got != linux.WebviewGpuPolicyOnDemand {
-		t.Fatalf("linuxWebviewGpuPolicy() = %v, want %v", got, linux.WebviewGpuPolicyOnDemand)
+func TestDesktopTestTelemetryEndpointsAreFailClosed(t *testing.T) {
+	for name, endpoint := range map[string]string{
+		"crash":   crashEndpoint,
+		"ping":    pingEndpoint,
+		"metrics": metricsEndpoint,
+	} {
+		if strings.Contains(endpoint, "crash.reasonix.io") {
+			t.Fatalf("%s test endpoint targets production: %s", name, endpoint)
+		}
 	}
 }

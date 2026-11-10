@@ -2,11 +2,17 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
+	"sync"
 
+	"reasonix/internal/config"
+	"reasonix/internal/fileutil"
+	fileencoding "reasonix/internal/fileutil/encoding"
 	"reasonix/internal/hook"
 )
 
@@ -34,9 +40,15 @@ func (a *App) HooksSettings(scope string) HooksSettingsView {
 		Scope:       s,
 		Path:        path,
 		ProjectRoot: root,
-		Trusted:     s == string(hook.ScopeGlobal) || hook.IsTrusted(root, ""),
 		Hooks:       []HookConfigView{},
 		Events:      hookEventNames(),
+	}
+	// Project hooks run only once approved as they stand now; what this view
+	// showed is what the Approve button may approve.
+	program, pending := hook.PendingProjectHooks(hook.LoadOptions{ProjectRoot: root})
+	view.Trusted = s != string(hook.ScopeProject) || !pending
+	if !view.Trusted {
+		shownProjectHooks.Store(root, program.Digest)
 	}
 	settings, err := readHooksSettingsFile(path)
 	if err != nil || settings.Hooks == nil {
@@ -69,6 +81,7 @@ func (a *App) SaveHooksSettingsForRoot(scope, projectRoot string, hooks []HookCo
 		if cmd == "" {
 			continue
 		}
+		cmd = hook.NormalizeCommand(cmd)
 		settings.Hooks[event] = append(settings.Hooks[event], hook.HookConfig{
 			Match:       strings.TrimSpace(h.Match),
 			Command:     cmd,
@@ -80,20 +93,55 @@ func (a *App) SaveHooksSettingsForRoot(scope, projectRoot string, hooks []HookCo
 	if s == string(hook.ScopeProject) && strings.TrimSpace(path) == "" {
 		return fmt.Errorf("no active project workspace")
 	}
-	return writeHooksSettingsFile(path, settings)
+	if err := writeHooksSettingsFile(path, settings); err != nil {
+		return err
+	}
+	// Saving from the editor is the person choosing these hooks as written.
+	if s == string(hook.ScopeProject) {
+		return hook.ApproveProjectHooksAs(hook.LoadOptions{ProjectRoot: projectRoot}, settings)
+	}
+	return nil
 }
 
 func (a *App) TrustProjectHooks() error {
 	return a.TrustProjectHooksForRoot(a.activeHookProjectRoot())
 }
 
+// errHooksNotShown refuses approving hooks that carry fields this editor
+// cannot display: a person may only approve what they were shown.
+var errHooksNotShown = errors.New("these project hooks set env or contextFile, which this editor does not show; review and approve them with `reasonix trust`")
+
+// TrustProjectHooksForRoot approves root's project hooks as they stand now.
 func (a *App) TrustProjectHooksForRoot(root string) error {
-	root = strings.TrimSpace(root)
-	if strings.TrimSpace(root) == "" || root == "." {
+	if strings.TrimSpace(root) == "" {
 		return fmt.Errorf("no active project workspace")
 	}
-	return hook.Trust(root, "")
+	settings, err := readHooksSettingsFile(hook.ProjectSettingsPath(root))
+	if err != nil {
+		return err
+	}
+	for _, list := range settings.Hooks {
+		for _, cfg := range list {
+			if len(cfg.Env) > 0 || strings.TrimSpace(cfg.ContextFile) != "" {
+				return errHooksNotShown
+			}
+		}
+	}
+	program, ok := hook.ProjectHooksProgram(root)
+	if !ok {
+		return nil
+	}
+	if shown, _ := shownProjectHooks.Load(root); shown != program.Digest {
+		return errHooksChangedSinceShown
+	}
+	return config.NewProjectProgramStore(config.ReasonixHomeDir()).Approve(root, program)
 }
+
+// shownProjectHooks is the digest of the project hooks each root's settings
+// view last showed as waiting, so approving never covers a later rewrite.
+var shownProjectHooks sync.Map
+
+var errHooksChangedSinceShown = errors.New("these project hooks changed after they were shown; reload them and review again")
 
 func (a *App) activeHookProjectRoot() string {
 	a.mu.RLock()
@@ -124,12 +172,7 @@ func hookEventNames() []string {
 }
 
 func validHookEvent(event hook.Event) bool {
-	for _, e := range hook.Events {
-		if event == e {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(hook.Events, event)
 }
 
 func hookConfigView(event hook.Event, cfg hook.HookConfig) HookConfigView {
@@ -145,7 +188,7 @@ func hookConfigView(event hook.Event, cfg hook.HookConfig) HookConfigView {
 
 func readHooksSettingsFile(path string) (hook.Settings, error) {
 	var settings hook.Settings
-	body, err := os.ReadFile(path)
+	body, err := fileencoding.ReadFileUTF8(path)
 	if err != nil {
 		return settings, err
 	}
@@ -163,7 +206,7 @@ func writeHooksSettingsFile(path string, settings hook.Settings) error {
 		return fmt.Errorf("empty hooks settings path")
 	}
 	raw := map[string]json.RawMessage{}
-	if body, err := os.ReadFile(path); err == nil {
+	if body, err := fileencoding.ReadFileUTF8(path); err == nil {
 		if err := json.Unmarshal(body, &raw); err != nil {
 			return err
 		}
@@ -181,5 +224,5 @@ func writeHooksSettingsFile(path string, settings hook.Settings) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return err
 	}
-	return os.WriteFile(path, body, 0o644)
+	return fileutil.AtomicWriteFile(path, body, 0o644)
 }

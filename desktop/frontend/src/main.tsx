@@ -1,24 +1,28 @@
+import "./lib/compat";
 import { StrictMode } from "react";
 import { createRoot } from "react-dom/client";
 import App from "./App";
 import { ErrorBoundary } from "./components/ErrorBoundary";
-import { installGlobalCrashHandlers, installPerformancePressureMonitor } from "./lib/crash";
-import { installWailsNonFileDragErrorSuppression } from "./lib/bridge";
+import { installPerformancePressureMonitor } from "./lib/crash";
+import { installGlobalCrashHandlers } from "./lib/globalCrashHandlers";
+import { desktopHost } from "./lib/desktopHost";
 import { installBreadcrumbConsoleHook } from "./lib/breadcrumbs";
-import { installMessageSelectionCopy } from "./lib/messageSelectionCopy";
-import { LocaleProvider } from "./lib/i18n";
+import { installPerfDebugHook } from "./lib/perfDebug";
+import { LocaleProvider, preloadDetectedLocale } from "./lib/i18n";
 import { ToastProvider } from "./lib/toast";
 import { initFontFamily } from "./lib/fontFamily";
 import { initTextSize } from "./lib/textSize";
+import { initTypographyPreferences } from "./lib/typographyPreferences";
 import { initTheme } from "./lib/theme";
-import "./styles.css";
+import { initConversationWidth } from "./lib/conversationWidth";
+import appShellStylesheetURL from "./styles.css?url";
 
 // Install first so startup/runtime failures paint a useful error instead of a
 // featureless webview background, with the recent console trail attached.
-installWailsNonFileDragErrorSuppression();
 installGlobalCrashHandlers();
 installBreadcrumbConsoleHook();
 installPerformancePressureMonitor();
+installPerfDebugHook();
 
 // Apply the saved appearance (auto/light/dark) before the first paint.
 function initTypographyPlatform() {
@@ -39,8 +43,10 @@ function initTypographyPlatform() {
 
 initTypographyPlatform();
 initTheme();
+initConversationWidth();
 initTextSize();
 initFontFamily();
+initTypographyPreferences();
 
 // Pre-warm font fallback stacks so the first frame doesn't flicker between the
 // browser default font and the app's configured typeface. Inserting a hidden span
@@ -61,30 +67,62 @@ function prewarmFontFallbacks() {
 }
 prewarmFontFallbacks();
 
-installMessageSelectionCopy(document);
 
-// Inside the Wails shell, suppress the webview's default right-click menu — its
+// Inside the desktop shell, suppress the webview's default right-click menu — its
 // Reload / Back / Inspect entries are easy to hit by accident and can reset or
-// navigate away from the app. Text inputs keep their native Cut/Copy/Paste menu.
+// navigate away from the app. Text inputs keep their native Cut/Copy/Paste menu;
+// the terminal area is exempt so its own context menu can offer copy/paste.
 // Left alone in a plain browser (pnpm dev) so devtools stay reachable.
-if (typeof window !== "undefined" && window.runtime) {
+if (desktopHost().kind !== "none") {
   window.addEventListener("contextmenu", (e) => {
     const target = e.target as HTMLElement | null;
-    if (!target?.closest("input, textarea")) e.preventDefault();
+    if (!target?.closest("input, textarea, .chat-transcript") && !target?.closest(".terminal-view")) e.preventDefault();
   });
 }
 
 const root = document.getElementById("root");
 if (!root) throw new Error("missing #root");
+const rootElement = root;
 
-createRoot(root).render(
-  <StrictMode>
-    <ErrorBoundary>
-      <LocaleProvider>
-        <ToastProvider>
-          <App />
-        </ToastProvider>
-      </LocaleProvider>
-    </ErrorBoundary>
-  </StrictMode>,
-);
+async function mountApp() {
+  // The HTML boot shell paints immediately with critical inline styles. Load
+  // the full stylesheet and detected locale in parallel, then replace that
+  // shell in one React commit so users never see an unstyled application.
+  const preloadLocaleForMount = async () => {
+    await preloadDetectedLocale();
+  };
+  const stylesResult = await Promise.allSettled([
+    new Promise<void>((resolve, reject) => {
+      const link = document.createElement("link");
+      link.rel = "stylesheet";
+      link.href = appShellStylesheetURL;
+      link.onload = () => resolve();
+      link.onerror = () => reject(new Error(`failed to load desktop stylesheet: ${appShellStylesheetURL}`));
+      document.head.appendChild(link);
+    }),
+    preloadLocaleForMount(),
+  ]);
+  const [styleResult, localeResult] = stylesResult;
+  if (styleResult.status === "rejected") {
+    console.error("failed to load desktop stylesheet", styleResult.reason);
+    return;
+  }
+  if (localeResult.status === "rejected") console.error("failed to preload desktop locale", localeResult.reason);
+  createRoot(rootElement).render(
+    <StrictMode>
+      <ErrorBoundary>
+        <LocaleProvider>
+          <ToastProvider>
+            <App />
+          </ToastProvider>
+        </LocaleProvider>
+      </ErrorBoundary>
+    </StrictMode>,
+  );
+
+  void import("./lib/desktopWebViewHeartbeat").then(({ installDesktopWebViewHeartbeat }) => {
+    installDesktopWebViewHeartbeat();
+  });
+}
+
+void mountApp();

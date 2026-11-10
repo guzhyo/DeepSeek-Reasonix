@@ -1,12 +1,14 @@
 package agent
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
 	"time"
 
 	"reasonix/internal/provider"
+	"reasonix/internal/store"
 )
 
 // forkRecoveryBranch builds a real conflict-recovery branch: a diverged disk
@@ -38,10 +40,13 @@ func forkRecoveryBranch(t *testing.T, dir, name string) (parentPath, branchPath 
 // fork preserved" shape that makes the fork redundant.
 func coverBranchInParent(t *testing.T, parentPath string, branchMsgs []provider.Message) {
 	t.Helper()
-	merged := NewSession("")
-	merged.Messages = append([]provider.Message(nil), branchMsgs...)
+	merged, err := LoadSession(parentPath)
+	if err != nil {
+		t.Fatalf("Load covering parent: %v", err)
+	}
+	merged.Replace(append([]provider.Message(nil), branchMsgs...))
 	merged.Add(provider.Message{Role: provider.RoleAssistant, Content: "answered after recovery"})
-	if err := merged.Save(parentPath); err != nil {
+	if err := merged.SaveRewrite(parentPath); err != nil {
 		t.Fatalf("Save covering parent: %v", err)
 	}
 }
@@ -112,12 +117,396 @@ func TestReclaimableRecoveryBranchesRespectsGraceLeaseAndMissingParent(t *testin
 	}
 
 	// Parent gone: content is no longer covered anywhere — kept.
-	for _, suffix := range []string{"", ".events.jsonl", ".meta"} {
-		if err := os.Remove(parentPath + suffix); err != nil && !os.IsNotExist(err) {
-			t.Fatalf("remove parent artifact %s: %v", suffix, err)
+	for _, artifact := range append([]string{parentPath}, store.SessionSidecarFiles(parentPath)...) {
+		if err := os.Remove(artifact); err != nil && !os.IsNotExist(err) {
+			t.Fatalf("remove parent artifact %s: %v", artifact, err)
 		}
 	}
 	if got, err := ReclaimableRecoveryBranches(dir, later, RecoveryGCGracePeriod); err != nil || len(got) != 0 {
 		t.Fatalf("parent missing = %v err=%v, want none", got, err)
+	}
+}
+
+func TestRecoveryBranchCoveredByParentReadsActualContent(t *testing.T) {
+	dir := t.TempDir()
+
+	_, divergedBranch, _ := forkRecoveryBranch(t, dir, "diverged-proof")
+	if RecoveryBranchCoveredByParent(divergedBranch, dir) {
+		t.Fatal("diverged parent reported as covering its recovery branch")
+	}
+
+	coveredParent, coveredBranch, coveredMsgs := forkRecoveryBranch(t, dir, "covered-proof")
+	coverBranchInParent(t, coveredParent, coveredMsgs)
+	if !RecoveryBranchCoveredByParent(coveredBranch, dir) {
+		t.Fatal("parent containing the recovery transcript did not cover the branch")
+	}
+
+	// Restore the fork metadata after continuing the transcript. This models a
+	// stale sidecar that still claims content_digest == recovery_digest even
+	// though the actual branch has changed.
+	staleMeta, ok, err := LoadBranchMeta(coveredBranch)
+	if err != nil || !ok {
+		t.Fatalf("LoadBranchMeta stale branch: ok=%v err=%v", ok, err)
+	}
+	continued, err := LoadSession(coveredBranch)
+	if err != nil {
+		t.Fatalf("LoadSession stale branch: %v", err)
+	}
+	continued.Add(provider.Message{Role: provider.RoleAssistant, Content: "continued after sidecar snapshot"})
+	if err := continued.Save(coveredBranch); err != nil {
+		t.Fatalf("Save continued branch: %v", err)
+	}
+	if err := SaveBranchMetaPreserveUpdated(coveredBranch, staleMeta); err != nil {
+		t.Fatalf("restore stale branch meta: %v", err)
+	}
+	if RecoveryBranchCoveredByParent(coveredBranch, dir) {
+		t.Fatal("stale sidecar authorized cleanup of changed branch content")
+	}
+
+	missingParent, missingBranch, missingMsgs := forkRecoveryBranch(t, dir, "missing-proof")
+	coverBranchInParent(t, missingParent, missingMsgs)
+	if !RecoveryBranchCoveredByParent(missingBranch, dir) {
+		t.Fatal("missing-parent fixture was not covered before parent removal")
+	}
+	for _, artifact := range append([]string{missingParent}, store.SessionSidecarFiles(missingParent)...) {
+		if err := os.Remove(artifact); err != nil && !os.IsNotExist(err) {
+			t.Fatalf("remove parent artifact %s: %v", artifact, err)
+		}
+	}
+	if RecoveryBranchCoveredByParent(missingBranch, dir) {
+		t.Fatal("missing parent reported as covering its recovery branch")
+	}
+}
+
+func TestRecoveryParentGuardBlocksRewindAfterValidation(t *testing.T) {
+	dir := schemaOneTempDir(t)
+	parentPath, branchPath, branchMsgs := forkRecoveryBranch(t, dir, "rewind-race")
+	coverBranchInParent(t, parentPath, branchMsgs)
+
+	guard, err := TryAcquireRecoveryParentGuard(branchPath, dir)
+	if err != nil {
+		t.Fatalf("TryAcquireRecoveryParentGuard: %v", err)
+	}
+	// Force the dangerous ordering: coverage validation has completed, then a
+	// concurrent rewind tries to take the parent's save lock before purge. The
+	// guard must keep that lock unavailable until the caller finishes deleting
+	// the redundant branch.
+	if lock, err := tryTakeSessionLockFile(store.SessionLockFile(parentPath)); !errors.Is(err, ErrSessionFileLockHeld) {
+		if lock != nil {
+			lock.Unlock()
+		}
+		guard.Release()
+		t.Fatalf("parent save lock after coverage validation = %v, want ErrSessionFileLockHeld", err)
+	}
+	guard.Release()
+
+	parent, err := LoadSession(parentPath)
+	if err != nil {
+		t.Fatalf("LoadSession parent: %v", err)
+	}
+	parent.Messages = append([]provider.Message(nil), parent.Messages[:1]...)
+	if err := parent.SaveRewrite(parentPath); err != nil {
+		t.Fatalf("SaveRewrite after guard release: %v", err)
+	}
+	if RecoveryBranchCoveredByParent(branchPath, dir) {
+		t.Fatal("rewound parent still reported as covering the recovery branch")
+	}
+}
+
+func TestRecoveryParentGuardRefusesInFlightParentRewrite(t *testing.T) {
+	dir := t.TempDir()
+	parentPath, branchPath, branchMsgs := forkRecoveryBranch(t, dir, "rewrite-busy")
+	coverBranchInParent(t, parentPath, branchMsgs)
+
+	unlock, err := lockSessionFile(parentPath)
+	if err != nil {
+		t.Fatalf("lockSessionFile: %v", err)
+	}
+	defer unlock()
+	if guard, err := TryAcquireRecoveryParentGuard(branchPath, dir); !errors.Is(err, ErrSessionLeaseHeld) {
+		if guard != nil {
+			guard.Release()
+		}
+		t.Fatalf("guard during parent rewrite err = %v, want ErrSessionLeaseHeld", err)
+	}
+}
+
+func ageRecoveryBranchForGC(t *testing.T, path string) {
+	t.Helper()
+	meta, ok, err := LoadBranchMeta(path)
+	if err != nil || !ok {
+		t.Fatalf("LoadBranchMeta: ok=%v err=%v", ok, err)
+	}
+	meta.UpdatedAt = time.Now().Add(-2 * RecoveryGCGracePeriod)
+	if err := SaveBranchMetaPreserveUpdated(path, meta); err != nil {
+		t.Fatalf("age recovery meta: %v", err)
+	}
+}
+
+func TestTrashReclaimableRecoveryBranchUsesRecoverableDesktopLayout(t *testing.T) {
+	dir := t.TempDir()
+	parentPath, branchPath, branchMsgs := forkRecoveryBranch(t, dir, "trash-covered")
+	coverBranchInParent(t, parentPath, branchMsgs)
+	ageRecoveryBranchForGC(t, branchPath)
+
+	if err := TrashReclaimableRecoveryBranch(branchPath, dir); err != nil {
+		t.Fatalf("TrashReclaimableRecoveryBranch: %v", err)
+	}
+	if _, err := os.Stat(branchPath); !os.IsNotExist(err) {
+		t.Fatalf("live recovery transcript still exists: %v", err)
+	}
+	if IsCleanupPending(branchPath) {
+		t.Fatal("cleanup-pending marker remained after completed trash move")
+	}
+	itemDir := filepath.Join(dir, recoveryTrashDir, filepath.Base(branchPath))
+	for _, path := range []string{
+		filepath.Join(itemDir, filepath.Base(branchPath)),
+		filepath.Join(itemDir, filepath.Base(BranchMetaPath(branchPath))),
+		filepath.Join(itemDir, filepath.Base(store.SessionEventLog(branchPath))),
+		filepath.Join(itemDir, recoveryTrashMetaFile),
+	} {
+		if _, err := os.Stat(path); err != nil {
+			t.Fatalf("recoverable trash artifact %s: %v", path, err)
+		}
+	}
+	if _, err := os.Stat(parentPath); err != nil {
+		t.Fatalf("parent session changed by recovery trash: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(itemDir, recoveryTrashPendingFile)); !os.IsNotExist(err) {
+		t.Fatalf("completed trash entry retained pending marker: %v", err)
+	}
+}
+
+func TestTrashRecoveryBranchCoveredByCanonicalCompactsLegacyChain(t *testing.T) {
+	dir := t.TempDir()
+	rootPath := filepath.Join(dir, "root.jsonl")
+	ancestorPath := filepath.Join(dir, "ancestor.jsonl")
+	canonicalPath := filepath.Join(dir, "canonical.jsonl")
+	root := NewSession("sys")
+	root.Add(provider.Message{Role: provider.RoleUser, Content: "root"})
+	if err := root.Save(rootPath); err != nil {
+		t.Fatal(err)
+	}
+	ancestor := NewSession("")
+	ancestor.Replace(root.Snapshot())
+	ancestor.Add(provider.Message{Role: provider.RoleAssistant, Content: "ancestor"})
+	if err := ancestor.Save(ancestorPath); err != nil {
+		t.Fatal(err)
+	}
+	if err := SaveBranchMetaPreserveUpdated(ancestorPath, BranchMeta{ID: "ancestor", Recovered: true, ParentID: "root", RecoveryDepth: 1}); err != nil {
+		t.Fatal(err)
+	}
+	canonical := NewSession("")
+	canonical.Replace(ancestor.Snapshot())
+	canonical.Add(provider.Message{Role: provider.RoleUser, Content: "continued"})
+	if err := canonical.Save(canonicalPath); err != nil {
+		t.Fatal(err)
+	}
+	if err := SaveBranchMetaPreserveUpdated(canonicalPath, BranchMeta{ID: "canonical", Recovered: true, ParentID: "ancestor", RecoveryDepth: 2}); err != nil {
+		t.Fatal(err)
+	}
+	if err := ReparentRecoveryCanonical(canonicalPath, "root", dir); err != nil {
+		t.Fatalf("ReparentRecoveryCanonical: %v", err)
+	}
+	if err := TrashRecoveryBranchCoveredBy(ancestorPath, canonicalPath, dir); err != nil {
+		t.Fatalf("TrashRecoveryBranchCoveredBy: %v", err)
+	}
+	meta, ok, err := LoadBranchMeta(canonicalPath)
+	if err != nil || !ok || meta.ParentID != "root" || meta.RecoveryDepth != 1 {
+		t.Fatalf("canonical meta = %+v ok=%v err=%v", meta, ok, err)
+	}
+	if _, err := os.Stat(rootPath); err != nil {
+		t.Fatalf("root was removed: %v", err)
+	}
+	if _, err := os.Stat(canonicalPath); err != nil {
+		t.Fatalf("canonical was removed: %v", err)
+	}
+	if _, err := os.Stat(ancestorPath); !os.IsNotExist(err) {
+		t.Fatalf("ancestor remained live: %v", err)
+	}
+}
+
+func TestSetRecoveryPreferredKeepsExactlyOneChoice(t *testing.T) {
+	dir := t.TempDir()
+	paths := []string{filepath.Join(dir, "left.jsonl"), filepath.Join(dir, "right.jsonl")}
+	for _, path := range paths {
+		session := NewSession("sys")
+		session.Add(provider.Message{Role: provider.RoleUser, Content: path})
+		if err := session.Save(path); err != nil {
+			t.Fatal(err)
+		}
+		if err := SaveBranchMeta(path, BranchMeta{ID: BranchID(path), Recovered: true, ParentID: "root"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := SetRecoveryPreferred(paths, paths[0]); err != nil {
+		t.Fatal(err)
+	}
+	if err := SetRecoveryPreferred(paths, paths[1]); err != nil {
+		t.Fatal(err)
+	}
+	for index, path := range paths {
+		meta, ok, err := LoadBranchMeta(path)
+		if err != nil || !ok {
+			t.Fatalf("meta %q ok=%v err=%v", path, ok, err)
+		}
+		if meta.RecoveryPreferred != (index == 1) {
+			t.Fatalf("preferred[%d] = %v", index, meta.RecoveryPreferred)
+		}
+		if index == 1 && !RecoveryPreferenceCurrent(path, meta) {
+			t.Fatal("saved preference fingerprint was not current")
+		}
+	}
+	chosen, err := LoadSession(paths[1])
+	if err != nil {
+		t.Fatal(err)
+	}
+	chosen.Add(provider.Message{Role: provider.RoleAssistant, Content: "changed"})
+	if err := chosen.SaveSnapshot(paths[1]); err != nil {
+		t.Fatal(err)
+	}
+	meta, _, _ := LoadBranchMeta(paths[1])
+	if RecoveryPreferenceCurrent(paths[1], meta) {
+		t.Fatal("content change must invalidate the explicit preference")
+	}
+}
+
+func TestSetRecoveryPreferredAllowsOriginalLineageMember(t *testing.T) {
+	dir := t.TempDir()
+	root := filepath.Join(dir, "root.jsonl")
+	branch := filepath.Join(dir, "branch.jsonl")
+	for _, path := range []string{root, branch} {
+		session := NewSession("sys")
+		session.Add(provider.Message{Role: provider.RoleUser, Content: filepath.Base(path)})
+		if err := session.Save(path); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := SaveBranchMeta(root, BranchMeta{ID: BranchID(root)}); err != nil {
+		t.Fatal(err)
+	}
+	if err := SaveBranchMeta(branch, BranchMeta{ID: BranchID(branch), Recovered: true, ParentID: BranchID(root)}); err != nil {
+		t.Fatal(err)
+	}
+	if err := SetRecoveryPreferred([]string{root, branch}, root); err != nil {
+		t.Fatal(err)
+	}
+	rootMeta, ok, err := LoadBranchMeta(root)
+	if err != nil || !ok || !rootMeta.RecoveryPreferred || !RecoveryPreferenceCurrent(root, rootMeta) {
+		t.Fatalf("original preference ok=%v err=%v meta=%+v", ok, err, rootMeta)
+	}
+	branchMeta, _, _ := LoadBranchMeta(branch)
+	if branchMeta.RecoveryPreferred {
+		t.Fatal("choosing the original left a recovery leaf preferred")
+	}
+}
+
+func TestTrashReclaimableRecoveryBranchEnforcesGraceAtFinalGuard(t *testing.T) {
+	dir := t.TempDir()
+	parentPath, branchPath, branchMsgs := forkRecoveryBranch(t, dir, "trash-fresh")
+	coverBranchInParent(t, parentPath, branchMsgs)
+
+	if err := TrashReclaimableRecoveryBranch(branchPath, dir); !errors.Is(err, ErrRecoveryBranchNotIdle) {
+		t.Fatalf("fresh recovery trash err = %v, want ErrRecoveryBranchNotIdle", err)
+	}
+	if _, err := os.Stat(branchPath); err != nil {
+		t.Fatalf("fresh recovery branch was not preserved: %v", err)
+	}
+}
+
+func TestInterruptedRecoveryTrashStageReconcilesBeforePublication(t *testing.T) {
+	dir := t.TempDir()
+	_, branchPath, _ := forkRecoveryBranch(t, dir, "staged-crash")
+	key := filepath.Base(branchPath)
+	stageDir, err := reserveRecoveryTrashStage(dir)
+	if err != nil {
+		t.Fatalf("reserveRecoveryTrashStage: %v", err)
+	}
+	if err := prepareRecoveryTrashStage(branchPath, key, stageDir); err != nil {
+		t.Fatalf("prepareRecoveryTrashStage: %v", err)
+	}
+	if IsCleanupPending(branchPath) {
+		t.Fatal("live cleanup marker should not be used by the staging protocol")
+	}
+	if _, err := os.Stat(branchPath); !os.IsNotExist(err) {
+		t.Fatalf("live transcript still exists after staging: %v", err)
+	}
+	if store.IsSessionTranscriptName(filepath.Base(stageDir)) {
+		t.Fatalf("staging directory is Desktop-visible by name: %s", stageDir)
+	}
+	for _, target := range []string{
+		filepath.Join(stageDir, key),
+		filepath.Join(stageDir, recoveryTrashPendingFile),
+	} {
+		if _, err := os.Stat(target); err != nil {
+			t.Fatalf("staged recovery artifact %s: %v", target, err)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(stageDir, recoveryTrashMetaFile)); !os.IsNotExist(err) {
+		t.Fatalf("incomplete stage became Desktop-visible through trash metadata: %v", err)
+	}
+
+	// Simulate a process crash after the transcript rename but before any
+	// sidecars moved. Startup reconciliation must finish the hidden stage and
+	// publish one complete Desktop trash item without the hard-delete callback.
+	calledFallback := false
+	if err := ReconcileCleanupPending(dir, func(CleanupPendingInfo) error {
+		calledFallback = true
+		return errors.New("hard-delete fallback must not run")
+	}); err != nil {
+		t.Fatalf("ReconcileCleanupPending: %v", err)
+	}
+	if calledFallback {
+		t.Fatal("recovery trash stage reached hard-delete fallback")
+	}
+	if _, err := os.Stat(stageDir); !os.IsNotExist(err) {
+		t.Fatalf("staging directory remained after publication: %v", err)
+	}
+	itemDir := filepath.Join(dir, recoveryTrashDir, key)
+	for _, target := range []string{
+		filepath.Join(itemDir, key),
+		filepath.Join(itemDir, filepath.Base(BranchMetaPath(branchPath))),
+		filepath.Join(itemDir, filepath.Base(store.SessionEventLog(branchPath))),
+		filepath.Join(itemDir, recoveryTrashMetaFile),
+	} {
+		if _, err := os.Stat(target); err != nil {
+			t.Fatalf("reconciled recovery artifact %s: %v", target, err)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(itemDir, recoveryTrashPendingFile)); !os.IsNotExist(err) {
+		t.Fatalf("published trash entry retained pending marker: %v", err)
+	}
+}
+
+func TestReconcileCleanupPendingFinishesRecoveryTrashWithoutHardDeleteCallback(t *testing.T) {
+	dir := t.TempDir()
+	_, branchPath, _ := forkRecoveryBranch(t, dir, "trash-interrupted")
+	key := filepath.Base(branchPath)
+	itemName, itemDir, err := reserveRecoveryTrashItemDir(dir, key)
+	if err != nil {
+		t.Fatalf("reserveRecoveryTrashItemDir: %v", err)
+	}
+	if err := prepareRecoveryTrashEntry(branchPath, key, itemDir); err != nil {
+		t.Fatalf("prepare trash entry before simulated crash: %v", err)
+	}
+	if err := MarkCleanupPending(branchPath, recoveryTrashOperationPrefix+itemName); err != nil {
+		t.Fatalf("MarkCleanupPending: %v", err)
+	}
+
+	calledFallback := false
+	if err := ReconcileCleanupPending(dir, func(CleanupPendingInfo) error {
+		calledFallback = true
+		return errors.New("hard-delete fallback must not run")
+	}); err != nil {
+		t.Fatalf("ReconcileCleanupPending: %v", err)
+	}
+	if calledFallback {
+		t.Fatal("recovery-trash marker reached hard-delete fallback")
+	}
+	if IsCleanupPending(branchPath) {
+		t.Fatal("cleanup-pending marker remained after reconciliation")
+	}
+	if _, err := os.Stat(filepath.Join(itemDir, recoveryTrashMetaFile)); err != nil {
+		t.Fatalf("reconciled trash metadata: %v", err)
 	}
 }

@@ -3,9 +3,12 @@ package builtin
 import (
 	"fmt"
 	"os"
+	"slices"
 	"strings"
 
+	"reasonix/internal/fileutil"
 	fileenc "reasonix/internal/fileutil/encoding"
+	"reasonix/internal/tool"
 )
 
 // readFileEncoded reads a file and decodes its encoding to UTF-8.
@@ -16,13 +19,20 @@ func readFileEncoded(path string) (content string, enc fileenc.Kind, err error) 
 	if err != nil {
 		return "", 0, err
 	}
-	enc, _ = fileenc.Detect(b)
-	return string(fileenc.Decode(b, enc)), enc, nil
+	enc, text := fileenc.DetectAndDecode(b)
+	return string(text), enc, nil
 }
 
 // writeFileEncoded encodes content back to the given encoding and writes it.
+// The write is atomic: a truncating write that fails midway (a Windows filter
+// driver holding a transient lock, a full disk) would leave the user's source
+// file empty or half-written.
 func writeFileEncoded(path string, content string, enc fileenc.Kind) error {
-	return os.WriteFile(path, fileenc.Encode(content, enc), 0o644)
+	data, err := fileenc.Encode(content, enc)
+	if err != nil {
+		return err
+	}
+	return fileutil.AtomicOverwriteFileStrict(path, data, 0o644)
 }
 
 // matchLineEndings adapts an edit's old/new text to a CRLF file when the literal
@@ -56,11 +66,23 @@ type editApplyResult struct {
 	applied int
 	matches int
 	fuzzy   bool
+	receipt editReplacementReceipt
 }
 
 type editRange struct {
 	start int
 	end   int
+}
+
+// editReplacementReceipt records only the span the tool actually matched and
+// the span it wrote in its place. It deliberately excludes surrounding file
+// content so a successful edit can ground the next model turn without widening
+// provider-visible workspace data.
+type editReplacementReceipt struct {
+	matched     string
+	replacement string
+	occurrences int
+	fuzzy       bool
 }
 
 // applyOldStringEdit is the shared edit_file/multi_edit/Preview contract. It
@@ -77,17 +99,29 @@ func applyOldStringEdit(content, oldString, newString string, replaceAll bool) e
 				updated: strings.ReplaceAll(content, old, newStr),
 				applied: count,
 				matches: count,
+				receipt: editReplacementReceipt{
+					matched:     old,
+					replacement: newStr,
+					occurrences: count,
+				},
 			}
 		}
 		ranges := fuzzyEditRanges(content, old)
 		if len(ranges) == 0 {
 			return editApplyResult{updated: content}
 		}
+		replacement := matchReplacementLineEndings(content, newStr)
 		return editApplyResult{
-			updated: replaceEditRanges(content, ranges, matchReplacementLineEndings(content, newStr)),
+			updated: replaceEditRanges(content, ranges, replacement),
 			applied: len(ranges),
 			matches: len(ranges),
 			fuzzy:   true,
+			receipt: editReplacementReceipt{
+				matched:     matchedRangeSample(content, old, ranges),
+				replacement: replacement,
+				occurrences: len(ranges),
+				fuzzy:       true,
+			},
 		}
 	}
 
@@ -102,27 +136,75 @@ func applyOldStringEdit(content, oldString, newString string, replaceAll bool) e
 			applied: 1,
 			matches: 1,
 			fuzzy:   true,
+			receipt: editReplacementReceipt{
+				matched:     matchedRangeSample(content, old, ranges),
+				replacement: matchReplacementLineEndings(content, newStr),
+				occurrences: 1,
+				fuzzy:       true,
+			},
 		}
 	case 1:
 		return editApplyResult{
 			updated: strings.Replace(content, old, newStr, 1),
 			applied: 1,
 			matches: 1,
+			receipt: editReplacementReceipt{
+				matched:     old,
+				replacement: newStr,
+				occurrences: 1,
+			},
 		}
 	default:
 		return editApplyResult{updated: content, matches: count}
 	}
 }
 
-func oldStringNotFoundError(path, oldString, content string) error {
-	hint := " Re-read the current file before retrying; if several related edits target the same area, combine the final replacements in one multi_edit call."
+func matchedRangeSample(content, fallback string, ranges []editRange) string {
+	if len(ranges) == 0 {
+		return fallback
+	}
+	r := ranges[0]
+	if r.start < 0 || r.end < r.start || r.end > len(content) {
+		return fallback
+	}
+	actual := content[r.start:r.end]
+	sample := clipPostWriteSpan(actual, maxCapturedReceiptSpanBytes)
+	if len(sample) == len(actual) {
+		// Do not let a short substring keep an otherwise-dead large intermediate
+		// multi_edit buffer alive until all later steps finish.
+		return strings.Clone(sample)
+	}
+	return sample
+}
+
+func oldStringNotFoundError(path, oldString, content string) (err error) {
+	defer func() {
+		err = &tool.OperationError{Diagnostic: tool.OperationDiagnostic{Code: tool.WriteEvidenceStale, Path: path, Recovery: "re-read the target range, then retry with its current text"}, Cause: err}
+	}()
+	hint := oldStringNotFoundHint(oldString, content)
 	if line, text, ok := nearestContentLine(oldString, content); ok {
 		return fmt.Errorf("old_string not found in %s (nearest line %d: %q).%s", path, line, text, hint)
 	}
 	return fmt.Errorf("old_string not found in %s.%s", path, hint)
 }
 
-func oldStringNotUniqueError(path, oldString, content string, matches int, replaceAllHint bool) error {
+func oldStringNotFoundHint(oldString, content string) string {
+	base := " Re-read the current file before retrying; if several related edits target the same area, combine the final replacements in one multi_edit call."
+	if !strings.Contains(content, "\r\n") {
+		return base
+	}
+	normalizedContent := strings.ReplaceAll(content, "\r\n", "\n")
+	normalizedOld := strings.ReplaceAll(oldString, "\r\n", "\n")
+	if strings.Contains(normalizedContent, normalizedOld) {
+		return " The target file uses CRLF line endings; edit_file/multi_edit normally normalize LF-only old_string for CRLF files, so this is likely stale context. Re-read the current file before retrying."
+	}
+	return " The target file uses CRLF line endings, but edit_file/multi_edit already tolerate LF-only old_string for CRLF files; check for stale, incomplete, or non-unique context before retrying."
+}
+
+func oldStringNotUniqueError(path, oldString, content string, matches int, replaceAllHint bool) (err error) {
+	defer func() {
+		err = &tool.OperationError{Diagnostic: tool.OperationDiagnostic{Code: tool.WriteTargetAmbiguous, Path: path, Recovery: "read surrounding lines and use a unique anchor"}, Cause: err}
+	}()
 	lineHint := oldStringMatchLineSummary(oldString, content, 5)
 	if replaceAllHint {
 		return fmt.Errorf("old_string is not unique in %s (%d matches)%s; add nearby unique code, not just repeated separator lines, or set replace_all if every match should change", path, matches, lineHint)
@@ -287,8 +369,8 @@ func stripReadFileLinePrefix(line string) (string, bool) {
 
 func replaceEditRanges(content string, ranges []editRange, replacement string) string {
 	updated := content
-	for i := len(ranges) - 1; i >= 0; i-- {
-		r := ranges[i]
+	for _, v := range slices.Backward(ranges) {
+		r := v
 		updated = updated[:r.start] + replacement + updated[r.end:]
 	}
 	return updated
@@ -367,11 +449,8 @@ func firstNonEmptyLine(s string) string {
 }
 
 func commonPrefixLen(a, b string) int {
-	n := len(a)
-	if len(b) < n {
-		n = len(b)
-	}
-	for i := 0; i < n; i++ {
+	n := min(len(b), len(a))
+	for i := range n {
 		if a[i] != b[i] {
 			return i
 		}

@@ -3,6 +3,7 @@ package memory
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -70,5 +71,46 @@ func TestAppendDocNormalizesNote(t *testing.T) {
 	body := string(b)
 	if !strings.Contains(body, "- line one line two with spaces") {
 		t.Fatalf("note not normalised to one line:\n%s", body)
+	}
+}
+
+func TestAppendDocRejectsSymlinkDestination(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlink creation requires elevated privileges on common Windows setups")
+	}
+	outside := filepath.Join(t.TempDir(), "outside.md")
+	if err := os.WriteFile(outside, []byte("keep me"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(t.TempDir(), "AGENTS.md")
+	if err := os.Symlink(outside, link); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := AppendDoc(link, "must stay local"); err == nil {
+		t.Fatal("AppendDoc followed a symlink destination")
+	}
+	body, err := os.ReadFile(outside)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(body) != "keep me" {
+		t.Fatalf("outside target changed to %q", body)
+	}
+}
+
+// TestAppendDocPropagatesReadErrors pins the fail-safe contract: a doc-memory
+// file that exists but cannot be read (permission, encoding, IO) must surface
+// the read error instead of treating the file as empty and overwriting it with
+// a fresh Notes-only document, which would silently destroy existing content.
+func TestAppendDocPropagatesReadErrors(t *testing.T) {
+	// A directory is a real path that os.ReadFile refuses with a non-NotExist
+	// error (EISDIR), exercising the "exists but unreadable" branch without
+	// relying on permission bits that vary across platforms and CI users.
+	dir := t.TempDir()
+	if err := AppendDoc(dir, "note"); err == nil {
+		t.Fatal("AppendDoc on an unreadable path must fail")
+	} else if !strings.Contains(err.Error(), "read") {
+		t.Fatalf("error must surface the read failure, got %q", err)
 	}
 }

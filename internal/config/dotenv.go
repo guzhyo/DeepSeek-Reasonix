@@ -7,6 +7,8 @@ import (
 	"strings"
 
 	"github.com/joho/godotenv"
+
+	fileencoding "reasonix/internal/fileutil/encoding"
 )
 
 type dotEnvFile struct {
@@ -122,7 +124,11 @@ func loadDotEnvFileAs(path string, source CredentialSource) {
 }
 
 func readDotEnvFile(path string) (dotEnvFile, bool) {
-	values, err := godotenv.Read(path)
+	raw, err := readCredentialFile(path)
+	if err != nil {
+		return dotEnvFile{}, false
+	}
+	values, err := godotenv.Unmarshal(string(fileencoding.DecodeToUTF8(raw)))
 	if err != nil {
 		return dotEnvFile{}, false
 	}
@@ -160,13 +166,13 @@ func (f dotEnvFile) warnings() []string {
 }
 
 func detectDotEnvDuplicateKeys(path string) []string {
-	raw, err := os.ReadFile(path)
+	raw, err := fileencoding.ReadFileUTF8(path)
 	if err != nil {
 		return nil
 	}
 	seen := map[string]bool{}
 	dups := map[string]bool{}
-	for _, line := range strings.Split(strings.ReplaceAll(string(raw), "\r\n", "\n"), "\n") {
+	for line := range strings.SplitSeq(strings.ReplaceAll(string(raw), "\r\n", "\n"), "\n") {
 		values, err := godotenv.Unmarshal(line)
 		if err != nil {
 			continue

@@ -14,6 +14,7 @@ import (
 	"testing"
 	"unicode/utf16"
 
+	"go.uber.org/goleak"
 	"golang.org/x/text/encoding/simplifiedchinese"
 
 	"reasonix/internal/tool"
@@ -42,7 +43,7 @@ func runTool(t *testing.T, tl tool.Tool, m map[string]any) string {
 }
 
 func TestBuiltinsRegistered(t *testing.T) {
-	want := []string{"bash", "code_index", "edit_file", "glob", "grep", "ls", "move_file", "multi_edit", "read_file", "web_fetch", "write_file"}
+	want := []string{"bash", "code_index", "compress", "edit_file", "glob", "grep", "ls", "move_file", "multi_edit", "read_file", "web_fetch", "write_file"}
 	for _, name := range want {
 		if _, ok := tool.LookupBuiltin(name); !ok {
 			t.Errorf("built-in %q not registered", name)
@@ -57,7 +58,7 @@ func TestBuiltinsRegistered(t *testing.T) {
 // many invocations are pure reads — args aren't introspected.
 func TestBuiltinReadOnlyClassification(t *testing.T) {
 	readOnly := map[string]bool{
-		"read_file": true, "ls": true, "glob": true, "grep": true, "code_index": true, "web_fetch": true,
+		"read_file": true, "ls": true, "glob": true, "grep": true, "code_index": true, "compress": true, "web_fetch": true,
 		"write_file": false, "edit_file": false, "multi_edit": false, "move_file": false, "bash": false,
 	}
 	for name, want := range readOnly {
@@ -68,6 +69,74 @@ func TestBuiltinReadOnlyClassification(t *testing.T) {
 		if got := tl.ReadOnly(); got != want {
 			t.Errorf("%s.ReadOnly() = %v, want %v", name, got, want)
 		}
+	}
+}
+
+type compressStub struct {
+	request tool.CompressRequest
+	result  tool.CompressResult
+}
+
+func (s *compressStub) CompressContext(_ context.Context, request tool.CompressRequest) (tool.CompressResult, error) {
+	s.request = request
+	return s.result, nil
+}
+
+func TestCompressToolProtocol(t *testing.T) {
+	stub := &compressStub{result: tool.CompressResult{
+		Status: "ok", Direction: "before", Anchor: "unique", Messages: 4,
+		SourceTokens: 900, ProjectionTokens: 200, Mode: "summarized",
+	}}
+	ctx := tool.WithContextCompressor(context.Background(), stub)
+	out, err := (compressContext{}).Execute(ctx, argsJSON(t, map[string]any{
+		"direction": "before", "anchor": "  unique excerpt  ", "focus": " keep decisions ",
+	}))
+	if err != nil {
+		t.Fatalf("compress Execute: %v", err)
+	}
+	if stub.request.Direction != "before" || stub.request.Anchor != "unique excerpt" || stub.request.Focus != "keep decisions" {
+		t.Fatalf("forwarded request = %+v", stub.request)
+	}
+	var got tool.CompressResult
+	if err := json.Unmarshal([]byte(out), &got); err != nil {
+		t.Fatalf("decode result: %v", err)
+	}
+	if got != stub.result {
+		t.Fatalf("result = %+v, want %+v", got, stub.result)
+	}
+	if !(compressContext{}).ReadOnly() || !(compressContext{}).PlanModeSafe() {
+		t.Fatal("compress must be workspace-read-only and Plan Mode safe")
+	}
+}
+
+func TestCompressToolRejectsInvalidArgs(t *testing.T) {
+	tests := []struct {
+		name string
+		args map[string]any
+		want string
+	}{
+		{name: "direction", args: map[string]any{"direction": "around", "anchor": "x"}, want: "direction"},
+		{name: "case-sensitive direction", args: map[string]any{"direction": "Before", "anchor": "x"}, want: "direction"},
+		{name: "empty anchor", args: map[string]any{"direction": "before", "anchor": "  "}, want: "empty"},
+		{name: "long anchor", args: map[string]any{"direction": "before", "anchor": strings.Repeat("a", 513)}, want: "512 bytes"},
+		{name: "long focus", args: map[string]any{"direction": "before", "anchor": "x", "focus": strings.Repeat("a", 2001)}, want: "2000 bytes"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := (compressContext{}).Execute(context.Background(), argsJSON(t, tt.args))
+			if err == nil || !strings.Contains(err.Error(), tt.want) {
+				t.Fatalf("error = %v, want containing %q", err, tt.want)
+			}
+		})
+	}
+}
+
+func TestCompressToolRequiresActiveAgent(t *testing.T) {
+	_, err := (compressContext{}).Execute(context.Background(), argsJSON(t, map[string]any{
+		"direction": "after", "anchor": "unique",
+	}))
+	if err == nil || !strings.Contains(err.Error(), "active agent session") {
+		t.Fatalf("error = %v, want unavailable context compressor", err)
 	}
 }
 
@@ -124,7 +193,7 @@ func TestReadFileOffsetLimit(t *testing.T) {
 		}
 	}
 	// Trailer announces what's left so the model can paginate.
-	if !strings.Contains(out, "more line") || !strings.Contains(out, "offset=15") {
+	if !strings.Contains(out, "PARTIAL view") || !strings.Contains(out, "offset=15") {
 		t.Errorf("pagination hint missing:\n%s", out)
 	}
 }
@@ -182,7 +251,15 @@ func TestEditFile(t *testing.T) {
 	f := filepath.Join(t.TempDir(), "a.txt")
 	os.WriteFile(f, []byte("hello world\n"), 0o644)
 
-	runTool(t, editFile{}, map[string]any{"path": f, "old_string": "world", "new_string": "reasonix"})
+	out := runTool(t, editFile{}, map[string]any{"path": f, "old_string": "world", "new_string": "reasonix"})
+	for _, want := range []string{"Actual replacement receipt after write:", "-world", "+reasonix"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("edit result should contain %q in actual post-write receipt:\n%s", want, out)
+		}
+	}
+	if strings.Contains(out, "hello") {
+		t.Fatalf("edit receipt should not include unchanged same-line content:\n%s", out)
+	}
 	if b, _ := os.ReadFile(f); string(b) != "hello reasonix\n" {
 		t.Fatalf("after edit = %q", b)
 	}
@@ -215,6 +292,14 @@ func TestMultiEdit(t *testing.T) {
 	})
 	if !strings.Contains(out, "multi_edit") || !strings.Contains(out, "2 edits applied") {
 		t.Errorf("summary unexpected: %q", out)
+	}
+	for _, want := range []string{"Actual replacement receipt after write:", "-package old", "+package new", "-old", "+reasonix"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("multi_edit result should contain %q in actual post-write receipt:\n%s", want, out)
+		}
+	}
+	if strings.Contains(out, "func reasonix") {
+		t.Fatalf("multi_edit receipt should not include unchanged same-line content:\n%s", out)
 	}
 	got, _ := os.ReadFile(f)
 	want := "package new\n\nfunc reasonix() {\n\treasonix()\n}\n"
@@ -473,7 +558,7 @@ func TestGlobNoMatches(t *testing.T) {
 	}
 }
 
-// --- GB18030 encoding integration tests (issue #2637) ---
+// GB18030 encoding integration tests (issue #2637)
 
 func TestReadFileGB18030(t *testing.T) {
 	f := filepath.Join(t.TempDir(), "gbk.txt")
@@ -537,5 +622,55 @@ func TestGrepGB18030(t *testing.T) {
 	out := runTool(t, grepTool{}, map[string]any{"pattern": "函数", "path": dir})
 	if !strings.Contains(out, "函数") {
 		t.Errorf("expected match in decoded GB18030 text, got:\n%s", out)
+	}
+}
+
+// The 8 KiB peek ends inside a two-byte character whose lead byte is also a
+// UTF-8 continuation byte, so no UTF-8 rune trim removes it. Detection must not
+// read the cut as a sign the file is anything but GB18030.
+func TestGrepGB18030PeekCutMidCharacter(t *testing.T) {
+	enc := simplifiedchinese.GB18030.NewEncoder()
+	line, err := enc.String(strings.Repeat("啊", 50) + "\n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if 8*1024%len(line)%2 == 0 {
+		t.Fatal("fixture does not cut a character at the peek boundary")
+	}
+	target, _ := enc.String("目标行\n")
+	path := filepath.Join(t.TempDir(), "long.gbk")
+	if err := os.WriteFile(path, []byte(strings.Repeat(line, 100)+target), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	out := runTool(t, grepTool{}, map[string]any{"pattern": "目标", "path": path})
+	if !strings.Contains(out, "目标行") {
+		t.Errorf("expected match past the peek in decoded GB18030 text, got:\n%s", out)
+	}
+}
+
+func TestGrepGB18030TruncationDoesNotLeakGoroutine(t *testing.T) {
+	defer goleak.VerifyNone(t, goleak.IgnoreCurrent())
+
+	var content strings.Builder
+	for range grepMaxMatches {
+		content.WriteString("命中\n")
+	}
+	content.WriteString(strings.Repeat("padding\n", 2000))
+	gb, err := simplifiedchinese.GB18030.NewEncoder().String(content.String())
+	if err != nil {
+		t.Fatalf("encode GB18030: %v", err)
+	}
+
+	path := filepath.Join(t.TempDir(), "many-matches.gbk")
+	if err := os.WriteFile(path, []byte(gb), 0o644); err != nil {
+		t.Fatalf("write fixture: %v", err)
+	}
+
+	out := runTool(t, grepTool{}, map[string]any{"pattern": "命中", "path": path})
+	if got := strings.Count(out, ":命中"); got != grepMaxMatches {
+		t.Fatalf("matches = %d, want %d:\n%s", got, grepMaxMatches, out)
+	}
+	if !strings.Contains(out, "truncated at 200 matches") {
+		t.Fatalf("missing truncation marker:\n%s", out)
 	}
 }

@@ -7,6 +7,10 @@ import (
 	"os"
 	"path/filepath"
 
+	"reasonix/internal/fileops"
+	"reasonix/internal/fileutil"
+	fileenc "reasonix/internal/fileutil/encoding"
+	"reasonix/internal/sandbox"
 	"reasonix/internal/tool"
 )
 
@@ -19,8 +23,18 @@ func init() { tool.RegisterBuiltin(writeFile{}) }
 // non-empty, is the directory a relative path resolves against (see resolveIn).
 type writeFile struct {
 	roots   []string
+	rootSet *sandbox.WritableRootSet
 	guard   SessionDataGuard
+	managed ManagedConfigPaths
 	workDir string
+	// overlay, when non-nil, routes the write through the host transport so an
+	// open editor buffer updates too. Consulted only after write confinement,
+	// and only for plain-UTF-8 targets (the overlay is text-only, so non-UTF-8
+	// files keep the local encoding-preserving path).
+	overlay FileOverlay
+	// receipt is an optional per-runtime effect hook. hadPrior means an existing
+	// file was overwritten; prior is its previous content.
+	receipt func(path string, hadPrior bool, prior []byte)
 }
 
 func (writeFile) Name() string { return "write_file" }
@@ -35,6 +49,10 @@ func (writeFile) Schema() json.RawMessage {
 
 func (writeFile) ReadOnly() bool { return false }
 
+func (w writeFile) DeclareWriteAccess(args json.RawMessage) (tool.WriteAccessDeclaration, error) {
+	return declareFilePathWriteAccess(w.workDir, args)
+}
+
 func (w writeFile) Execute(ctx context.Context, args json.RawMessage) (string, error) {
 	var p struct {
 		Path    string `json:"path"`
@@ -47,24 +65,105 @@ func (w writeFile) Execute(ctx context.Context, args json.RawMessage) (string, e
 		return "", fmt.Errorf("path is required")
 	}
 	p.Path = resolveIn(w.workDir, p.Path)
-	if err := confineWrite(w.roots, w.guard, p.Path); err != nil {
+	if err := confineWrite(ctx, effectiveWriteRoots(ctx, w.rootSet, w.roots), w.guard, w.managed, p.Path); err != nil {
 		return "", err
 	}
+	unlock := lockMutationPath(p.Path)
+	defer unlock()
 	// Preserve the existing file's encoding (GBK/UTF-16/BOM) on overwrite instead
-	// of always writing UTF-8, which would silently corrupt a non-UTF-8 file.
-	// readFileEncoded returns enc=UTF8 for a missing file — the right default for
-	// a newly created one.
-	existing, enc, rerr := readFileEncoded(p.Path)
-	if rerr == nil && existing == p.Content {
-		return fmt.Sprintf("%s already contains the exact content; no changes made", p.Path), nil
+	// of always writing UTF-8, which would silently corrupt a non-UTF-8 file. A
+	// missing file yields enc=UTF8 — the right default for a new one. Reading via
+	// the overlay makes the no-op check see the same buffer Preview does.
+	src, rerr := readEditSource(ctx, w.overlay, p.Path)
+	if rerr != nil && !os.IsNotExist(rerr) {
+		return "", rerr
 	}
-	if dir := filepath.Dir(p.Path); dir != "" && dir != "." {
-		if err := os.MkdirAll(dir, 0o755); err != nil {
-			return "", fmt.Errorf("mkdir %s: %w", dir, err)
+	if rerr != nil && fileops.FromContext(ctx).Get(fileops.DiskTarget(p.Path, nil)).Kind == fileops.Present {
+		return "", &tool.OperationError{Diagnostic: tool.OperationDiagnostic{Code: tool.FSStaleVersion, Path: p.Path, Recovery: "the observed file was removed; read its current state before creating it again"}, Cause: ErrFileChanged}
+	}
+	if rerr == nil {
+		if err := src.requireObserved(ctx, w.overlay, p.Path); err != nil {
+			return "", err
+		}
+		if src.content == p.Content {
+			return fmt.Sprintf("%s already contains the exact content; no changes made", p.Path), nil
 		}
 	}
-	if err := writeFileEncoded(p.Path, p.Content, enc); err != nil {
-		return "", fmt.Errorf("write %s: %w", p.Path, err)
+	if err := src.assertUnchanged(ctx, w.overlay, p.Path); err != nil {
+		return "", err
+	}
+	// The host overlay applies the write to the editor buffer and the file in
+	// one step. Text-only, so it handles plain UTF-8 targets (and new files);
+	// non-UTF-8 files stay on the local encoding-preserving path below.
+	if w.overlay != nil && filepath.IsAbs(p.Path) && (rerr != nil || src.overlay) {
+		if err := src.recordWrite(ctx, p.Path, p.Content, "overlay", w.overlay); err != nil {
+			return "", err
+		}
+		if err := src.assertUnchanged(ctx, w.overlay, p.Path); err != nil {
+			return "", err
+		}
+		if ok, werr := w.overlay.WriteTextFile(ctx, p.Path, p.Content); ok {
+			if werr != nil {
+				fileops.FromContext(ctx).Forget(overlayObservationTarget(w.overlay, p.Path))
+				return "", fmt.Errorf("write outcome unknown: %w", werr)
+			}
+			if w.receipt != nil {
+				w.receipt(p.Path, rerr == nil, []byte(src.content))
+			}
+			fileops.FromContext(ctx).ObservePresent(overlayObservationTarget(w.overlay, p.Path), fileops.OverlayVersion(p.Content))
+			return fmt.Sprintf("wrote %d bytes to %s", len(p.Content), p.Path), nil
+		}
+		if src.overlay {
+			fileops.FromContext(ctx).Forget(overlayObservationTarget(w.overlay, p.Path))
+			return "", fmt.Errorf("write outcome unknown: original overlay did not confirm the write")
+		}
+		// A new target rejected before entry by the transport stays a local create.
+	}
+	if err := src.recordWrite(ctx, p.Path, p.Content, "disk", w.overlay); err != nil {
+		return "", err
+	}
+	if err := src.assertUnchanged(ctx, w.overlay, p.Path); err != nil {
+		return "", err
+	}
+	hadPrior := rerr == nil
+	var prior []byte
+	if hadPrior {
+		prior = []byte(src.content)
+	}
+	var writeErr error
+	if rerr != nil {
+		writeErr = createFileEncoded(p.Path, p.Content, src.enc)
+	} else {
+		writeErr = writeFileEncoded(p.Path, p.Content, src.enc)
+	}
+	if writeErr != nil {
+		if os.IsExist(writeErr) {
+			return "", &tool.OperationError{Diagnostic: tool.OperationDiagnostic{Code: tool.FSAlreadyExists, Path: p.Path, Recovery: "the file was created concurrently; read it before deciding whether to replace it"}, Cause: writeErr}
+		}
+		return "", fmt.Errorf("write %s: %w", p.Path, writeErr)
+	}
+	src.commitObservation(ctx, w.overlay, p.Path, p.Content)
+	if w.receipt != nil {
+		w.receipt(p.Path, hadPrior, prior)
 	}
 	return fmt.Sprintf("wrote %d bytes to %s", len(p.Content), p.Path), nil
+}
+
+func createFileEncoded(path, content string, enc fileenc.Kind) error {
+	data, err := fileenc.Encode(content, enc)
+	if err != nil {
+		return err
+	}
+	return fileutil.AtomicCreateFile(path, data, 0o644)
+}
+
+// BindFileWriteReceipt returns t with a per-runtime write receipt callback when
+// t is write_file. Other tools are returned unchanged.
+func BindFileWriteReceipt(t tool.Tool, receipt func(path string, hadPrior bool, prior []byte)) tool.Tool {
+	w, ok := t.(writeFile)
+	if !ok {
+		return t
+	}
+	w.receipt = receipt
+	return w
 }

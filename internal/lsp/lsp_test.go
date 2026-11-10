@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"os"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"testing"
@@ -23,6 +25,11 @@ func TestDefaultSpecsInvariants(t *testing.T) {
 				t.Errorf("extension %q claimed by both %q and %q", ext, prev, lang)
 			}
 			seen[ext] = lang
+		}
+		for _, fb := range s.Fallbacks {
+			if fb == "" || fb == s.Command {
+				t.Errorf("lang %q: bad fallback %q", lang, fb)
+			}
 		}
 	}
 	if seen[".go"] != "go" || seen[".rs"] != "rust" || seen[".cpp"] != "cpp" || seen[".cs"] != "csharp" {
@@ -42,6 +49,82 @@ func TestExtensionRouting(t *testing.T) {
 	_, err := m.resolve("a.go")
 	if err == nil || !strings.Contains(err.Error(), "no language server") {
 		t.Fatalf("unconfigured extension should report no server, got %v", err)
+	}
+}
+
+func TestKotlinDefaultSpec(t *testing.T) {
+	spec, ok := DefaultSpecs()["kotlin"]
+	if !ok {
+		t.Fatal("kotlin default spec missing")
+	}
+	if spec.Command != "kotlin-lsp" {
+		t.Errorf("kotlin Command = %q, want the official PATH name kotlin-lsp", spec.Command)
+	}
+	if len(spec.Args) != 1 || spec.Args[0] != "--stdio" {
+		t.Errorf("kotlin Args = %v, want [--stdio] (client speaks stdio, server defaults to socket)", spec.Args)
+	}
+	hasFallback := false
+	for _, fb := range spec.Fallbacks {
+		if fb == "intellij-server" {
+			hasFallback = true
+		}
+	}
+	if !hasFallback {
+		t.Errorf("kotlin Fallbacks = %v, want intellij-server fallback for the Windows zip layout", spec.Fallbacks)
+	}
+	for _, want := range []string{
+		"macOS",
+		"brew install JetBrains/utils/kotlin-lsp",
+		"Linux",
+		"kotlin-lsp.sh",
+		"Windows",
+		"intellij-server.exe",
+	} {
+		if !strings.Contains(spec.InstallHint, want) {
+			t.Errorf("kotlin InstallHint = %q, want platform guidance containing %q", spec.InstallHint, want)
+		}
+	}
+}
+
+func TestResolveCommandFallback(t *testing.T) {
+	binDir := t.TempDir()
+	fake := func(name string) string {
+		if runtime.GOOS == "windows" {
+			name += ".exe"
+		}
+		path := filepath.Join(binDir, name)
+		if err := os.WriteFile(path, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		return path
+	}
+	spec := ServerSpec{Command: "kotlin-lsp", Fallbacks: []string{"intellij-server"}, InstallHint: "hint"}
+	t.Setenv("PATH", binDir) // hermetic: the real PATH may already have kotlin-lsp
+
+	// Only the fallback on PATH → it is used.
+	fallback := fake("intellij-server")
+	bin, err := resolveCommand(spec)
+	if err != nil {
+		t.Fatalf("resolveCommand: %v", err)
+	}
+	if bin != fallback {
+		t.Errorf("resolved %q, want fallback %q", bin, fallback)
+	}
+
+	// Both on PATH → the primary command wins.
+	primary := fake("kotlin-lsp")
+	bin, err = resolveCommand(spec)
+	if err != nil {
+		t.Fatalf("resolveCommand with both: %v", err)
+	}
+	if bin != primary {
+		t.Errorf("resolved %q, want primary %q", bin, primary)
+	}
+
+	// Neither name on PATH surfaces the primary command in the install error.
+	t.Setenv("PATH", t.TempDir())
+	if _, err := resolveCommand(spec); !errors.As(err, new(*notInstalledError)) {
+		t.Fatalf("expected notInstalledError, got %v", err)
 	}
 }
 
@@ -122,9 +205,66 @@ func TestURIRoundtrip(t *testing.T) {
 		if !strings.HasPrefix(uri, "file://") {
 			t.Errorf("%q → %q is not a file URI", p, uri)
 		}
-		if got := uriToPath(uri); got != p {
-			t.Errorf("roundtrip %q → %q", p, got)
+		if got, err := uriToPath(uri); err != nil || got != p {
+			t.Errorf("roundtrip %q → %q, %v", p, got, err)
 		}
+	}
+}
+
+func TestWindowsFileURIConversions(t *testing.T) {
+	tests := []struct {
+		path string
+		uri  string
+	}{
+		{`C:\Users\Test User\中文%20.go`, `file:///C:/Users/Test%20User/%E4%B8%AD%E6%96%87%2520.go`},
+		{`\\server\share\Test User\中文%20.go`, `file://server/share/Test%20User/%E4%B8%AD%E6%96%87%2520.go`},
+	}
+	for _, tt := range tests {
+		if got := pathToURIForOS(tt.path, "windows"); got != tt.uri {
+			t.Errorf("pathToURIForOS(%q) = %q, want %q", tt.path, got, tt.uri)
+		}
+		if got, err := uriToPathForOS(tt.uri, "windows"); err != nil || got != tt.path {
+			t.Errorf("uriToPathForOS(%q) = %q, %v; want %q", tt.uri, got, err, tt.path)
+		}
+	}
+}
+
+func TestURIToPathAuthorityAndValidation(t *testing.T) {
+	if got, err := uriToPathForOS("file://localhost/tmp/a%20b%2520.go", "linux"); err != nil || got != "/tmp/a b%20.go" {
+		t.Fatalf("localhost URI = %q, %v", got, err)
+	}
+	for _, uri := range []string{
+		"https://server/share/a.go",
+		"file://server/share/a.go",
+		"file://server:123/share/a.go",
+		"file:///tmp/a.go?mode=ro",
+		"file:///tmp/a.go#fragment",
+		"file:///tmp/%00.go",
+		"%",
+	} {
+		if _, err := uriToPathForOS(uri, "linux"); err == nil {
+			t.Errorf("uriToPathForOS(%q) unexpectedly succeeded", uri)
+		}
+	}
+}
+
+func TestFormatLocationsKeepsInvalidURIAndSkipsSnippet(t *testing.T) {
+	root := t.TempDir()
+	path := filepath.Join(root, "valid.go")
+	if err := os.WriteFile(path, []byte("package valid\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	m := &Manager{wsRoot: root}
+	remote := "https://server/share/secret.go"
+	got := m.formatLocations("definition", []Location{
+		{URI: pathToURI(path), Range: Range{Start: Position{Line: 0}}},
+		{URI: remote, Range: Range{Start: Position{Line: 6}}},
+	})
+	if !strings.Contains(got, "valid.go:1  package valid") {
+		t.Fatalf("valid location lost snippet:\n%s", got)
+	}
+	if !strings.Contains(got, remote+":7") || strings.Contains(got, remote+":7  ") {
+		t.Fatalf("invalid URI was treated as a local path:\n%s", got)
 	}
 }
 

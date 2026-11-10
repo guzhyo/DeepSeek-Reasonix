@@ -55,7 +55,11 @@ func ResponseLanguageBlock(lang string) string {
 func ReasoningLanguageBlock(lang string) string {
 	switch NormalizeReasoningLanguage(lang) {
 	case "zh":
-		return "<reasoning-language>\n可见推理/思考文本偏好：当模型服务暴露可见推理或思考文本时，请使用简体中文。代码、标识符、文件路径、shell 命令和未翻译的技术术语保持原文。此偏好不会覆盖用户对最终回答语言的明确要求。\n</reasoning-language>"
+		// Imperative wording measured against soft "偏好……请使用" phrasing:
+		// the soft form loses the first reasoning segment on Chinese prompts
+		// that embed English logs/code, and the first segment anchors the
+		// whole turn once providers round-trip prior reasoning.
+		return "<reasoning-language>\n必须使用简体中文书写全部可见思考/推理文本：从第一个字开始就用中文，并在整轮内保持中文，即使系统提示词、工具说明、工具输出或引用的代码是英文。代码、标识符、文件路径、shell 命令和未翻译的技术术语保持原文。此要求只约束可见思考文本，不覆盖用户对最终回答语言的明确要求。\n</reasoning-language>"
 	case "en":
 		return "<reasoning-language>\nVisible reasoning/thinking text preference: use English when the provider exposes reasoning text. Keep code, identifiers, file paths, shell commands, and untranslated technical terms in their original form. This preference does not override an explicit user request for the final answer language.\n</reasoning-language>"
 	default:
@@ -200,55 +204,49 @@ func WithReasoningLanguageForSource(content, lang, source string) string {
 	return block + "\n\n" + content
 }
 
+// hasLeadingInjectedBlock reports whether target is already among the transient
+// blocks leading content, skipping past any other injected block on the way.
+// It walks TransientUserBlockTags rather than a list of its own: when the two
+// disagreed, a block the host had started injecting was treated as user prose
+// and stopped the walk early, so an already-present target went undetected and
+// was injected a second time.
 func hasLeadingInjectedBlock(content, target string) bool {
 	s := strings.TrimLeft(content, " \t\r\n")
 	for {
-		switch {
-		case strings.HasPrefix(s, "<"+target+">"):
+		if hasOpenTag(s, target) {
 			return strings.Contains(s, "</"+target+">")
-		case target != "response-language" && strings.HasPrefix(s, "<response-language>"):
-			var ok bool
-			s, ok = trimLeadingTransientBlock(s, "response-language")
+		}
+		skipped := false
+		for _, tag := range TransientUserBlockTags {
+			if tag == target || !hasOpenTag(s, tag) {
+				continue
+			}
+			rest, ok := trimLeadingTransientBlock(s, tag)
 			if !ok {
 				return false
 			}
-		case target != "reasoning-language" && strings.HasPrefix(s, "<reasoning-language>"):
-			var ok bool
-			s, ok = trimLeadingTransientBlock(s, "reasoning-language")
-			if !ok {
-				return false
-			}
-		case strings.HasPrefix(s, "<memory-update>"):
-			var ok bool
-			s, ok = trimLeadingTransientBlock(s, "memory-update")
-			if !ok {
-				return false
-			}
-		case strings.HasPrefix(s, "<background-jobs>"):
-			var ok bool
-			s, ok = trimLeadingTransientBlock(s, "background-jobs")
-			if !ok {
-				return false
-			}
-		case strings.HasPrefix(s, "<hook-context"):
-			var ok bool
-			s, ok = trimLeadingTransientBlock(s, "hook-context")
-			if !ok {
-				return false
-			}
-		default:
+			s, skipped = rest, true
+			break
+		}
+		if !skipped {
 			return false
 		}
 	}
 }
 
+// hasOpenTag reports whether s opens with tag, with or without attributes
+// (hook-context and capability-route carry them).
+func hasOpenTag(s, tag string) bool {
+	return strings.HasPrefix(s, "<"+tag+">") || strings.HasPrefix(s, "<"+tag+" ")
+}
+
 func trimLeadingTransientBlock(content, tag string) (string, bool) {
 	closeTag := "</" + tag + ">"
-	i := strings.Index(content, closeTag)
-	if i < 0 {
+	_, after, ok := strings.Cut(content, closeTag)
+	if !ok {
 		return content, false
 	}
-	return strings.TrimLeft(content[i+len(closeTag):], " \t\r\n"), true
+	return strings.TrimLeft(after, " \t\r\n"), true
 }
 
 // WithResponseLanguagePreference carries the runtime final-answer language

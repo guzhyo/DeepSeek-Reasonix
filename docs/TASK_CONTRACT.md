@@ -46,10 +46,9 @@ after the task is complete.
 
 - **Normal chat** can use the template directly for one-off work.
 - **Goal mode** treats the goal as a task contract and keeps working until the
-  request, output format, constraints, and verification expectations are
-  satisfied.
-- **Plan mode** is still the right choice when you want a read-only plan before
-  edits or side effects.
+  model explicitly reports complete or blocked, subject to user controls and resource limits.
+- **Plan mode** is the right choice when you want the model to draft and confirm
+  a plan before implementation. The host enforces a read-only boundary until approval.
 - **Tool approval** remains separate: file writes, shell commands, publishing,
   credentials, and external effects still follow the configured approval policy.
 - **Checkpoints/Rewind** are file and conversation snapshots. The task contract's
@@ -57,6 +56,13 @@ after the task is complete.
 
 The Goal-mode task contract rides the provider-visible user turn. It does not
 rewrite the cache-stable system prompt, memory prefix, or tool schemas.
+
+The model interprets requested checks and acceptance criteria as task instructions.
+The host does not derive quality obligations from file count, paths, plans, or
+verification wording. It retains permissions, Plan preapproval write protection,
+cancellation, explicit budgets, and reliable execution. Results show actual
+commands and outcomes alongside model declarations; no overall host quality
+verdict is assigned. See [execution semantics and migration](EXECUTION_MODEL_SIMPLIFICATION.md).
 
 ## Example
 
@@ -73,7 +79,7 @@ Output format:
 After implementation, summarize changed files and verification results.
 
 Constraints:
-Do not change the Wails JSON contract.
+Do not change the desktop host JSON contract.
 Do not refactor unrelated composer state.
 If browser verification cannot run, say why.
 

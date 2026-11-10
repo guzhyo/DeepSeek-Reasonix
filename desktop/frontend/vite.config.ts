@@ -1,9 +1,11 @@
-import { defineConfig, type Plugin } from "vite";
+import { createRequire } from "node:module";
+import { defineConfig, searchForWorkspaceRoot, type Plugin } from "vite";
 import react from "@vitejs/plugin-react";
 import { execSync } from "node:child_process";
-import { mkdir, readdir, rename, writeFile } from "node:fs/promises";
+import { access, mkdir, readdir, rename, writeFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { rewriteDragRegions, shellFromEnv } from "./scripts/shell-css.mjs";
 
 const devPort = Number(process.env.REASONIX_DESKTOP_VITE_PORT || "5173");
 const configDir = dirname(fileURLToPath(import.meta.url));
@@ -23,9 +25,9 @@ function buildChannel(): string {
   return process.env.REASONIX_CHANNEL || "stable";
 }
 
-// On macOS ≤ 12 (Safari 15 WebKit) a crossorigin module/stylesheet fetched over the
-// wails:// scheme is CORS-blocked (no Access-Control-Allow-Origin from the handler),
-// so the bundle never loads and the window paints blank; newer WebKit tolerates it.
+// A crossorigin module/stylesheet fetched over a custom app scheme is CORS-blocked
+// when the protocol handler sends no Access-Control-Allow-Origin, so the bundle
+// never loads and the window paints blank; plain HTTP origins tolerate it.
 function stripCrossorigin(): Plugin {
   return {
     name: "strip-crossorigin",
@@ -56,16 +58,54 @@ function archiveHiddenSourcemaps(commit: string): Plugin {
 
       const archiveDir = resolve(configDir, "sourcemaps", commit);
       await mkdir(archiveDir, { recursive: true });
+      const records = await Promise.all(maps.map(async (mapPath) => {
+        const map = mapPath.slice(distDir.length + 1).replaceAll("\\", "/");
+        return {
+          source: mapPath,
+          archive: map.replaceAll("/", "__"),
+          map,
+          bundle: map.slice(0, -4),
+          bundleExists: await access(mapPath.slice(0, -4)).then(() => true, () => false),
+        };
+      }));
       await Promise.all(
-        maps.map(async (mapPath) => {
-          const rel = mapPath.slice(distDir.length + 1).replace(/[\\/]+/g, "__");
-          await rename(mapPath, resolve(archiveDir, rel));
+        records.map(async (record) => {
+          await rename(record.source, resolve(archiveDir, record.archive));
         }),
       );
+      const manifestRecord = ({ archive, map, bundle }: (typeof records)[number]) => ({ archive, map, bundle });
       await writeFile(
         resolve(archiveDir, "manifest.json"),
-        JSON.stringify({ commit, channel: buildChannel(), archivedAt: new Date().toISOString() }, null, 2) + "\n",
+        JSON.stringify({
+          schemaVersion: 1,
+          commit,
+          channel: buildChannel(),
+          archivedAt: new Date().toISOString(),
+          maps: records.filter((record) => record.bundleExists).map(manifestRecord),
+          orphanMaps: records.filter((record) => !record.bundleExists).map(manifestRecord),
+        }, null, 2) + "\n",
       );
+    },
+  };
+}
+
+// One stylesheet serves the browser and the Electron shell: the Electron build
+// rewrites the drag-region marker property to -webkit-app-region at bundle time
+// (scripts/shell-css.mjs), so the browser bundle stays byte-identical and no rule
+// is declared twice.
+function shellDragRegions(): Plugin {
+  const shell = shellFromEnv();
+  return {
+    name: "shell-drag-regions",
+    apply: "build",
+    enforce: "post",
+    generateBundle(_options, bundle) {
+      if (shell !== "electron") return;
+      for (const asset of Object.values(bundle)) {
+        if (asset.type === "asset" && asset.fileName.endsWith(".css") && typeof asset.source === "string") {
+          asset.source = rewriteDragRegions(asset.source, shell);
+        }
+      }
     },
   };
 }
@@ -91,12 +131,12 @@ const channel = buildChannel();
 const nodeModulePath = String.raw`[\\/]node_modules[\\/](?:\.pnpm[\\/][^\\/]+[\\/]node_modules[\\/])?`;
 const vendorReact = new RegExp(`${nodeModulePath}(?:react|react-dom)(?:[\\/]|$)`);
 const vendorMarkdown = new RegExp(
-  `${nodeModulePath}(?:react-markdown|remark-gfm|remark-math|rehype-katex|katex)(?:[\\/]|$)`,
+  `${nodeModulePath}(?:react-markdown|remark-gfm|remark-math|remark-parse|remark-rehype|rehype-katex|katex|unified|vfile|hast-util-to-jsx-runtime|html-url-attributes)(?:[\\/]|$)`,
 );
 const vendorHighlight = new RegExp(`${nodeModulePath}highlight\\.js(?:[\\/]|$)`);
 
-// base: "./" so built asset URLs are relative. Wails serves the embedded dist from
-// the app root over the wails:// scheme, where absolute "/assets/..." URLs 404.
+// base: "./" so built asset URLs are relative: the shell serves dist from the app
+// root over its custom scheme, where absolute "/assets/..." URLs 404.
 export default defineConfig({
   // errorRecovery tells lightningcss to skip unparseable rules instead of
   // failing the whole build. Vite 8 + lightningcss 1.32.0 can reject valid
@@ -104,9 +144,25 @@ export default defineConfig({
   css: {
     lightningcss: { errorRecovery: true },
   },
-  plugins: [react(), stripCrossorigin(), archiveHiddenSourcemaps(commit), keepDistPlaceholder()],
+  plugins: [react(), stripCrossorigin(), shellDragRegions(), archiveHiddenSourcemaps(commit), keepDistPlaceholder()],
   base: "./",
   define: { __BUILD_COMMIT__: JSON.stringify(commit), __BUILD_CHANNEL__: JSON.stringify(channel) },
+  resolve: {
+    alias: {
+      // decode-named-character-reference (micromark/remark dependency) ships a
+      // browser condition (index.dom.js) that calls document.createElement at
+      // module scope. That explodes inside markdown.worker.ts (WorkerGlobalScope
+      // has no document), killing the off-main-thread parse on first use. The
+      // default entry is DOM-free and works in both window and worker, so pin
+      // it for every bundle. The package is a direct devDependency so this
+      // resolve works under pnpm's non-hoisted layout.
+      "decode-named-character-reference": createRequire(import.meta.url).resolve("decode-named-character-reference"),
+      // hast-util-from-html-isomorphic (rehype-katex dependency) has the same
+      // shape: its browser entry constructs a DOMParser at module scope, which
+      // WorkerGlobalScope lacks. Pin the isomorphic default (parse5) entry.
+      "hast-util-from-html-isomorphic": createRequire(import.meta.url).resolve("hast-util-from-html-isomorphic"),
+    },
+  },
   build: {
     outDir: "dist",
     emptyOutDir: true,
@@ -145,10 +201,16 @@ export default defineConfig({
     chunkSizeWarningLimit: 600,
   },
   server: {
-    // Bind IPv4 — unset host listens on ::1, and the Wails dev proxy's [::1]
-    // dial fails on Windows hosts where IPv6 loopback is filtered.
+    // Bind IPv4 — unset host listens on ::1, which fails for clients on Windows
+    // hosts where IPv6 loopback is filtered.
     host: "127.0.0.1",
     port: devPort,
     strictPort: true,
+    fs: {
+      // Browser-dev theme mocks use the same embedded source assets as the
+      // desktop build. Keep the allow-list narrow while retaining Vite's
+      // workspace root.
+      allow: [searchForWorkspaceRoot(configDir), resolve(configDir, "../themes/official")],
+    },
   },
 });

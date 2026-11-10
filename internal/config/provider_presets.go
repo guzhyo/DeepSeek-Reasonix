@@ -14,17 +14,47 @@ type ProviderPreset struct {
 	Label       string
 	Description string
 	KeyEnv      string
+	// Recommended marks the lowest-friction starter path in Settings. It is
+	// presentation metadata only; installed entries remain editable providers.
+	Recommended bool
+	// BillingMode tells the host whether usage should be presented as a
+	// subscription-equivalent plan rather than a token price estimate.
+	BillingMode string
 	Entries     []ProviderEntry
+
+	// Display metadata is presentation-only. It deliberately does not change
+	// provider routing or the persisted provider schema.
+	DisplayGroup   string
+	DisplaySection string
+	DisplayTier    string
+	RouteKind      string
+	Optional       bool
+	DisplayOrder   int
 }
 
-const ProviderPresetVersion = 1
+const (
+	ProviderPresetVersion        = 1
+	longCat20ContextWindow       = 1_048_576
+	legacyLongCat20ContextWindow = 131_072
+	longCatOpenAIBaseURL         = "https://api.longcat.chat/openai/v1"
+	longCatAnthropicBaseURL      = "https://api.longcat.chat/anthropic"
+	deepSeekAnthropicBaseURL     = "https://api.deepseek.com/anthropic"
+)
 
 // CuratedProviderPresets returns one-click provider templates for common
 // OpenAI-compatible and Anthropic-compatible coding-plan services. These are
 // intentionally editable after installation; they reduce setup friction without
 // turning fast-moving third-party catalogs into hard runtime dependencies.
 func CuratedProviderPresets() []ProviderPreset {
-	presets := cloneProviderPresets(curatedProviderPresets)
+	presets := make([]ProviderPreset, 0, len(curatedProviderPresets))
+	for _, preset := range curatedProviderPresets {
+		// Keep the old direct lookup available for installed configurations, but
+		// do not offer the redundant Anthropic preset in new-provider surfaces.
+		if preset.ID == "deepseek-anthropic" {
+			continue
+		}
+		presets = append(presets, cloneProviderPreset(preset))
+	}
 	sort.SliceStable(presets, func(i, j int) bool {
 		return providerPresetDisplayRank(presets[i].ID) < providerPresetDisplayRank(presets[j].ID)
 	})
@@ -44,9 +74,15 @@ func CuratedProviderPreset(id string) (ProviderPreset, bool) {
 
 func providerPresetDisplayRank(id string) int {
 	switch {
+	case id == "opencode-go-recommended":
+		return -3
+	case id == "deepseek-responses":
+		return -2
 	case id == "glm-cn" || id == "zai-global" || strings.HasPrefix(id, "glm-coding-plan-") || strings.HasPrefix(id, "zai-coding-plan-"):
 		return 0
 	case strings.HasPrefix(id, "longcat-"):
+		return 1
+	case id == "token-rhythm":
 		return 1
 	case strings.HasPrefix(id, "kimi-"):
 		return 2
@@ -58,14 +94,16 @@ func providerPresetDisplayRank(id string) int {
 }
 
 var (
-	kimiAPIModels       = []string{"kimi-k2.7-code", "kimi-k2.7-code-highspeed", "kimi-k2.6", "kimi-k2.5"}
-	kimiAPIVisionModels = []string{"kimi-k2.7-code", "kimi-k2.7-code-highspeed", "kimi-k2.6", "kimi-k2.5"}
+	legacyKimiAPIModels = []string{"kimi-k2.7-code", "kimi-k2.7-code-highspeed", "kimi-k2.6", "kimi-k2.5"}
+	kimiAPIModels       = []string{"kimi-k3", "kimi-k2.7-code", "kimi-k2.7-code-highspeed", "kimi-k2.6", "kimi-k2.5"}
+	kimiAPIVisionModels = []string{"kimi-k3", "kimi-k2.7-code", "kimi-k2.7-code-highspeed", "kimi-k2.6", "kimi-k2.5"}
 	kimiCodingModels    = []string{"kimi-for-coding"}
 
-	longCat20Models = []string{"LongCat-2.0"}
-
-	mimoV25Models       = []string{"mimo-v2.5-pro", "mimo-v2.5"}
-	mimoV25VisionModels = []string{"mimo-v2.5"}
+	longCat20Models              = []string{"LongCat-2.0"}
+	deepSeekOfficialModels       = []string{"deepseek-flash", "deepseek-v4-pro"}
+	deepSeekOfficialVisionModels = []string{"deepseek-flash"}
+	mimoModels                   = []string{"mimo-v2.6-pro", "mimo-v2.6-flash", "mimo-v2.5-pro", "mimo-v2.5"}
+	mimoCuratedVisionModels      = []string{"mimo-v2.6-pro", "mimo-v2.6-flash", "mimo-v2.5"}
 
 	minimaxMSeriesModels       = []string{"MiniMax-M3", "MiniMax-M2.7", "MiniMax-M2.7-highspeed"}
 	minimaxMSeriesVisionModels = []string{"MiniMax-M3"}
@@ -79,11 +117,23 @@ var (
 	qwenAPIVisionModels  = []string{"qwen3.7-plus", "qwen3.6-plus", "qwen3.5-plus", "kimi-k2.5"}
 	qwenPlanModels       = []string{"qwen3.7-plus", "qwen3.6-plus", "kimi-k2.5", "glm-5", "MiniMax-M2.5", "qwen3.5-plus", "qwen3-max-2026-01-23", "qwen3-coder-next", "qwen3-coder-plus", "glm-4.7"}
 	qwenPlanVisionModels = []string{"qwen3.7-plus", "qwen3.6-plus", "qwen3.5-plus", "kimi-k2.5"}
+	stepfunPlanModels    = []string{"step-3.7-flash", "step-3.5-flash", "step-3.5-flash-2603"}
 
-	stepfunPlanModels = []string{"step-3.7-flash", "step-3.5-flash", "step-3.5-flash-2603"}
+	// Only step-3.7-flash is enabled server-side on the Responses API
+	// ("this model is not enabled for the Responses API" for 3.5 SKUs).
+	stepfunResponsesModels = []string{"step-3.7-flash"}
 
-	opencodeGoModels                 = []string{"glm-5.2", "glm-5.1", "kimi-k2.7-code", "kimi-k2.6", "deepseek-v4-pro", "deepseek-v4-flash", "mimo-v2.5-pro", "mimo-v2.5"}
-	opencodeGoAnthropicModels        = []string{"qwen3.7-plus", "qwen3.7-max", "qwen3.6-plus", "minimax-m3", "minimax-m2.7", "minimax-m2.5"}
+	// The pay-as-you-go channel serves the same reasoning SKUs; 3.7-flash
+	// additionally accepts image input there (verified live), while the
+	// step_plan channel rejects images outright.
+	stepfunAPIModels       = []string{"step-3.7-flash", "step-3.5-flash", "step-3.5-flash-2603"}
+	stepfunAPIVisionModels = []string{"step-3.7-flash"}
+
+	legacyOpenCodeGoModels           = []string{"glm-5.2", "glm-5.1", "kimi-k2.7-code", "kimi-k2.6", "deepseek-v4-pro", "deepseek-v4-flash", "mimo-v2.5-pro", "mimo-v2.5"}
+	preVisionOpenCodeGoModels        = []string{"glm-5.3", "glm-5.2", "glm-5.1", "kimi-k3", "kimi-k2.7-code", "kimi-k2.6", "deepseek-v4-pro", "deepseek-v4-flash", "mimo-v2.5-pro", "mimo-v2.5", "hy3"}
+	preVisionOpenCodeGoVisionModels  = []string{"kimi-k3"}
+	opencodeGoModels                 = provider.OpenCodeGoModelIDs(provider.OpenCodeGoRouteChat)
+	opencodeGoVisionModels           = provider.OpenCodeGoVisionModelIDs(provider.OpenCodeGoRouteChat)
 	opencodeZenAnthropicModels       = []string{"claude-sonnet-4-6", "claude-opus-4-8", "claude-haiku-4-5", "qwen3.6-plus", "qwen3.5-plus", "qwen3.6-plus-free"}
 	opencodeZenAnthropicVisionModels = []string{"claude-sonnet-4-6", "claude-opus-4-8", "claude-haiku-4-5"}
 
@@ -95,7 +145,48 @@ var (
 	ollamaCloudModels = []string{"glm-5.2", "kimi-k2.7-code", "deepseek-v4-pro", "deepseek-v4-flash", "minimax-m3", "nemotron-3-nano:30b", "qwen3-coder-next"}
 )
 
+func qwenModelContextOverrides() map[string]ProviderModelOverride {
+	return map[string]ProviderModelOverride{
+		"qwen3-max-2026-01-23": {ContextWindow: 262_144},
+		"qwen3-coder-next":     {ContextWindow: 262_144},
+		"MiniMax-M2.5":         {ContextWindow: 196_608},
+		"glm-5":                {ContextWindow: 202_752},
+		"glm-4.7":              {ContextWindow: 202_752},
+		"kimi-k2.5":            {ContextWindow: 262_144},
+	}
+}
+
+func kimiK3DirectOverride() ProviderModelOverride {
+	return ProviderModelOverride{
+		ReasoningProtocol: ReasoningProtocolOpenAI,
+		SupportedEfforts:  []string{"low", "high", "max"},
+		DefaultEffort:     "max",
+		ContextWindow:     1_048_576,
+	}
+}
+
 var curatedProviderPresets = []ProviderPreset{
+	{
+		ID:          "deepseek-anthropic",
+		Label:       "DeepSeek Official Anthropic",
+		Description: "Separate official DeepSeek Anthropic-compatible entry for Flash and Pro.",
+		KeyEnv:      "DEEPSEEK_API_KEY",
+		Entries: []ProviderEntry{{
+			Name:           "deepseek-anthropic",
+			Kind:           "anthropic",
+			BaseURL:        deepSeekAnthropicBaseURL,
+			Models:         deepSeekOfficialModels,
+			Default:        "deepseek-flash",
+			VisionModels:   deepSeekOfficialVisionModels,
+			APIKeyEnv:      "DEEPSEEK_API_KEY",
+			BalanceURL:     "https://api.deepseek.com/user/balance",
+			Thinking:       "enabled",
+			WebSearch:      boolPointer(true),
+			ContextWindow:  1_000_000,
+			Prices:         deepSeekV4PricesUSD(),
+			ModelOverrides: deepSeekV4EffortOverrides(),
+		}},
+	},
 	{
 		ID:          "longcat-openai",
 		Label:       "LongCat OpenAI",
@@ -104,12 +195,12 @@ var curatedProviderPresets = []ProviderPreset{
 		Entries: []ProviderEntry{{
 			Name:             "longcat-openai",
 			Kind:             "openai",
-			BaseURL:          "https://api.longcat.chat/openai/v1",
+			BaseURL:          longCatOpenAIBaseURL,
 			ModelsURL:        "https://api.longcat.chat/openai/v1/models",
 			Models:           longCat20Models,
 			Default:          "LongCat-2.0",
 			APIKeyEnv:        "LONGCAT_API_KEY",
-			ContextWindow:    131072,
+			ContextWindow:    longCat20ContextWindow,
 			Prices:           longCat20Prices(longCat20Models),
 			Thinking:         "enabled",
 			SupportedEfforts: []string{"enabled", "disabled"},
@@ -124,7 +215,7 @@ var curatedProviderPresets = []ProviderPreset{
 		Entries: []ProviderEntry{{
 			Name:             "longcat-anthropic",
 			Kind:             "anthropic",
-			BaseURL:          "https://api.longcat.chat/anthropic",
+			BaseURL:          longCatAnthropicBaseURL,
 			ModelsURL:        "https://api.longcat.chat/anthropic/v1/models",
 			Models:           longCat20Models,
 			Default:          "LongCat-2.0",
@@ -133,8 +224,26 @@ var curatedProviderPresets = []ProviderPreset{
 			Thinking:         "enabled",
 			SupportedEfforts: []string{"enabled", "disabled"},
 			DefaultEffort:    "enabled",
-			ContextWindow:    131072,
+			ContextWindow:    longCat20ContextWindow,
 			Prices:           longCat20Prices(longCat20Models),
+		}},
+	},
+	{
+		ID:          "token-rhythm",
+		Label:       "Token Rhythm",
+		Description: "Token Rhythm (基元律动) multi-model OpenAI-compatible gateway.",
+		KeyEnv:      "TOKEN_RHYTHM_API_KEY",
+		Entries: []ProviderEntry{{
+			Name:           "token-rhythm",
+			Kind:           "openai",
+			BaseURL:        "https://tokenrhythm.studio/v1",
+			ModelsURL:      "https://tokenrhythm.studio/v1/models",
+			Models:         tokenRhythmModels,
+			VisionModels:   tokenRhythmVisionModels,
+			Default:        "deepseek-v4-flash",
+			APIKeyEnv:      "TOKEN_RHYTHM_API_KEY",
+			ContextWindow:  1_000_000,
+			ModelOverrides: tokenRhythmModelOverrides(),
 		}},
 	},
 	{
@@ -153,6 +262,9 @@ var curatedProviderPresets = []ProviderPreset{
 			BalanceURL:        "https://api.moonshot.cn/v1/users/me/balance",
 			ContextWindow:     262144,
 			ReasoningProtocol: ReasoningProtocolNone,
+			ModelOverrides: map[string]ProviderModelOverride{
+				"kimi-k3": kimiK3DirectOverride(),
+			},
 		}},
 	},
 	{
@@ -171,6 +283,9 @@ var curatedProviderPresets = []ProviderPreset{
 			BalanceURL:        "https://api.moonshot.ai/v1/users/me/balance",
 			ContextWindow:     262144,
 			ReasoningProtocol: ReasoningProtocolNone,
+			ModelOverrides: map[string]ProviderModelOverride{
+				"kimi-k3": kimiK3DirectOverride(),
+			},
 		}},
 	},
 	{
@@ -200,12 +315,12 @@ var curatedProviderPresets = []ProviderPreset{
 			Name:          "mimo-api",
 			Kind:          "openai",
 			BaseURL:       "https://api.xiaomimimo.com/v1",
-			Models:        mimoV25Models,
-			VisionModels:  mimoV25VisionModels,
-			Default:       "mimo-v2.5-pro",
+			Models:        mimoModels,
+			VisionModels:  mimoCuratedVisionModels,
+			Default:       "mimo-v2.6-pro",
 			APIKeyEnv:     "MIMO_API_KEY",
 			ContextWindow: 1048576,
-			Prices:        mimoDomesticPrices(mimoV25Models),
+			Prices:        mimoDomesticPrices(mimoModels),
 			NoProxy:       true,
 		}},
 	},
@@ -218,13 +333,13 @@ var curatedProviderPresets = []ProviderPreset{
 			Name:          "mimo-anthropic",
 			Kind:          "anthropic",
 			BaseURL:       "https://api.xiaomimimo.com/anthropic",
-			Models:        mimoV25Models,
-			VisionModels:  mimoV25VisionModels,
-			Default:       "mimo-v2.5-pro",
+			Models:        mimoModels,
+			VisionModels:  mimoCuratedVisionModels,
+			Default:       "mimo-v2.6-pro",
 			APIKeyEnv:     "MIMO_API_KEY",
 			Thinking:      "adaptive",
 			ContextWindow: 1048576,
-			Prices:        mimoDomesticPrices(mimoV25Models),
+			Prices:        mimoDomesticPrices(mimoModels),
 			NoProxy:       true,
 		}},
 	},
@@ -237,12 +352,12 @@ var curatedProviderPresets = []ProviderPreset{
 			Name:          "mimo-token-plan-cn",
 			Kind:          "openai",
 			BaseURL:       "https://token-plan-cn.xiaomimimo.com/v1",
-			Models:        mimoV25Models,
-			VisionModels:  mimoV25VisionModels,
-			Default:       "mimo-v2.5-pro",
+			Models:        mimoModels,
+			VisionModels:  mimoCuratedVisionModels,
+			Default:       "mimo-v2.6-pro",
 			APIKeyEnv:     "MIMO_TOKEN_PLAN_API_KEY",
 			ContextWindow: 1048576,
-			Prices:        mimoDomesticPrices(mimoV25Models),
+			Prices:        mimoDomesticPrices(mimoModels),
 			NoProxy:       true,
 		}},
 	},
@@ -255,13 +370,13 @@ var curatedProviderPresets = []ProviderPreset{
 			Name:          "mimo-token-plan-cn-anthropic",
 			Kind:          "anthropic",
 			BaseURL:       "https://token-plan-cn.xiaomimimo.com/anthropic",
-			Models:        mimoV25Models,
-			VisionModels:  mimoV25VisionModels,
-			Default:       "mimo-v2.5-pro",
+			Models:        mimoModels,
+			VisionModels:  mimoCuratedVisionModels,
+			Default:       "mimo-v2.6-pro",
 			APIKeyEnv:     "MIMO_TOKEN_PLAN_API_KEY",
 			Thinking:      "adaptive",
 			ContextWindow: 1048576,
-			Prices:        mimoDomesticPrices(mimoV25Models),
+			Prices:        mimoDomesticPrices(mimoModels),
 			NoProxy:       true,
 		}},
 	},
@@ -274,12 +389,12 @@ var curatedProviderPresets = []ProviderPreset{
 			Name:          "mimo-token-plan-sgp",
 			Kind:          "openai",
 			BaseURL:       "https://token-plan-sgp.xiaomimimo.com/v1",
-			Models:        mimoV25Models,
-			VisionModels:  mimoV25VisionModels,
-			Default:       "mimo-v2.5-pro",
+			Models:        mimoModels,
+			VisionModels:  mimoCuratedVisionModels,
+			Default:       "mimo-v2.6-pro",
 			APIKeyEnv:     "MIMO_TOKEN_PLAN_API_KEY",
 			ContextWindow: 1048576,
-			Prices:        mimoDomesticPrices(mimoV25Models),
+			Prices:        mimoDomesticPrices(mimoModels),
 		}},
 	},
 	{
@@ -291,13 +406,13 @@ var curatedProviderPresets = []ProviderPreset{
 			Name:          "mimo-token-plan-sgp-anthropic",
 			Kind:          "anthropic",
 			BaseURL:       "https://token-plan-sgp.xiaomimimo.com/anthropic",
-			Models:        mimoV25Models,
-			VisionModels:  mimoV25VisionModels,
-			Default:       "mimo-v2.5-pro",
+			Models:        mimoModels,
+			VisionModels:  mimoCuratedVisionModels,
+			Default:       "mimo-v2.6-pro",
 			APIKeyEnv:     "MIMO_TOKEN_PLAN_API_KEY",
 			Thinking:      "adaptive",
 			ContextWindow: 1048576,
-			Prices:        mimoDomesticPrices(mimoV25Models),
+			Prices:        mimoDomesticPrices(mimoModels),
 		}},
 	},
 	{
@@ -309,12 +424,12 @@ var curatedProviderPresets = []ProviderPreset{
 			Name:          "mimo-token-plan-ams",
 			Kind:          "openai",
 			BaseURL:       "https://token-plan-ams.xiaomimimo.com/v1",
-			Models:        mimoV25Models,
-			VisionModels:  mimoV25VisionModels,
-			Default:       "mimo-v2.5-pro",
+			Models:        mimoModels,
+			VisionModels:  mimoCuratedVisionModels,
+			Default:       "mimo-v2.6-pro",
 			APIKeyEnv:     "MIMO_TOKEN_PLAN_API_KEY",
 			ContextWindow: 1048576,
-			Prices:        mimoDomesticPrices(mimoV25Models),
+			Prices:        mimoDomesticPrices(mimoModels),
 		}},
 	},
 	{
@@ -326,13 +441,13 @@ var curatedProviderPresets = []ProviderPreset{
 			Name:          "mimo-token-plan-ams-anthropic",
 			Kind:          "anthropic",
 			BaseURL:       "https://token-plan-ams.xiaomimimo.com/anthropic",
-			Models:        mimoV25Models,
-			VisionModels:  mimoV25VisionModels,
-			Default:       "mimo-v2.5-pro",
+			Models:        mimoModels,
+			VisionModels:  mimoCuratedVisionModels,
+			Default:       "mimo-v2.6-pro",
 			APIKeyEnv:     "MIMO_TOKEN_PLAN_API_KEY",
 			Thinking:      "adaptive",
 			ContextWindow: 1048576,
-			Prices:        mimoDomesticPrices(mimoV25Models),
+			Prices:        mimoDomesticPrices(mimoModels),
 		}},
 	},
 	{
@@ -404,6 +519,27 @@ var curatedProviderPresets = []ProviderPreset{
 		}},
 	},
 	{
+		ID:          "deepseek-responses",
+		Label:       "DeepSeek Official Responses API",
+		Description: "Official stateless DeepSeek Responses API for Flash and Pro with server-side web search.",
+		KeyEnv:      "DEEPSEEK_API_KEY",
+		Entries: []ProviderEntry{{
+			Name:           "deepseek-responses",
+			Kind:           "responses",
+			BaseURL:        "https://api.deepseek.com",
+			Models:         deepSeekOfficialModels,
+			Default:        "deepseek-flash",
+			VisionModels:   deepSeekOfficialVisionModels,
+			APIKeyEnv:      "DEEPSEEK_API_KEY",
+			BalanceURL:     "https://api.deepseek.com/user/balance",
+			ContextWindow:  1_000_000,
+			Prices:         deepSeekV4PricesUSD(),
+			ResponsesMode:  "stateless",
+			WebSearch:      boolPointer(true),
+			ModelOverrides: deepSeekV4EffortOverrides(),
+		}},
+	},
+	{
 		ID:          "glm-cn",
 		Label:       "GLM CN API",
 		Description: "Zhipu GLM China OpenAI-compatible API with thinking controls.",
@@ -461,7 +597,7 @@ var curatedProviderPresets = []ProviderPreset{
 			Kind:          "anthropic",
 			BaseURL:       "https://open.bigmodel.cn/api/anthropic",
 			Models:        glmAnthropicModels,
-			Default:       "glm-5.2[1m]",
+			Default:       "glm-5.2",
 			APIKeyEnv:     "GLM_PLAN_API_KEY",
 			AuthHeader:    true,
 			Thinking:      "adaptive",
@@ -494,7 +630,7 @@ var curatedProviderPresets = []ProviderPreset{
 			Kind:          "anthropic",
 			BaseURL:       "https://api.z.ai/api/anthropic",
 			Models:        glmAnthropicModels,
-			Default:       "glm-5.2[1m]",
+			Default:       "glm-5.2",
 			APIKeyEnv:     "ZAI_CODING_API_KEY",
 			AuthHeader:    true,
 			Thinking:      "adaptive",
@@ -502,19 +638,38 @@ var curatedProviderPresets = []ProviderPreset{
 		}},
 	},
 	{
-		ID:          "opencode-go",
-		Label:       "OpenCode Go",
-		Description: "OpenCode Go relay with per-model capability overrides.",
-		KeyEnv:      "OPENCODE_GO_API_KEY",
+		ID:             "opencode-go",
+		Label:          "OpenCode Go",
+		Description:    "OpenCode Go relay with per-model capability overrides.",
+		KeyEnv:         "OPENCODE_GO_API_KEY",
+		BillingMode:    "subscription_equivalent",
+		DisplayGroup:   "opencode",
+		DisplaySection: "go",
+		DisplayTier:    "compatibility",
+		RouteKind:      "chat",
+		DisplayOrder:   90,
 		Entries: []ProviderEntry{{
-			Name:          "opencode-go",
-			Kind:          "openai",
-			BaseURL:       "https://opencode.ai/zen/go/v1",
-			Models:        opencodeGoModels,
-			Default:       "glm-5.2",
-			APIKeyEnv:     "OPENCODE_GO_API_KEY",
-			ContextWindow: 128000,
-			ModelOverrides: map[string]ProviderModelOverride{
+			Name:            "opencode-go",
+			Kind:            "openai",
+			BaseURL:         provider.OpenCodeGoChatBaseURL,
+			Models:          opencodeGoModels,
+			VisionModels:    opencodeGoVisionModels,
+			Default:         "glm-5.2",
+			APIKeyEnv:       "OPENCODE_GO_API_KEY",
+			ContextWindow:   128000,
+			MaxOutputTokens: 32_768,
+			BillingMode:     "subscription_equivalent",
+			ModelOverrides: withOpenCodeGoChatContextOverrides(map[string]ProviderModelOverride{
+				"glm-5.3": {
+					ReasoningProtocol: ReasoningProtocolOpenAI,
+					SupportedEfforts:  []string{"low", "high", "max"},
+					DefaultEffort:     "high",
+				},
+				"glm-5.2": {
+					ReasoningProtocol: ReasoningProtocolOpenAI,
+					SupportedEfforts:  []string{"high", "max"},
+					DefaultEffort:     "high",
+				},
 				"deepseek-v4-flash": {
 					ReasoningProtocol: ReasoningProtocolDeepSeek,
 					SupportedEfforts:  []string{"disabled", "high", "max"},
@@ -535,31 +690,34 @@ var curatedProviderPresets = []ProviderPreset{
 					SupportedEfforts:  []string{"low", "medium", "high"},
 					DefaultEffort:     "high",
 				},
-			},
+				"kimi-k3": {
+					ReasoningProtocol: ReasoningProtocolOpenAI,
+					SupportedEfforts:  []string{"high", "max"},
+					DefaultEffort:     "max",
+				},
+				"hy3": {
+					ReasoningProtocol: ReasoningProtocolOpenAI,
+					SupportedEfforts:  []string{"none", "low", "high"},
+					DefaultEffort:     "high",
+				},
+			}),
 		}},
 	},
+	opencodeGoAnthropicPreset,
+	opencodeGoResponsesPreset,
+	opencodeGoDeepSeekAnthropicPreset,
+	opencodeGoDeepSeekResponsesPreset,
+	opencodeGoRecommendedPreset,
 	{
-		ID:          "opencode-go-anthropic",
-		Label:       "OpenCode Go Anthropic",
-		Description: "OpenCode Go subscription Anthropic-compatible route for Qwen and MiniMax models.",
-		KeyEnv:      "OPENCODE_GO_API_KEY",
-		Entries: []ProviderEntry{{
-			Name:          "opencode-go-anthropic",
-			Kind:          "anthropic",
-			BaseURL:       "https://opencode.ai/zen/go",
-			Models:        opencodeGoAnthropicModels,
-			VisionModels:  []string{"qwen3.7-plus", "qwen3.6-plus"},
-			Default:       "qwen3.7-plus",
-			APIKeyEnv:     "OPENCODE_GO_API_KEY",
-			Thinking:      "adaptive",
-			ContextWindow: 262144,
-		}},
-	},
-	{
-		ID:          "opencode-zen-anthropic",
-		Label:       "OpenCode Zen Anthropic",
-		Description: "OpenCode Zen Anthropic-compatible route for Claude and Qwen models.",
-		KeyEnv:      "OPENCODE_API_KEY",
+		ID:             "opencode-zen-anthropic",
+		Label:          "OpenCode Zen Anthropic",
+		Description:    "OpenCode Zen Anthropic-compatible route for Claude and Qwen models.",
+		KeyEnv:         "OPENCODE_API_KEY",
+		DisplayGroup:   "opencode",
+		DisplaySection: "zen",
+		DisplayTier:    "primary",
+		RouteKind:      "zen-anthropic",
+		DisplayOrder:   100,
 		Entries: []ProviderEntry{{
 			Name:          "opencode-zen-anthropic",
 			Kind:          "anthropic",
@@ -577,14 +735,16 @@ var curatedProviderPresets = []ProviderPreset{
 		Description: "Alibaba DashScope China standard OpenAI-compatible endpoint.",
 		KeyEnv:      "QWEN_API_KEY",
 		Entries: []ProviderEntry{{
-			Name:         "qwen-cn",
-			Kind:         "openai",
-			BaseURL:      "https://dashscope.aliyuncs.com/compatible-mode/v1",
-			Models:       qwenAPIModels,
-			VisionModels: qwenAPIVisionModels,
-			Default:      "qwen3.7-plus",
-			APIKeyEnv:    "QWEN_API_KEY",
-			NoProxy:      true,
+			Name:           "qwen-cn",
+			Kind:           "openai",
+			BaseURL:        "https://dashscope.aliyuncs.com/compatible-mode/v1",
+			Models:         qwenAPIModels,
+			VisionModels:   qwenAPIVisionModels,
+			Default:        "qwen3.7-plus",
+			APIKeyEnv:      "QWEN_API_KEY",
+			ContextWindow:  1_000_000,
+			ModelOverrides: qwenModelContextOverrides(),
+			NoProxy:        true,
 		}},
 	},
 	{
@@ -593,13 +753,15 @@ var curatedProviderPresets = []ProviderPreset{
 		Description: "Alibaba DashScope international standard OpenAI-compatible endpoint.",
 		KeyEnv:      "QWEN_API_KEY",
 		Entries: []ProviderEntry{{
-			Name:         "qwen-global",
-			Kind:         "openai",
-			BaseURL:      "https://dashscope-intl.aliyuncs.com/compatible-mode/v1",
-			Models:       qwenAPIModels,
-			VisionModels: qwenAPIVisionModels,
-			Default:      "qwen3.7-plus",
-			APIKeyEnv:    "QWEN_API_KEY",
+			Name:           "qwen-global",
+			Kind:           "openai",
+			BaseURL:        "https://dashscope-intl.aliyuncs.com/compatible-mode/v1",
+			Models:         qwenAPIModels,
+			VisionModels:   qwenAPIVisionModels,
+			Default:        "qwen3.7-plus",
+			APIKeyEnv:      "QWEN_API_KEY",
+			ContextWindow:  1_000_000,
+			ModelOverrides: qwenModelContextOverrides(),
 		}},
 	},
 	{
@@ -608,14 +770,16 @@ var curatedProviderPresets = []ProviderPreset{
 		Description: "Alibaba Cloud Qwen Coding Plan China endpoint.",
 		KeyEnv:      "QWEN_CODING_API_KEY",
 		Entries: []ProviderEntry{{
-			Name:         "qwen-coding-plan-cn",
-			Kind:         "openai",
-			BaseURL:      "https://coding.dashscope.aliyuncs.com/v1",
-			Models:       qwenPlanModels,
-			VisionModels: qwenPlanVisionModels,
-			Default:      "qwen3.7-plus",
-			APIKeyEnv:    "QWEN_CODING_API_KEY",
-			NoProxy:      true,
+			Name:           "qwen-coding-plan-cn",
+			Kind:           "openai",
+			BaseURL:        "https://coding.dashscope.aliyuncs.com/v1",
+			Models:         qwenPlanModels,
+			VisionModels:   qwenPlanVisionModels,
+			Default:        "qwen3.7-plus",
+			APIKeyEnv:      "QWEN_CODING_API_KEY",
+			ContextWindow:  1_000_000,
+			ModelOverrides: qwenModelContextOverrides(),
+			NoProxy:        true,
 		}},
 	},
 	{
@@ -624,15 +788,17 @@ var curatedProviderPresets = []ProviderPreset{
 		Description: "Alibaba Cloud Qwen Coding Plan China Anthropic-compatible endpoint.",
 		KeyEnv:      "QWEN_CODING_API_KEY",
 		Entries: []ProviderEntry{{
-			Name:         "qwen-coding-plan-cn-anthropic",
-			Kind:         "anthropic",
-			BaseURL:      "https://coding.dashscope.aliyuncs.com/apps/anthropic",
-			Models:       qwenPlanModels,
-			VisionModels: qwenPlanVisionModels,
-			Default:      "qwen3.7-plus",
-			APIKeyEnv:    "QWEN_CODING_API_KEY",
-			Thinking:     "adaptive",
-			NoProxy:      true,
+			Name:           "qwen-coding-plan-cn-anthropic",
+			Kind:           "anthropic",
+			BaseURL:        "https://coding.dashscope.aliyuncs.com/apps/anthropic",
+			Models:         qwenPlanModels,
+			VisionModels:   qwenPlanVisionModels,
+			Default:        "qwen3.7-plus",
+			APIKeyEnv:      "QWEN_CODING_API_KEY",
+			ContextWindow:  1_000_000,
+			ModelOverrides: qwenModelContextOverrides(),
+			Thinking:       "adaptive",
+			NoProxy:        true,
 		}},
 	},
 	{
@@ -641,13 +807,15 @@ var curatedProviderPresets = []ProviderPreset{
 		Description: "Alibaba Cloud Qwen Coding Plan international endpoint.",
 		KeyEnv:      "QWEN_CODING_API_KEY",
 		Entries: []ProviderEntry{{
-			Name:         "qwen-coding-plan-global",
-			Kind:         "openai",
-			BaseURL:      "https://coding-intl.dashscope.aliyuncs.com/v1",
-			Models:       qwenPlanModels,
-			VisionModels: qwenPlanVisionModels,
-			Default:      "qwen3.7-plus",
-			APIKeyEnv:    "QWEN_CODING_API_KEY",
+			Name:           "qwen-coding-plan-global",
+			Kind:           "openai",
+			BaseURL:        "https://coding-intl.dashscope.aliyuncs.com/v1",
+			Models:         qwenPlanModels,
+			VisionModels:   qwenPlanVisionModels,
+			Default:        "qwen3.7-plus",
+			APIKeyEnv:      "QWEN_CODING_API_KEY",
+			ContextWindow:  1_000_000,
+			ModelOverrides: qwenModelContextOverrides(),
 		}},
 	},
 	{
@@ -656,14 +824,16 @@ var curatedProviderPresets = []ProviderPreset{
 		Description: "Alibaba Cloud Qwen Coding Plan international Anthropic-compatible endpoint.",
 		KeyEnv:      "QWEN_CODING_API_KEY",
 		Entries: []ProviderEntry{{
-			Name:         "qwen-coding-plan-global-anthropic",
-			Kind:         "anthropic",
-			BaseURL:      "https://coding-intl.dashscope.aliyuncs.com/apps/anthropic",
-			Models:       qwenPlanModels,
-			VisionModels: qwenPlanVisionModels,
-			Default:      "qwen3.7-plus",
-			APIKeyEnv:    "QWEN_CODING_API_KEY",
-			Thinking:     "adaptive",
+			Name:           "qwen-coding-plan-global-anthropic",
+			Kind:           "anthropic",
+			BaseURL:        "https://coding-intl.dashscope.aliyuncs.com/apps/anthropic",
+			Models:         qwenPlanModels,
+			VisionModels:   qwenPlanVisionModels,
+			Default:        "qwen3.7-plus",
+			APIKeyEnv:      "QWEN_CODING_API_KEY",
+			ContextWindow:  1_000_000,
+			ModelOverrides: qwenModelContextOverrides(),
+			Thinking:       "adaptive",
 		}},
 	},
 	{
@@ -677,7 +847,26 @@ var curatedProviderPresets = []ProviderPreset{
 			BaseURL:          "https://api.stepfun.com/step_plan/v1",
 			Models:           stepfunPlanModels,
 			Default:          "step-3.7-flash",
+			ContextWindow:    stepfunContextWindow,
 			APIKeyEnv:        "STEPFUN_API_KEY",
+			SupportedEfforts: []string{"low", "medium", "high"},
+			DefaultEffort:    "medium",
+		}},
+	},
+	{
+		ID:          "stepfun-responses",
+		Label:       "StepFun Responses API",
+		Description: "StepFun Responses API endpoint with reasoning effort and tool calls (step-3.7-flash).",
+		KeyEnv:      "STEPFUN_API_KEY",
+		Entries: []ProviderEntry{{
+			Name:             "stepfun-responses",
+			Kind:             "responses",
+			BaseURL:          "https://api.stepfun.com/v1",
+			Models:           stepfunResponsesModels,
+			Default:          "step-3.7-flash",
+			ContextWindow:    stepfunContextWindow,
+			APIKeyEnv:        "STEPFUN_API_KEY",
+			ResponsesMode:    "stateless",
 			SupportedEfforts: []string{"low", "medium", "high"},
 			DefaultEffort:    "medium",
 		}},
@@ -693,6 +882,43 @@ var curatedProviderPresets = []ProviderPreset{
 			BaseURL:          "https://api.stepfun.com/step_plan",
 			Models:           stepfunPlanModels,
 			Default:          "step-3.7-flash",
+			ContextWindow:    stepfunContextWindow,
+			APIKeyEnv:        "STEPFUN_API_KEY",
+			Thinking:         "adaptive",
+			SupportedEfforts: []string{"low", "medium", "high"},
+			DefaultEffort:    "medium",
+		}},
+	},
+	{
+		ID:          "stepfun-api",
+		Label:       "StepFun API Pay-as-you-go",
+		Description: "StepFun pay-as-you-go OpenAI-compatible API with vision on step-3.7-flash.",
+		KeyEnv:      "STEPFUN_API_KEY",
+		Entries: []ProviderEntry{{
+			Name:             "stepfun-api",
+			Kind:             "openai",
+			BaseURL:          "https://api.stepfun.com/v1",
+			Models:           stepfunAPIModels,
+			VisionModels:     stepfunAPIVisionModels,
+			Default:          "step-3.7-flash",
+			ContextWindow:    stepfunContextWindow,
+			APIKeyEnv:        "STEPFUN_API_KEY",
+			SupportedEfforts: []string{"low", "medium", "high"},
+			DefaultEffort:    "medium",
+		}},
+	},
+	{
+		ID:          "stepfun-api-anthropic",
+		Label:       "StepFun API Anthropic Pay-as-you-go",
+		Description: "StepFun pay-as-you-go Anthropic-compatible Messages API with automatic prefix caching.",
+		KeyEnv:      "STEPFUN_API_KEY",
+		Entries: []ProviderEntry{{
+			Name:             "stepfun-api-anthropic",
+			Kind:             "anthropic",
+			BaseURL:          "https://api.stepfun.com",
+			Models:           stepfunAPIModels,
+			Default:          "step-3.7-flash",
+			ContextWindow:    stepfunContextWindow,
 			APIKeyEnv:        "STEPFUN_API_KEY",
 			Thinking:         "adaptive",
 			SupportedEfforts: []string{"low", "medium", "high"},
@@ -787,6 +1013,7 @@ var curatedProviderPresets = []ProviderPreset{
 			APIKeyEnv: "KILOCODE_API_KEY",
 		}},
 	},
+	modelscopePreset,
 	{
 		ID:          "ollama-cloud",
 		Label:       "Ollama Cloud",
@@ -803,21 +1030,8 @@ var curatedProviderPresets = []ProviderPreset{
 	},
 }
 
-func cloneProviderPresets(in []ProviderPreset) []ProviderPreset {
-	out := make([]ProviderPreset, 0, len(in))
-	for _, p := range in {
-		out = append(out, cloneProviderPreset(p))
-	}
-	return out
-}
-
-func cloneProviderPreset(p ProviderPreset) ProviderPreset {
-	p.Entries = cloneProviderEntries(p.Entries)
-	for i := range p.Entries {
-		p.Entries[i].PresetID = p.ID
-		p.Entries[i].PresetVersion = ProviderPresetVersion
-	}
-	return p
+func boolPointer(value bool) *bool {
+	return &value
 }
 
 func cloneProviderEntries(in []ProviderEntry) []ProviderEntry {
@@ -829,6 +1043,18 @@ func cloneProviderEntries(in []ProviderEntry) []ProviderEntry {
 }
 
 func cloneProviderEntry(e ProviderEntry) ProviderEntry {
+	if e.WebSearch != nil {
+		value := *e.WebSearch
+		e.WebSearch = &value
+	}
+	if e.ResponsesStateful != nil {
+		value := *e.ResponsesStateful
+		e.ResponsesStateful = &value
+	}
+	if e.visionOverride != nil {
+		value := *e.visionOverride
+		e.visionOverride = &value
+	}
 	e.Models = append([]string(nil), e.Models...)
 	e.VisionModels = append([]string(nil), e.VisionModels...)
 	e.SupportedEfforts = append([]string(nil), e.SupportedEfforts...)
@@ -884,6 +1110,10 @@ func cloneModelOverrideMap(in map[string]ProviderModelOverride) map[string]Provi
 	out := make(map[string]ProviderModelOverride, len(in))
 	for k, v := range in {
 		v.SupportedEfforts = append([]string(nil), v.SupportedEfforts...)
+		if v.Vision != nil {
+			vision := *v.Vision
+			v.Vision = &vision
+		}
 		out[k] = v
 	}
 	return out

@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -16,6 +17,8 @@ import (
 
 	"reasonix/internal/config"
 	"reasonix/internal/event"
+	"reasonix/internal/recovery"
+	"reasonix/internal/turnevent"
 )
 
 // metrics_app.go is the aggregate desktop-metrics flush: anonymous (signal,
@@ -30,6 +33,7 @@ const metricsPendingFile = "metrics-pending.json"
 const metricsPostTimeout = 8 * time.Second
 
 var statusCodePattern = regexp.MustCompile(`status (\d{3})`)
+var metricsPendingMu sync.Mutex
 
 type counters map[string]map[string]int // signal -> bucket -> count
 
@@ -61,8 +65,15 @@ func newMetricsAggregator(configDir string) *metricsAggregator {
 }
 
 func (m *metricsAggregator) inc(signal, bucket string) {
+	m.add(signal, bucket, 1)
+}
+
+func (m *metricsAggregator) add(signal, bucket string, n int) {
+	if n <= 0 {
+		return
+	}
 	m.mu.Lock()
-	m.c.add(signal, bucket, 1)
+	m.c.add(signal, bucket, n)
 	m.mu.Unlock()
 }
 
@@ -100,10 +111,8 @@ func countBucket(n int) string {
 
 func knownBucket(value string, allowed ...string) string {
 	value = strings.ToLower(strings.TrimSpace(value))
-	for _, ok := range allowed {
-		if value == ok {
-			return value
-		}
+	if slices.Contains(allowed, value) {
+		return value
 	}
 	return "other"
 }
@@ -230,8 +239,6 @@ func (m *metricsAggregator) observeSettingsSnapshot(c *config.Config) {
 	m.inc("settings_theme_style", themeStyle)
 	m.inc("settings_close_behavior", c.DesktopCloseBehavior())
 	m.inc("settings_display_mode", c.DesktopDisplayMode())
-	m.inc("settings_auto_plan", desktopAutoPlanMode(c.Agent.AutoPlan))
-	m.inc("settings_memory_compiler", boolBucket(c.MemoryCompilerEnabled()))
 	m.inc("settings_status_bar_style", c.DesktopStatusBarStyle())
 	m.inc("settings_status_bar_items_count", statusBarItemsCountBucket(len(c.DesktopStatusBarItems())))
 	m.inc("settings_check_updates", boolBucket(c.DesktopCheckUpdates()))
@@ -252,7 +259,7 @@ func (m *metricsAggregator) observeBotSettingsSnapshot(c *config.Config) {
 	bot := c.Bot
 	m.inc("settings_bot_enabled", boolBucket(bot.Enabled))
 	m.inc("settings_bot_model", safeModelBucket(c, bot.Model))
-	m.inc("settings_bot_tool_approval", knownBucketDefault(bot.ToolApprovalMode, "ask", "ask", "auto", "yolo"))
+	m.inc("settings_bot_tool_approval", knownBucketDefault(bot.ToolApprovalMode, "workspace-write", "read-only", "workspace-write", "danger-full-access", "ask", "auto", "yolo"))
 	m.inc("settings_bot_allowlist", boolBucket(bot.Allowlist.Enabled))
 	m.inc("settings_bot_allow_all", boolBucket(bot.Allowlist.AllowAll))
 	m.inc("settings_bot_qq_enabled", boolBucket(bot.QQ.Enabled))
@@ -265,7 +272,7 @@ func (m *metricsAggregator) observeBotSettingsSnapshot(c *config.Config) {
 		m.inc("settings_bot_connection_enabled", boolBucket(conn.Enabled))
 		m.inc("settings_bot_connection_status", knownBucket(conn.Status, "disconnected", "pending", "connected", "error"))
 		m.inc("settings_bot_connection_model", safeModelBucket(c, conn.Model))
-		m.inc("settings_bot_connection_approval", knownBucketDefault(conn.ToolApprovalMode, "default", "default", "ask", "auto", "yolo"))
+		m.inc("settings_bot_connection_approval", knownBucketDefault(conn.ToolApprovalMode, "default", "default", "read-only", "workspace-write", "danger-full-access", "ask", "auto", "yolo"))
 	}
 }
 
@@ -278,6 +285,31 @@ func (a *App) recordSettingsMetricsSnapshot(c *config.Config) {
 		return
 	}
 	m.observeSettingsSnapshot(c)
+	m.persist()
+}
+
+// recordDiagnosticMetric persists one bounded operational signal even when the
+// native event arrives before Wails OnStartup installs the session aggregator.
+func (a *App) recordDiagnosticMetric(signal, bucket string) {
+	a.recordDiagnosticMetricCount(signal, bucket, 1)
+}
+
+func (a *App) recordDiagnosticMetricCount(signal, bucket string, count int) {
+	if count <= 0 {
+		return
+	}
+	if version == "dev" {
+		return
+	}
+	m := a.metrics.Load()
+	if m == nil {
+		cfg, err := config.Load()
+		if err != nil || !cfg.DesktopMetrics() {
+			return
+		}
+		m = newMetricsAggregator(config.MemoryUserDir())
+	}
+	m.add(signal, metricBucket(bucket), count)
 	m.persist()
 }
 
@@ -297,7 +329,7 @@ func (m *metricsAggregator) observe(e event.Event) {
 		}
 	case event.TurnDone:
 		m.inc("turns", "total")
-		if e.Err != nil {
+		if e.Err != nil && e.Outcome != event.TurnOutcomeRecoveryPaused && e.Outcome != event.TurnOutcomeCompletionUncertain && e.Outcome != event.TurnOutcomeIncompleteRead {
 			m.inc("provider_error", errorClass(e.Err.Error()))
 		}
 	case event.ToolResult:
@@ -306,72 +338,29 @@ func (m *metricsAggregator) observe(e event.Event) {
 		}
 	case event.CompactionDone:
 		m.inc("compaction", "total")
-	case event.MemoryCompilerStatsEvent:
-		m.observeMemoryCompilerStats(e.MemoryCompiler)
 	case event.Notice:
-		if strings.HasPrefix(e.Text, "empty final answer blocked") {
+		if e.Code == event.NoticeCodeEmptyFinal || strings.HasPrefix(e.Detail, "empty final answer blocked") {
 			m.inc("empty_final", "total")
 		}
 	}
 }
 
-func (m *metricsAggregator) observeMemoryCompilerStats(s *event.MemoryCompilerStats) {
-	if s == nil {
-		return
+func (m *metricsAggregator) observeSubagentLifecycle(info event.SubagentLifecycleInfo) {
+	phase := knownBucket(info.Phase, "child_created", "child_running", "child_completed", "child_partial", "child_failed", "child_cancelled", "child_resume")
+	status := knownBucket(info.Status, "queued", "running", "completed", "partial", "failed", "cancelled")
+	m.inc("subagent_lifecycle", phase+"_"+status)
+	if info.ErrorCode != "" {
+		m.inc("subagent_error", knownBucket(info.ErrorCode, "completion_uncertain", "final_readiness", "review_unavailable", "max_steps", "incomplete_read", "provider_connection", "subagent_error"))
 	}
-	m.inc("memory_compiler_turn", "total")
-	m.inc("memory_compiler_injected", boolBucket(s.Injected))
-	m.inc("memory_compiler_useful_ir", boolBucket(s.UsefulIR))
-	m.inc("memory_compiler_compiled_tokens", tokenSizeBucket(s.CompiledTokens))
-	m.inc("memory_compiler_ir_overhead_tokens", tokenSizeBucket(s.IROverheadTokens))
-	m.inc("memory_compiler_memory_refs", countBucket(s.MemoryReferences))
-	m.inc("memory_compiler_constraints", countBucket(s.Constraints))
-	m.inc("memory_compiler_risk_notes", countBucket(s.RiskNotes))
-	m.inc("memory_compiler_execution_steps", countBucket(s.ExecutionSteps))
-	m.inc("memory_compiler_nodes", memorySizeBucket(s.TotalNodes))
-	m.inc("memory_compiler_high_signal_nodes", memorySizeBucket(s.HighSignalNodes))
-	m.inc("memory_compiler_tool_result_nodes", memorySizeBucket(s.ToolResultNodes))
-	m.inc("memory_compiler_decisions", memorySizeBucket(s.DecisionNodes))
-	m.inc("memory_compiler_strategies", memorySizeBucket(s.StrategyCount))
-	m.inc("memory_compiler_learnings", memorySizeBucket(s.LearningCount))
-}
-
-func tokenSizeBucket(n int) string {
-	if n <= 0 {
-		return "t_0"
-	}
-	switch {
-	case n <= 250:
-		return "t_1_250"
-	case n <= 750:
-		return "t_251_750"
-	case n <= 1500:
-		return "t_751_1500"
-	case n <= 3000:
-		return "t_1501_3000"
-	default:
-		return "t_3001_plus"
+	if info.Retryable {
+		m.inc("subagent_retryable", "yes")
+	} else {
+		m.inc("subagent_retryable", "no")
 	}
 }
 
-func memorySizeBucket(n int) string {
-	if n <= 0 {
-		return "n_0"
-	}
-	switch {
-	case n <= 5:
-		return "n_1_5"
-	case n <= 20:
-		return "n_6_20"
-	case n <= 50:
-		return "n_21_50"
-	case n <= 100:
-		return "n_51_100"
-	case n <= 300:
-		return "n_101_300"
-	default:
-		return "n_301_plus"
-	}
+func metricsEventRequiresPersist(e event.Event) bool {
+	return e.Kind == event.TurnDone
 }
 
 func cacheBucket(hit, miss int) string {
@@ -390,12 +379,37 @@ func cacheBucket(hit, miss int) string {
 	}
 }
 
+// badRequestReason separates the 400s that need different fixes. Every arm
+// returns a fixed label matched against a fixed substring, so nothing the
+// provider echoed back can reach the bucket — the same constraint errorClass
+// works under. Unrecognized shapes stay plain http_400 rather than guessing.
+func badRequestReason(low string) string {
+	switch {
+	case strings.Contains(low, "image_url"), strings.Contains(low, "unknown variant"):
+		return "content"
+	case strings.Contains(low, "is not of type"), strings.Contains(low, "invalid schema for function"):
+		return "schema"
+	case strings.Contains(low, "thinking") && strings.Contains(low, "passed back"):
+		return "reasoning_replay"
+	case strings.Contains(low, "thinking") && (strings.Contains(low, "expected a boolean") || strings.Contains(low, "invalid type")):
+		return "thinking_shape"
+	case strings.Contains(low, "context length"), strings.Contains(low, "maximum context"), strings.Contains(low, "too long"):
+		return "context_length"
+	case strings.Contains(low, "tool_calls"), strings.Contains(low, "missing field name"):
+		return "tool_calls"
+	}
+	return ""
+}
+
 // errorClass extracts only the failure category — never the message itself, which
 // can echo request content back from a provider.
 func errorClass(msg string) string {
 	if mm := statusCodePattern.FindStringSubmatch(msg); mm != nil {
 		switch code := mm[1]; {
 		case code == "400":
+			if reason := badRequestReason(strings.ToLower(msg)); reason != "" {
+				return "http_400_" + reason
+			}
 			return "http_400"
 		case code == "401" || code == "403":
 			return "http_401"
@@ -407,6 +421,16 @@ func errorClass(msg string) string {
 	}
 	low := strings.ToLower(msg)
 	switch {
+	case strings.Contains(low, "authorization cancelled"):
+		return "authorization_cancelled"
+	case strings.Contains(low, "authorization failed"):
+		return "authorization_failed"
+	case strings.Contains(low, "package manager busy"):
+		return "package_manager_busy"
+	case strings.Contains(low, "package install failed"):
+		return "package_install_failed"
+	case strings.Contains(low, "package verify failed"), strings.Contains(low, "signature verification failed"):
+		return "package_verify_failed"
 	case strings.Contains(low, "reset"), strings.Contains(low, "interrupt"), strings.Contains(low, "eof"):
 		return "stream_interrupted"
 	case strings.Contains(low, "timeout"), strings.Contains(low, "deadline"):
@@ -423,12 +447,110 @@ func toolErrorClass(msg string) string {
 		return "permission"
 	case strings.Contains(low, "plan mode"):
 		return "planmode"
+	case strings.Contains(low, "recovery"):
+		return "recovery"
 	case strings.Contains(low, "hook"):
 		return "hook"
 	case strings.Contains(low, "timeout"), strings.Contains(low, "deadline"):
 		return "timeout"
 	default:
 		return "exec"
+	}
+}
+
+// observeRecoveryMetrics merges content-free recovery counters from a controller
+// (failure events, rule/review continues, human prompts/actions, reviewer errors).
+func (m *metricsAggregator) observeRecoveryMetrics(stats recovery.Metrics) {
+	if m == nil {
+		return
+	}
+	add := func(signal string, n int64) {
+		for range n {
+			m.inc(signal, "total")
+		}
+	}
+	add("recovery_failure", stats.FailureEvents)
+	add("recovery_rule_continue", stats.RuleContinues)
+	add("recovery_review_continue", stats.ReviewContinues)
+	add("recovery_human_prompt", stats.HumanPrompts)
+	add("recovery_human_continue", stats.HumanContinues)
+	add("recovery_human_revise", stats.HumanRevises)
+	add("recovery_review_error", stats.ReviewErrors)
+	add("recovery_repeat_prompt", stats.RepeatPrompts)
+	if stats.ReviewLatencyCount > 0 {
+		avg := stats.ReviewLatencyMsSum / stats.ReviewLatencyCount
+		switch {
+		case avg < 500:
+			m.inc("recovery_review_latency", "lt_500ms")
+		case avg < 2000:
+			m.inc("recovery_review_latency", "lt_2s")
+		case avg < 10000:
+			m.inc("recovery_review_latency", "lt_10s")
+		default:
+			m.inc("recovery_review_latency", "gte_10s")
+		}
+	}
+}
+
+func observeControllerRecoveryMetrics(m *metricsAggregator, ctrl any) {
+	if m == nil || ctrl == nil {
+		return
+	}
+	if drainer, ok := ctrl.(interface {
+		DrainRecoveryMetrics() recovery.Metrics
+	}); ok {
+		m.observeRecoveryMetrics(drainer.DrainRecoveryMetrics())
+	}
+}
+
+func (m *metricsAggregator) observeTurnEventMetrics(stats turnevent.MetricsSnapshot) {
+	if m == nil {
+		return
+	}
+	m.add("turn_ledger_stream_raw", "total", int(stats.RawEvents))
+	m.add("turn_ledger_stream_records", "total", int(stats.StreamRecords))
+	m.add("turn_ledger_write_bytes", "total", int(stats.BytesWritten))
+	m.add("turn_ledger_replay_events", "total", int(stats.ReplayEvents))
+	m.add("turn_ledger_replay_bytes", "total", int(stats.ReplayBytes))
+	m.add("turn_ledger_replay_reset", "total", int(stats.ReplayResets))
+	m.add("turn_ledger_compaction", "success", int(stats.Compactions))
+	m.add("turn_ledger_compaction", "failed", int(stats.CompactionFailures))
+	m.add("turn_ledger_compaction_bytes", "before", int(stats.BytesBeforeCompact))
+	m.add("turn_ledger_compaction_bytes", "after", int(stats.BytesAfterCompact))
+	m.add("turn_ledger_failure", "write", int(stats.WriteFailures))
+	m.add("turn_ledger_recovery", "torn_tail", int(stats.TornTails))
+	m.add("turn_ledger_projection_retry", "total", int(stats.ProjectionRetries))
+	latencyBuckets := []string{"lt_1ms", "1_5ms", "5_20ms", "20_100ms", "gte_100ms"}
+	for i, bucket := range latencyBuckets {
+		m.add("turn_ledger_append_latency", bucket, int(stats.AppendLatencyBuckets[i]))
+		m.add("turn_ledger_replay_latency", bucket, int(stats.ReplayLatencyBuckets[i]))
+		m.add("turn_ledger_compact_latency", bucket, int(stats.CompactLatencyBuckets[i]))
+	}
+	switch {
+	case stats.FileSizeBytes < 256<<10:
+		m.inc("turn_ledger_file_size", "lt_256k")
+	case stats.FileSizeBytes < 1<<20:
+		m.inc("turn_ledger_file_size", "256k_1m")
+	case stats.FileSizeBytes < 8<<20:
+		m.inc("turn_ledger_file_size", "1m_8m")
+	case stats.FileSizeBytes < 32<<20:
+		m.inc("turn_ledger_file_size", "8m_32m")
+	default:
+		m.inc("turn_ledger_file_size", "gte_32m")
+	}
+	if stats.UnconfirmedTurns > 0 {
+		m.add("turn_ledger_projection_pending", "total", stats.UnconfirmedTurns)
+	}
+}
+
+func observeControllerTurnEventMetrics(m *metricsAggregator, ctrl any) {
+	if m == nil || ctrl == nil {
+		return
+	}
+	if drainer, ok := ctrl.(interface {
+		DrainTurnEventMetrics() turnevent.MetricsSnapshot
+	}); ok {
+		m.observeTurnEventMetrics(drainer.DrainTurnEventMetrics())
 	}
 }
 
@@ -444,13 +566,15 @@ func (m *metricsAggregator) persist() {
 	m.c = counters{}
 	m.mu.Unlock()
 
+	metricsPendingMu.Lock()
 	pending := readCounters(m.path)
 	pending.merge(delta)
 	writeCounters(m.path, pending)
+	metricsPendingMu.Unlock()
 }
 
 func readCounters(path string) counters {
-	b, err := os.ReadFile(path)
+	b, err := readFileUTF8(path)
 	if err != nil {
 		return counters{}
 	}
@@ -474,10 +598,21 @@ type metricCounter struct {
 }
 
 type metricsPayload struct {
-	InstallID string          `json:"installId,omitempty"`
-	Version   string          `json:"version"`
-	OS        string          `json:"os"`
-	Counters  []metricCounter `json:"counters"`
+	InstallID      string          `json:"installId,omitempty"`
+	Version        string          `json:"version"`
+	OS             string          `json:"os"`
+	Arch           string          `json:"arch,omitempty"`
+	Channel        string          `json:"channel,omitempty"`
+	OSBuild        int             `json:"osBuild,omitempty"`
+	OSRevision     int             `json:"osRevision,omitempty"`
+	DistroID       string          `json:"distroId,omitempty"`
+	DistroVersion  string          `json:"distroVersion,omitempty"`
+	KernelVersion  string          `json:"kernelVersion,omitempty"`
+	SessionType    string          `json:"sessionType,omitempty"`
+	RuntimeEngine  string          `json:"runtimeEngine,omitempty"`
+	RuntimeVersion string          `json:"runtimeVersion,omitempty"`
+	GPUMode        string          `json:"gpuMode,omitempty"`
+	Counters       []metricCounter `json:"counters"`
 }
 
 func flatten(c counters) []metricCounter {
@@ -505,11 +640,21 @@ func (a *App) flushMetrics() {
 	}
 	path := filepath.Join(config.MemoryUserDir(), metricsPendingFile)
 	temp := path + ".sending"
+	metricsPendingMu.Lock()
 	if os.Rename(path, temp) != nil {
+		metricsPendingMu.Unlock()
 		return // nothing pending
 	}
+	metricsPendingMu.Unlock()
 	flat := flatten(readCounters(temp))
-	payload := metricsPayload{Version: version, OS: runtime.GOOS, Counters: flat}
+	device := collectDeviceInfo()
+	payload := metricsPayload{
+		Version: version, OS: runtime.GOOS, Arch: runtime.GOARCH, Channel: channel,
+		OSBuild: device.OSBuild, OSRevision: device.OSRevision,
+		DistroID: device.DistroID, DistroVersion: device.DistroVersion,
+		KernelVersion: device.KernelVersion, SessionType: device.SessionType,
+		RuntimeEngine: desktopRendererEngine, Counters: flat,
+	}
 	if id, err := installID(); err == nil {
 		payload.InstallID = id
 	}
@@ -517,9 +662,11 @@ func (a *App) flushMetrics() {
 		_ = os.Remove(temp)
 		return
 	}
+	metricsPendingMu.Lock()
 	pending := readCounters(path)
 	pending.merge(readCounters(temp))
 	writeCounters(path, pending)
+	metricsPendingMu.Unlock()
 	_ = os.Remove(temp)
 }
 

@@ -21,7 +21,9 @@ The setting is intentionally small:
 
 - `auto` anchors visible reasoning to Chinese when the raw user prompt is
   clearly Chinese, ignoring injected reference context such as `@file` contents;
-  English and ambiguous turns add no extra instruction.
+  English and ambiguous turns add no extra instruction. Official DeepSeek-V4-Pro
+  is the exception: `auto` pins visible reasoning to English so it cannot
+  override that model's agent persona.
 - `zh` asks visible reasoning to prefer Simplified Chinese.
 - `en` asks visible reasoning to prefer English.
 
@@ -99,11 +101,9 @@ for this auto decision.
 
 When set to `zh` or `en`, Reasonix always adds a small transient
 `<reasoning-language>` block to the user turn. In all modes, this does not
-change:
-
-- the system prompt
-- tool schema bytes or ordering
-- the stable provider-visible prefix
+change tool schema bytes or ordering. Official DeepSeek-V4-Pro also prepends a
+stable first-line persona to the system prompt; other models leave the system
+prompt unchanged.
 
 This keeps high prompt-cache hit rate intact while still letting an explicit
 preference affect the next model call.
@@ -116,3 +116,13 @@ preference affect the next model call.
   terms should remain in their original form.
 - If a user asks for a final answer in a specific language, that request remains
   authoritative for the final answer.
+- The visible-reasoning language is anchored mainly by two signals: the language
+  of the turn's first reasoning segment, and the language of earlier reasoning
+  segments that providers receive back during tool-call loops. The injected
+  language block works by landing the first segment in the preferred language;
+  once the first segment holds, later segments usually sustain it.
+- In long agent turns dominated by another language (for example large English
+  build logs, code, or tool output), a later reasoning segment can still drift;
+  once it drifts, the rest of the turn usually stays in the drifted language,
+  and restating the preference mid-turn recovers it only partially. This is a
+  model-behavior boundary; the setting stays best-effort by design.

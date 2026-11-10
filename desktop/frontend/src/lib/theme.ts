@@ -4,8 +4,11 @@
 // carbon/nocturne/amber) — orthogonal to theme, so every direction supports both
 // light & dark.
 //
-// When running inside the Wails shell, applyTheme also syncs the native window
+// When running inside the desktop shell, applyTheme also syncs the native window
 // theme (title bar, traffic lights, etc.) so the OS chrome matches the webview.
+
+import { baseCodeReadabilityStylesheet } from "./codeReadability";
+import { desktopHost } from "./desktopHost";
 
 export type Theme = "auto" | "light" | "dark";
 export type ResolvedTheme = Exclude<Theme, "auto">;
@@ -38,6 +41,7 @@ const DEFAULT_THEME: Theme = "auto";
 const THEME_KEY = "reasonix-theme";
 const STYLE_KEY = "reasonix-theme-style";
 const AUTO_THEME_MEDIA_QUERY = "(prefers-color-scheme: light)";
+const BASE_CODE_READABILITY_STYLE_ID = "reasonix-base-code-readability";
 let currentTheme: Theme = DEFAULT_THEME;
 let currentThemeStyle: ThemeStyle = DEFAULT_THEME_STYLE;
 let autoThemeMediaQuery: MediaQueryList | null = null;
@@ -101,6 +105,7 @@ export function normalizeThemeStyleForTheme(style: string | undefined, _theme?: 
 
 export function applyTheme(theme: Theme, style: ThemeStyle = getThemeStyle(theme), options: { persist?: boolean } = {}): void {
   if (typeof document === "undefined") return;
+  ensureBaseCodeReadabilityStyle();
   const root = document.documentElement;
   root.removeAttribute("data-theme-mode");
   root.removeAttribute("data-theme-scheme");
@@ -113,20 +118,22 @@ export function applyTheme(theme: Theme, style: ThemeStyle = getThemeStyle(theme
   root.setAttribute("data-theme-style", nextStyle);
 
   // Sync the native window theme (title bar, traffic lights) to match.
-  const runtime = typeof window !== "undefined" ? window.runtime : undefined;
-  if (runtime) {
+  const host = desktopHost();
+  if (host.kind !== "none") {
     syncAutoThemeBackgroundListener(theme);
-    if (theme === "auto") {
-      runtime.WindowSetSystemDefaultTheme?.();
-    } else if (theme === "light") {
-      runtime.WindowSetLightTheme?.();
-    } else if (theme === "dark") {
-      runtime.WindowSetDarkTheme?.();
-    }
+    host.native.setWindowTheme(theme === "auto" ? "system" : theme);
     syncNativeWindowBackground(theme);
   }
 
   void options;
+}
+
+function ensureBaseCodeReadabilityStyle(): void {
+  if (document.getElementById(BASE_CODE_READABILITY_STYLE_ID)) return;
+  const style = document.createElement("style");
+  style.id = BASE_CODE_READABILITY_STYLE_ID;
+  style.textContent = baseCodeReadabilityStylesheet(THEME_STYLES);
+  document.head.appendChild(style);
 }
 
 function syncAutoThemeBackgroundListener(theme: Theme): void {
@@ -154,9 +161,7 @@ function clearAutoThemeBackgroundListener(): void {
 }
 
 function syncAutoThemeBackground(): void {
-  if (currentTheme === "auto" && typeof window !== "undefined" && window.runtime) {
-    syncNativeWindowBackground("auto");
-  }
+  if (currentTheme === "auto" && desktopHost().kind !== "none") syncNativeWindowBackground("auto");
 }
 
 export function readLegacyThemePreference(): { theme: Theme; style: ThemeStyle; hasValue: boolean } {
@@ -200,14 +205,13 @@ export function initTheme(): void {
 }
 
 function syncNativeWindowBackground(theme: Theme): void {
-  const runtime = typeof window !== "undefined" ? window.runtime : undefined;
-  if (!runtime?.WindowSetBackgroundColour) return;
-  const resolved = getResolvedTheme(theme);
-  if (resolved === "light") {
+  const host = desktopHost();
+  if (host.kind === "none") return;
+  if (getResolvedTheme(theme) === "light") {
     // Light shell: matches graphite --bg (#f4f3ef).
-    runtime.WindowSetBackgroundColour(244, 243, 239, 255);
+    host.native.setWindowBackground(244, 243, 239, 255);
   } else {
     // Dark shell: matches :root --bg (#090a0c).
-    runtime.WindowSetBackgroundColour(9, 10, 12, 255);
+    host.native.setWindowBackground(9, 10, 12, 255);
   }
 }

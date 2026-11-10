@@ -2,7 +2,10 @@ import { memo, type RefObject, useCallback, useEffect, useId, useLayoutEffect, u
 import { createPortal } from "react-dom";
 import { AlertCircle, Code2, Maximize2, Minimize2, Play, RotateCcw, ZoomIn, ZoomOut } from "lucide-react";
 import { CopyButton } from "./CopyButton";
+import { createMermaidPanZoom, type MermaidPanZoomInstance, type MermaidPanZoomOptions } from "./mermaidPanZoom";
 import { openExternal } from "../lib/bridge";
+import { markdownImageSource } from "../lib/markdownImage";
+import { useT } from "../lib/i18n";
 
 interface MermaidDiagramProps {
   definition: string;
@@ -24,17 +27,9 @@ type MermaidRenderAdapter = (
   signal: AbortSignal,
 ) => Promise<string>;
 
-type PanZoomInstance = {
-  destroy(): void;
-  resize(): unknown;
-  fit(): unknown;
-  center(): unknown;
-  zoomIn(): unknown;
-  zoomOut(): unknown;
-  reset(): unknown;
-};
+type PanZoomInstance = MermaidPanZoomInstance;
 
-type PanZoomFactory = (svg: SVGSVGElement, options?: Record<string, unknown>) => PanZoomInstance;
+type PanZoomFactory = (svg: SVGSVGElement, options?: MermaidPanZoomOptions) => PanZoomInstance;
 
 const MAX_TEXT_SIZE = 100000;
 const MIN_ZOOM = 0.3;
@@ -45,8 +40,6 @@ const XLINK_NS = "http://www.w3.org/1999/xlink";
 let mermaidApi: MermaidApi | null = null;
 let initPromise: Promise<MermaidApi> | null = null;
 let renderQueue: Promise<void> = Promise.resolve();
-let panZoomFactory: PanZoomFactory | null = null;
-let panZoomPromise: Promise<PanZoomFactory | null> | null = null;
 let renderAdapterForTest: MermaidRenderAdapter | null = null;
 let panZoomFactoryForTest: PanZoomFactory | null | undefined;
 
@@ -209,15 +202,7 @@ async function renderMermaid(
 
 async function ensurePanZoomFactory(): Promise<PanZoomFactory | null> {
   if (panZoomFactoryForTest !== undefined) return panZoomFactoryForTest;
-  if (panZoomFactory) return panZoomFactory;
-  if (!panZoomPromise) {
-    panZoomPromise = import("svg-pan-zoom").then((mod) => {
-      const factory = (("default" in mod ? mod.default : mod) as unknown) as PanZoomFactory;
-      panZoomFactory = factory;
-      return factory;
-    }).catch(() => null);
-  }
-  return panZoomPromise;
+  return createMermaidPanZoom;
 }
 
 export function isSafeMermaidHref(href: string | null | undefined): boolean {
@@ -264,8 +249,18 @@ export function sanitizeMermaidSvg(svg: string): string {
         element.removeAttribute(attrName);
         continue;
       }
-      if (localName === "href" && !isSafeMermaidHref(attr.value)) {
-        element.removeAttribute(attrName);
+      if (localName === "href") {
+        if (!isSafeMermaidHref(attr.value)) {
+          element.removeAttribute(attrName);
+          continue;
+        }
+        if (name === "image" || name === "feimage") {
+          attr.value = markdownImageSource(attr.value);
+        } else if (name === "use" && !attr.value.trim().startsWith("#")) {
+          // External <use> references can load arbitrary SVG documents. Mermaid
+          // only needs local fragment references, so keep those and drop the rest.
+          element.removeAttribute(attrName);
+        }
       }
     }
   }
@@ -306,8 +301,34 @@ function destroyPanZoom(instance: PanZoomInstance | null): void {
   try {
     instance.destroy();
   } catch {
-    /* svg-pan-zoom cleanup is best-effort across browser and test DOMs. */
+    /* pan/zoom listener cleanup is best-effort across browser and test DOMs. */
   }
+}
+
+function panZoomLayoutReady(container: HTMLElement): boolean {
+  const rect = container.getBoundingClientRect();
+  return Number.isFinite(rect.width) && Number.isFinite(rect.height) && rect.width > 0 && rect.height > 0;
+}
+
+export function safelyRunPanZoom(instance: PanZoomInstance | null, action: () => void): boolean {
+  if (!instance) return false;
+  try {
+    action();
+    return true;
+  } catch {
+    // Pan/zoom math reads live layout (getBoundingClientRect); a detached or
+    // zero-sized surface must never reach the global crash surface (#8068).
+    return false;
+  }
+}
+
+export function safelySyncPanZoom(instance: PanZoomInstance | null, container: HTMLElement | null): boolean {
+  if (!instance || !container || !panZoomLayoutReady(container)) return false;
+  return safelyRunPanZoom(instance, () => {
+    instance.resize();
+    instance.fit();
+    instance.center();
+  });
 }
 
 const MermaidDiagram = memo(function MermaidDiagram({ definition }: MermaidDiagramProps) {
@@ -359,7 +380,23 @@ const MermaidDiagram = memo(function MermaidDiagram({ definition }: MermaidDiagr
 
     let cancelled = false;
     let raf = 0;
+    let syncRaf = 0;
+    let resizeObserver: ResizeObserver | null = null;
     let instance: PanZoomInstance | null = null;
+
+    const queueSync = () => {
+      if (syncRaf) window.cancelAnimationFrame(syncRaf);
+      let attempts = 0;
+      const sync = () => {
+        syncRaf = 0;
+        if (cancelled || panZoomRef.current !== instance) return;
+        attempts += 1;
+        if (!safelySyncPanZoom(instance, container) && attempts < 4) {
+          syncRaf = window.requestAnimationFrame(sync);
+        }
+      };
+      syncRaf = window.requestAnimationFrame(sync);
+    };
 
     void ensurePanZoomFactory().then((factory) => {
       if (cancelled || !factory) return;
@@ -375,23 +412,16 @@ const MermaidDiagram = memo(function MermaidDiagram({ definition }: MermaidDiagr
         destroyPanZoom(panZoomRef.current);
         try {
           instance = factory(svg, {
-            zoomEnabled: true,
-            panEnabled: true,
-            controlIconsEnabled: false,
-            dblClickZoomEnabled: true,
-            fit: true,
-            center: true,
             minZoom: MIN_ZOOM,
             maxZoom: MAX_ZOOM,
             zoomScaleSensitivity: 0.3,
           });
           panZoomRef.current = instance;
-          window.requestAnimationFrame(() => {
-            if (panZoomRef.current !== instance) return;
-            instance?.resize();
-            instance?.fit();
-            instance?.center();
-          });
+          queueSync();
+          if (typeof ResizeObserver !== "undefined") {
+            resizeObserver = new ResizeObserver(queueSync);
+            resizeObserver.observe(container);
+          }
         } catch {
           instance = null;
           panZoomRef.current = null;
@@ -402,6 +432,8 @@ const MermaidDiagram = memo(function MermaidDiagram({ definition }: MermaidDiagr
     return () => {
       cancelled = true;
       if (raf) window.cancelAnimationFrame(raf);
+      if (syncRaf) window.cancelAnimationFrame(syncRaf);
+      resizeObserver?.disconnect();
       if (panZoomRef.current === instance) panZoomRef.current = null;
       destroyPanZoom(instance);
     };
@@ -421,9 +453,10 @@ const MermaidDiagram = memo(function MermaidDiagram({ definition }: MermaidDiagr
 
   useEffect(() => {
     if (!fullscreen || !panZoomRef.current) return;
-    panZoomRef.current.resize();
-    panZoomRef.current.fit();
-    panZoomRef.current.center();
+    const raf = window.requestAnimationFrame(() => {
+      safelySyncPanZoom(panZoomRef.current, previewRef.current);
+    });
+    return () => window.cancelAnimationFrame(raf);
   }, [fullscreen]);
 
   const toggleFullscreen = useCallback(() => {
@@ -435,19 +468,20 @@ const MermaidDiagram = memo(function MermaidDiagram({ definition }: MermaidDiagr
   }, []);
 
   const zoomIn = useCallback(() => {
-    panZoomRef.current?.zoomIn();
+    const instance = panZoomRef.current;
+    safelyRunPanZoom(instance, () => instance?.zoomIn());
   }, []);
 
   const zoomOut = useCallback(() => {
-    panZoomRef.current?.zoomOut();
+    const instance = panZoomRef.current;
+    safelyRunPanZoom(instance, () => instance?.zoomOut());
   }, []);
 
   const resetZoom = useCallback(() => {
     const instance = panZoomRef.current;
     if (!instance) return;
-    instance.reset();
-    instance.fit();
-    instance.center();
+    safelyRunPanZoom(instance, () => instance.reset());
+    safelySyncPanZoom(instance, previewRef.current);
   }, []);
 
   const body = (
@@ -460,7 +494,7 @@ const MermaidDiagram = memo(function MermaidDiagram({ definition }: MermaidDiagr
   );
 
   const content = (
-    <div className={[
+    <div data-app-overlay={fullscreen ? "" : undefined} className={[
       "mermaid-diagram",
       state.status === "error" ? "mermaid-diagram--error" : "",
       fullscreen ? "mermaid-diagram--fullscreen" : "",
@@ -585,6 +619,7 @@ function MermaidBody({
   tab: DiagramTab;
   previewRef: RefObject<HTMLDivElement | null>;
 }) {
+  const t = useT();
   if (tab === "code") {
     return (
       <pre className="code hljs mermaid-diagram__code" data-lang="mermaid">
@@ -597,7 +632,7 @@ function MermaidBody({
     return (
       <div className="mermaid-diagram__loading">
         <span className="mermaid-diagram__spinner" />
-        <span>Rendering diagram...</span>
+        <span>{t("common.loading")}</span>
       </div>
     );
   }
@@ -607,13 +642,13 @@ function MermaidBody({
       <div className="mermaid-diagram__error">
         <div className="mermaid-diagram__error-bar">
           <AlertCircle size={14} className="mermaid-diagram__error-icon" />
-          <span>Diagram syntax error</span>
+          <span>{t("error.diagram")}</span>
         </div>
         <pre className="code hljs mermaid-diagram__error-source" data-lang="mermaid">
           <code>{source}</code>
         </pre>
         <details className="mermaid-diagram__error-details">
-          <summary>Error details</summary>
+          <summary>{t("error.details")}</summary>
           <pre className="mermaid-diagram__error-detail-text">{state.message}</pre>
         </details>
       </div>

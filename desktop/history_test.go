@@ -1,11 +1,14 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 	"unicode/utf8"
 
 	"reasonix/internal/agent"
@@ -15,12 +18,13 @@ import (
 	"reasonix/internal/provider"
 	"reasonix/internal/store"
 	"reasonix/internal/tool"
+	"reasonix/internal/transcript"
 )
 
 func TestHistoryMessagesIncludeAssistantReasoning(t *testing.T) {
 	msgs := []provider.Message{
-		{Role: provider.RoleUser, Content: "expanded prompt"},
-		{Role: provider.RoleAssistant, Content: "answer", ReasoningContent: "thinking trace", ToolCalls: []provider.ToolCall{{
+		{Role: provider.RoleUser, Content: "expanded prompt", CreatedAt: 1_718_000_000_000},
+		{Role: provider.RoleAssistant, Content: "answer", ReasoningContent: "thinking trace", WorkDurationMs: 24_000, ToolCalls: []provider.ToolCall{{
 			ID: "call_1", Name: "bash", Arguments: `{"command":"pwd"}`,
 		}}, MemoryCitations: []provider.MemoryCitation{{
 			ID: "mem-1", Source: "Memory v5", Note: "use previous bash failure", Kind: "constraint",
@@ -45,8 +49,14 @@ func TestHistoryMessagesIncludeAssistantReasoning(t *testing.T) {
 	if got[0].SubmitText != "expanded prompt" {
 		t.Fatalf("user submit text = %q, want expanded prompt", got[0].SubmitText)
 	}
+	if got[0].CreatedAt != 1_718_000_000_000 {
+		t.Fatalf("user createdAt = %d, want 1718000000000", got[0].CreatedAt)
+	}
 	if got[1].Reasoning != "thinking trace" {
 		t.Fatalf("assistant reasoning = %q, want thinking trace", got[1].Reasoning)
+	}
+	if got[1].WorkDurationMs != 24_000 {
+		t.Fatalf("assistant work duration = %d, want 24000", got[1].WorkDurationMs)
 	}
 	if len(got[1].MemoryCitations) != 1 || got[1].MemoryCitations[0].Note != "use previous bash failure" {
 		t.Fatalf("assistant memory citations not preserved: %+v", got[1].MemoryCitations)
@@ -68,6 +78,108 @@ func TestHistoryMessagesIncludeAssistantReasoning(t *testing.T) {
 	}
 }
 
+func TestHistoryMessagesReplayAttachedDecisionReceiptAfterAssistant(t *testing.T) {
+	receipt := &provider.DecisionReceipt{ID: "approval-1", Kind: "tool", Tool: "bash", Outcome: "allow_once"}
+	got := historyMessages([]provider.Message{
+		{Role: provider.RoleUser, Content: "run it"},
+		{
+			Role:             provider.RoleAssistant,
+			ToolCalls:        []provider.ToolCall{{ID: "call-1", Name: "bash", Arguments: `{}`}},
+			DecisionReceipts: []*provider.DecisionReceipt{receipt},
+		},
+		{Role: provider.RoleTool, ToolCallID: "call-1", Name: "bash", Content: "ok"},
+	}, func(content string) string { return content })
+
+	if len(got) != 4 {
+		t.Fatalf("history messages = %d, want user, assistant, receipt, tool: %+v", len(got), got)
+	}
+	if len(got[1].ToolCalls) != 1 || got[2].Code != event.NoticeCodeDecisionReceipt || got[2].DecisionReceipt == nil {
+		t.Fatalf("history did not replay the decision after its assistant call: %+v", got)
+	}
+	if got[3].Role != "tool" || got[3].ToolCallID != "call-1" || !got[3].ToolResultArchived {
+		t.Fatalf("history lost the actual tool result: %+v", got[3])
+	}
+}
+
+func TestHistoryMessagesPreferPersistedRawUserContent(t *testing.T) {
+	const raw = "fix the bug"
+	const rendered = "<capability-route version=\"1\">\nuse review\n</capability-route>\n\nfix the bug"
+	msgs := []provider.Message{{Role: provider.RoleUser, Content: rendered, RawContent: raw}}
+
+	got := historyMessages(msgs, historyReplayUserContent)
+	if len(got) != 1 || got[0].Content != raw {
+		t.Fatalf("history user content = %+v, want raw %q", got, raw)
+	}
+	if got[0].SubmitText != "" {
+		t.Fatalf("provider-only wrapper should not become replay text, got %q", got[0].SubmitText)
+	}
+	if strings.Contains(got[0].Content, "capability-route") || strings.Contains(got[0].SubmitText, "capability-route") {
+		t.Fatalf("provider-only wrapper leaked into history: %+v", got[0])
+	}
+}
+
+func TestHistoryMessagesRecoverLegacyExpandedPasteWithoutSidecar(t *testing.T) {
+	const label = "[已粘贴文本 #1 · 3 行]"
+	const display = "review this\n\n" + label
+	const expanded = display + "\n\n--- Begin " + label + " ---\nfirst\nsecond\nthird\n--- End " + label + " ---"
+	const rendered = "<active-goal>\nship the release\n</active-goal>\n\n" + expanded
+	msgs := []provider.Message{{Role: provider.RoleUser, Content: rendered, RawContent: expanded}}
+
+	got := historyMessages(msgs, historyReplayUserContent)
+	if len(got) != 1 || got[0].Content != display {
+		t.Fatalf("legacy pasted display = %+v, want %q", got, display)
+	}
+	if got[0].SubmitText != expanded {
+		t.Fatalf("legacy pasted replay = %q, want expanded user input", got[0].SubmitText)
+	}
+	if strings.Contains(got[0].SubmitText, "<active-goal>") {
+		t.Fatalf("transient goal leaked into legacy replay: %+v", got[0])
+	}
+}
+
+func TestHistoryMessagesExpandedRawSupportsSidecarAndPreviousClients(t *testing.T) {
+	const label = "[Pasted text #1 · 2 lines]"
+	const display = "inspect\n\n" + label
+	const expanded = display + "\n\n--- Begin " + label + " ---\none\ntwo\n--- End " + label + " ---"
+	const rendered = "<capability-route version=\"1\">\nuse review\n</capability-route>\n\n" + expanded
+	msgs := []provider.Message{{Role: provider.RoleUser, Content: rendered, RawContent: expanded}}
+
+	// Previous desktop releases use RawContent as their replay source. Keeping
+	// the expanded markers there lets them reconstruct the same inline card
+	// instead of rendering an opaque label with no accessible payload.
+	previousReplay := agent.UserMessageText(msgs[0])
+	if !strings.Contains(previousReplay, "--- Begin "+label+" ---") || !strings.Contains(previousReplay, "--- End "+label+" ---") {
+		t.Fatalf("previous-client replay lost pasted payload markers: %q", previousReplay)
+	}
+
+	got := historyMessages(msgs, func(content string) string {
+		if content != rendered {
+			t.Fatalf("sidecar resolver content = %q, want rendered content", content)
+		}
+		return display
+	})
+	if len(got) != 1 || got[0].Content != display || got[0].SubmitText != expanded {
+		t.Fatalf("legacy sidecar history = %+v, want display %q and expanded replay", got, display)
+	}
+	if strings.Contains(got[0].SubmitText, "capability-route") {
+		t.Fatalf("provider-only wrapper leaked into sidecar replay: %+v", got[0])
+	}
+}
+
+func TestHistoryMessagesLegacyReferenceReplayExcludesResolvedContext(t *testing.T) {
+	const raw = "@src/main.go explain the entrypoint"
+	const rendered = "<capability-route version=\"1\">\nuse review\n</capability-route>\n\nReferenced context:\n\n<file path=\"src/main.go\">\npackage main\n</file>\n\n" + raw
+	msgs := []provider.Message{{Role: provider.RoleUser, Content: rendered, RawContent: raw}}
+
+	got := historyMessages(msgs, historyReplayUserContent)
+	if len(got) != 1 || got[0].Content != raw || got[0].SubmitText != "" {
+		t.Fatalf("legacy reference history = %+v, want compact raw replay", got)
+	}
+	if strings.Contains(got[0].Content, "<file") || strings.Contains(got[0].SubmitText, "<file") {
+		t.Fatalf("resolved reference leaked into editable history: %+v", got[0])
+	}
+}
+
 func TestHistoryMessagesDoNotReplayMemoryCompilerContract(t *testing.T) {
 	raw := historyMemoryCompilerContract(t, "ship the refactor")
 	msgs := []provider.Message{
@@ -86,6 +198,21 @@ func TestHistoryMessagesDoNotReplayMemoryCompilerContract(t *testing.T) {
 		t.Fatalf("raw Memory v5 contract should not be replay submitText, got %q", got[0].SubmitText)
 	}
 	assertNoHistoryMemoryContract(t, got[0].Content)
+}
+
+func TestHistoryMessagesRestoreCompiledSkillInvocationWithoutContract(t *testing.T) {
+	raw := historyMemoryCompilerContract(t, "/reasonix-develop ship the refactor")
+	msgs := []provider.Message{{Role: provider.RoleUser, Content: raw}}
+
+	got := historyMessages(msgs, func(string) string { return "ship the refactor" })
+	if len(got) != 1 {
+		t.Fatalf("history length = %d, want 1: %+v", len(got), got)
+	}
+	if got[0].Content != "ship the refactor" || got[0].SubmitText != "/reasonix-develop ship the refactor" {
+		t.Fatalf("compiled skill history = %+v", got[0])
+	}
+	assertNoHistoryMemoryContract(t, got[0].Content)
+	assertNoHistoryMemoryContract(t, got[0].SubmitText)
 }
 
 func TestHistoryMessagesStripActiveGoalFromVisibleUserContent(t *testing.T) {
@@ -170,6 +297,26 @@ func TestHistoryPageFromMessagesWindowsByUserTurn(t *testing.T) {
 	}
 }
 
+func TestHistoryPageWithFingerprintBindsRevisionToExactContentDigest(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "session.jsonl")
+	if err := agent.SaveBranchMeta(path, agent.BranchMeta{
+		Revision:      7,
+		ContentDigest: "digest-v7",
+	}); err != nil {
+		t.Fatalf("save branch metadata: %v", err)
+	}
+
+	page := historyPageWithFingerprint(HistoryPage{Messages: []HistoryMessage{{Role: "user", Content: "hello"}}}, path, "digest-v7")
+	if page.Revision != 7 || page.Digest != "digest-v7" {
+		t.Fatalf("history fingerprint = revision %d digest %q, want revision 7 digest-v7", page.Revision, page.Digest)
+	}
+
+	stale := historyPageWithFingerprint(HistoryPage{Messages: []HistoryMessage{{Role: "user", Content: "older"}}}, path, "digest-v6")
+	if stale.Revision != 0 || stale.Digest != "digest-v6" {
+		t.Fatalf("stale page fingerprint = revision %d digest %q, want content digest without mismatched revision", stale.Revision, stale.Digest)
+	}
+}
+
 func TestHistoryPageFromProviderMessagesWindowsVisibleUsers(t *testing.T) {
 	msgs := []provider.Message{
 		{Role: provider.RoleSystem, Content: "sys"},
@@ -179,7 +326,10 @@ func TestHistoryPageFromProviderMessagesWindowsVisibleUsers(t *testing.T) {
 		{Role: provider.RoleAssistant, Content: "hidden continuation"},
 		{Role: provider.RoleUser, Content: "second"},
 		{Role: provider.RoleAssistant, Content: "two"},
-		{Role: provider.RoleUser, Content: agent.MidTurnSteerPrefix + "\nupdate the plan"},
+		{
+			Role: provider.RoleTool, Content: agent.MidTurnSteerPrefix + "\nupdate the plan",
+			ToolCallID: provider.LocalOnlyToolID, Name: provider.LocalOnlyToolName, LocalOnly: true,
+		},
 		{Role: provider.RoleUser, Content: "third"},
 		{Role: provider.RoleAssistant, Content: "three"},
 	}
@@ -204,8 +354,12 @@ func TestHistoryPageFromProviderMessagesWindowsVisibleUsers(t *testing.T) {
 	if latest.Messages[0].CheckpointTurn == nil || *latest.Messages[0].CheckpointTurn != 2 {
 		t.Fatalf("second user checkpoint = %v, want 2", latest.Messages[0].CheckpointTurn)
 	}
-	if latest.Messages[2].Role != "notice" || !strings.Contains(latest.Messages[2].Content, "update the plan") {
-		t.Fatalf("steer message = %+v, want notice in second turn window", latest.Messages[2])
+	if latest.Messages[2].Role != "notice" ||
+		latest.Messages[2].Code != event.NoticeCodeUnappliedSteer ||
+		latest.Messages[2].Level != "warn" ||
+		!strings.Contains(latest.Messages[2].Content, "not applied") ||
+		!strings.Contains(latest.Messages[2].Content, "update the plan") {
+		t.Fatalf("steer message = %+v, want explicit unapplied notice in second turn window", latest.Messages[2])
 	}
 	if latest.Messages[3].Role != "user" || latest.Messages[3].Content != "third" {
 		t.Fatalf("third latest message = %+v, want third user", latest.Messages[3])
@@ -270,6 +424,7 @@ func TestHistoryForTabRestoresPlannerDisplayAfterReload(t *testing.T) {
 	sess.Add(provider.Message{Role: provider.RoleAssistant, Content: "executor kept working"})
 	ag := agent.New(stubProvider{}, tool.NewRegistry(), sess, agent.Options{}, event.Discard)
 	ctrl := control.New(control.Options{Executor: ag, SessionDir: dir, SessionPath: path, Sink: event.Discard})
+	t.Cleanup(ctrl.Close)
 	if err := recordSessionDisplay(dir, path, handoff, "fix the sandbox reload bug"); err != nil {
 		t.Fatalf("recordSessionDisplay: %v", err)
 	}
@@ -288,6 +443,8 @@ func TestHistoryForTabRestoresPlannerDisplayAfterReload(t *testing.T) {
 	tab.sink.Emit(event.Event{Kind: event.Text, Text: "planner visible plan", Source: event.UsageSourcePlanner})
 	tab.sink.Emit(event.Event{Kind: event.Message, Text: "planner visible plan", Reasoning: "planner thinking\n", Source: event.UsageSourcePlanner})
 	tab.sink.Emit(event.Event{Kind: event.TurnStarted})
+	tab.sink.Emit(event.Event{Kind: event.Text, Text: "executor kept working", Source: event.UsageSourceExecutor})
+	tab.sink.Emit(event.Event{Kind: event.Message, Text: "executor kept working", Source: event.UsageSourceExecutor})
 	tab.sink.Emit(event.Event{Kind: event.TurnDone})
 	waitForAutosaveIdle(t, tab)
 
@@ -306,6 +463,207 @@ func TestHistoryForTabRestoresPlannerDisplayAfterReload(t *testing.T) {
 	}
 	if got[4].Role != "assistant" || got[4].Content != "executor kept working" {
 		t.Fatalf("executor answer missing after reload: %+v", got[4])
+	}
+}
+
+type cancelledDisplayRunner struct {
+	session *agent.Session
+	sink    event.Sink
+	started chan struct{}
+}
+
+type blockingPlannerProvider struct {
+	started chan struct{}
+}
+
+func (p *blockingPlannerProvider) Name() string { return "blocking-planner" }
+
+func (p *blockingPlannerProvider) Stream(ctx context.Context, _ provider.Request) (<-chan provider.Chunk, error) {
+	close(p.started)
+	<-ctx.Done()
+	return nil, ctx.Err()
+}
+
+func (r *cancelledDisplayRunner) Run(ctx context.Context, input string) error {
+	r.session.Add(provider.Message{Role: provider.RoleUser, Content: input})
+	r.session.Add(provider.Message{Role: provider.RoleAssistant, ReasoningContent: "checking settings\n", ToolCalls: []provider.ToolCall{{
+		ID: "call_1", Name: "read_file", Arguments: `{"path":"settings.json"}`,
+	}}})
+	r.session.Add(provider.Message{Role: provider.RoleTool, ToolCallID: "call_1", Name: "read_file", Content: "partial settings"})
+	r.sink.Emit(event.Event{Kind: event.Reasoning, Text: "checking settings\n", Source: event.UsageSourceExecutor})
+	r.sink.Emit(event.Event{Kind: event.ToolDispatch, Source: event.UsageSourceExecutor, Tool: event.Tool{
+		ID: "call_1", Name: "read_file", Args: `{"path":"settings.json"}`, ReadOnly: true,
+	}})
+	r.sink.Emit(event.Event{Kind: event.ToolResult, Source: event.UsageSourceExecutor, Tool: event.Tool{
+		ID: "call_1", Name: "read_file", Output: "partial settings", Err: "cancelled",
+	}})
+	close(r.started)
+	<-ctx.Done()
+	return ctx.Err()
+}
+
+func TestHistoryForTabRestoresCancelledExecutorDisplayAfterReload(t *testing.T) {
+	dir := t.TempDir()
+	path := agent.NewSessionPath(dir, "test-model")
+	sess := agent.NewSession("system")
+	app := &App{tabs: map[string]*WorkspaceTab{}, activeTabID: "cancelled_tab"}
+	tab := &WorkspaceTab{ID: "cancelled_tab", Scope: "global", Ready: true, disabledMCP: map[string]ServerView{}}
+	tab.sink = &tabEventSink{tabID: tab.ID, app: app}
+	runner := &cancelledDisplayRunner{session: sess, sink: tab.sink, started: make(chan struct{})}
+	ag := agent.New(stubProvider{}, tool.NewRegistry(), sess, agent.Options{}, event.Discard)
+	ctrl := control.New(control.Options{Runner: runner, Executor: ag, SessionDir: dir, SessionPath: path, Sink: tab.sink})
+	t.Cleanup(ctrl.Close)
+	tab.Ctrl = ctrl
+	app.tabs[tab.ID] = tab
+
+	ctrl.Send("continue setup")
+	select {
+	case <-runner.started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("cancelled turn did not start")
+	}
+	ctrl.Cancel()
+	waitNotRunning(t, ctrl)
+	waitForAutosaveIdle(t, tab)
+
+	if got := ctrl.History(); len(got) != 5 || !got[4].LocalOnly {
+		t.Fatalf("stored transcript should retain user + completed pair + local recovery: %+v", got)
+	}
+	got := app.HistoryForTab(tab.ID)
+	if len(got) != 5 {
+		t.Fatalf("history length = %d, want system + user + assistant + tool + notice: %+v", len(got), got)
+	}
+	if got[1].Role != "user" || got[1].Content != "continue setup" {
+		t.Fatalf("cancelled turn user missing after reload: %+v", got[1])
+	}
+	if got[2].Role != "assistant" || got[2].Reasoning != "checking settings\n" || len(got[2].ToolCalls) != 1 || got[2].ToolCalls[0].Name != "read_file" {
+		t.Fatalf("cancelled assistant display missing after reload: %+v", got[2])
+	}
+	if got[3].Role != "tool" || got[3].ToolName != "read_file" || got[3].Content != "partial settings" || got[3].ToolResultError != "partial settings" {
+		t.Fatalf("cancelled tool display missing after reload: %+v", got[3])
+	}
+	if got[4].Role != "notice" || got[4].Code != event.NoticeCodeCancelledTurn {
+		t.Fatalf("cancelled turn context notice missing after reload: %+v", got[4])
+	}
+}
+
+func TestHistoryForTabRestoresPlannerDisplayWhenCancelledBeforeExecutorStarts(t *testing.T) {
+	dir := t.TempDir()
+	path := agent.NewSessionPath(dir, "test-model")
+	app := &App{tabs: map[string]*WorkspaceTab{}, activeTabID: "planner_cancelled_tab"}
+	tab := &WorkspaceTab{ID: "planner_cancelled_tab", Scope: "global", Ready: true, disabledMCP: map[string]ServerView{}}
+	tab.sink = &tabEventSink{tabID: tab.ID, app: app}
+	executorSession := agent.NewSession("system")
+	executor := agent.New(stubProvider{}, tool.NewRegistry(), executorSession, agent.Options{}, tab.sink)
+	planner := &blockingPlannerProvider{started: make(chan struct{})}
+	runner := agent.NewCoordinator(planner, agent.NewSession("planner system"), nil, agent.PlannerToolRegistry(tool.NewRegistry()), agent.Options{}, executor, 0, tab.sink, nil)
+	ctrl := control.New(control.Options{Runner: runner, Executor: executor, SessionDir: dir, SessionPath: path, Sink: tab.sink})
+	defer ctrl.Close()
+	ctrl.SetPlanMode(true)
+	tab.Ctrl = ctrl
+	app.tabs[tab.ID] = tab
+
+	ctrl.Send("new question")
+	select {
+	case <-planner.started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("planner did not start")
+	}
+	ctrl.Cancel()
+	waitNotRunning(t, ctrl)
+	waitForAutosaveIdle(t, tab)
+
+	canonical := ctrl.History()
+	if len(canonical) != 3 || canonical[1].Role != provider.RoleUser || canonical[1].Content != "new question" || !canonical[2].LocalOnly {
+		t.Fatalf("canonical history = %+v, want user plus provider-excluded recovery marker", canonical)
+	}
+	snapshot, snapshotErr := ctrl.TranscriptSnapshot(transcript.PageRequest{})
+	if snapshotErr != nil {
+		t.Fatal(snapshotErr)
+	}
+	users := 0
+	for _, record := range snapshot.Records {
+		if record.Message.Role == "user" {
+			users++
+			if record.Message.MessageID != canonical[1].ID {
+				t.Fatalf("display user ID %q differs from recovered canonical ID %q", record.Message.MessageID, canonical[1].ID)
+			}
+		}
+	}
+	if users != 1 {
+		t.Fatalf("snapshot users = %d, want one identified user", users)
+	}
+	visible := app.HistoryForTab(tab.ID)
+	if len(visible) != 4 {
+		t.Fatalf("visible history length = %d, want system + user + planner phase + notice: %+v", len(visible), visible)
+	}
+	if visible[1].Role != "user" || visible[1].Content != "new question" {
+		t.Fatalf("cancelled planner user missing after reload: %+v", visible[1])
+	}
+	if visible[2].Role != "phase" || !strings.Contains(visible[2].Content, "planning") {
+		t.Fatalf("cancelled planner display missing after reload: %+v", visible[2])
+	}
+	if visible[3].Role != "notice" || visible[3].Code != event.NoticeCodeCancelledTurn {
+		t.Fatalf("cancelled planner context notice missing after reload: %+v", visible[3])
+	}
+}
+
+func TestCancelledExecutorDisplayFollowsDetachedAndReattachedRuntime(t *testing.T) {
+	dir := t.TempDir()
+	path := agent.NewSessionPath(dir, "test-model")
+	app := &App{tabs: map[string]*WorkspaceTab{}, detachedSessions: map[string]*WorkspaceTab{}, activeTabID: "source_tab"}
+	source := &WorkspaceTab{ID: "source_tab", Scope: "global", Ready: true, SessionPath: path, disabledMCP: map[string]ServerView{}}
+	source.sink = &tabEventSink{tabID: source.ID, app: app}
+	sess := agent.NewSession("system")
+	runner := &cancelledDisplayRunner{session: sess, sink: source.sink, started: make(chan struct{})}
+	executor := agent.New(stubProvider{}, tool.NewRegistry(), sess, agent.Options{}, event.Discard)
+	ctrl := control.New(control.Options{Runner: runner, Executor: executor, SessionDir: dir, SessionPath: path, Sink: source.sink})
+	defer ctrl.Close()
+	source.Ctrl = ctrl
+	app.tabs[source.ID] = source
+
+	ctrl.Send("continue setup")
+	select {
+	case <-runner.started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("cancelled turn did not start")
+	}
+	if !app.detachRuntimeForReplacement(source) {
+		t.Fatal("running session could not be detached")
+	}
+	key := sessionRuntimeKey(path)
+	detached := app.detachedSessions[key]
+	if detached == nil {
+		t.Fatal("detached runtime missing")
+	}
+	target := &WorkspaceTab{ID: "reattached_tab", Scope: "global", Ready: true, disabledMCP: map[string]ServerView{}}
+	app.mu.Lock()
+	delete(app.tabs, source.ID)
+	app.tabs[target.ID] = target
+	delete(app.detachedSessions, key)
+	applyRuntimeTab(target, detached, path, app.ctx, app)
+	app.activeTabID = target.ID
+	app.mu.Unlock()
+	target.sink.Emit(event.Event{Kind: event.Text, Text: "after reattach", Source: event.UsageSourceExecutor})
+
+	ctrl.Cancel()
+	waitNotRunning(t, ctrl)
+	waitForAutosaveIdle(t, target)
+	visible := app.HistoryForTab(target.ID)
+	var sawBefore, sawAfter, sawNotice bool
+	for _, message := range visible {
+		if message.Role == "assistant" && message.Reasoning == "checking settings\n" {
+			sawBefore = true
+		}
+		if message.Role == "assistant" && message.Content == "after reattach" {
+			sawAfter = true
+		}
+		if message.Role == "notice" && message.Code == event.NoticeCodeCancelledTurn {
+			sawNotice = true
+		}
+	}
+	if !sawBefore || !sawAfter || !sawNotice {
+		t.Fatalf("reattached cancelled history lost display state: before=%v after=%v notice=%v history=%+v", sawBefore, sawAfter, sawNotice, visible)
 	}
 }
 
@@ -402,6 +760,30 @@ func TestHistoryMessagesArchiveCompletedToolPayloads(t *testing.T) {
 	}
 	if strings.Contains(string(encoded), largeArgs) || strings.Contains(string(encoded), largeOutput) {
 		t.Fatalf("initial history JSON still contains large args/output: %d bytes", len(encoded))
+	}
+}
+
+func TestHistoryMessagesPreserveResolvedCapabilityMetadata(t *testing.T) {
+	resolvedReadOnly := false
+	msgs := []provider.Message{
+		{Role: provider.RoleAssistant, ToolCalls: []provider.ToolCall{{
+			ID: "call_capability", Name: "use_capability",
+			Arguments:        `{"action":"call","capability_id":"mcp-tool:db/write"}`,
+			ResolvedName:     "mcp__db__write",
+			CapabilityID:     "mcp-tool:db/write",
+			ResolvedReadOnly: &resolvedReadOnly,
+		}}},
+		{Role: provider.RoleTool, Name: "use_capability", ToolCallID: "call_capability", Content: "done"},
+	}
+
+	got := historyMessages(msgs, func(content string) string { return content })
+	if len(got) != 2 || len(got[0].ToolCalls) != 1 {
+		t.Fatalf("history = %+v", got)
+	}
+	call := got[0].ToolCalls[0]
+	if call.ResolvedName != "mcp__db__write" || call.CapabilityID != "mcp-tool:db/write" ||
+		call.ResolvedReadOnly == nil || *call.ResolvedReadOnly {
+		t.Fatalf("resolved capability metadata = %+v", call)
 	}
 }
 
@@ -547,308 +929,6 @@ func TestHistoryMessagesPreserveUnaddressableToolPayloads(t *testing.T) {
 	}
 }
 
-func TestPreviewSessionMessagesLoadsWithoutResuming(t *testing.T) {
-	dir := t.TempDir()
-	session := agent.NewSession("")
-	session.Add(provider.Message{Role: provider.RoleUser, Content: "show history"})
-	session.Add(provider.Message{Role: provider.RoleAssistant, Content: "answer", ReasoningContent: "saved reasoning"})
-	path := filepath.Join(dir, "session.jsonl")
-	if err := session.Save(path); err != nil {
-		t.Fatalf("Save: %v", err)
-	}
-
-	got, err := previewSessionMessages(dir, path)
-	if err != nil {
-		t.Fatalf("previewSessionMessages: %v", err)
-	}
-	if len(got) != 2 {
-		t.Fatalf("preview history length = %d, want 2", len(got))
-	}
-	if got[1].Reasoning != "saved reasoning" {
-		t.Fatalf("preview reasoning = %q, want saved reasoning", got[1].Reasoning)
-	}
-}
-
-func TestPreviewSessionMessagesIncludesProcessEvents(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "events.jsonl")
-	body := strings.Join([]string{
-		`{"kind":"phase","text":"Preparing context"}`,
-		`{"kind":"notice","level":"warn","text":"Network changed"}`,
-		`{"kind":"compaction_started","compaction":{"trigger":"manual"}}`,
-		`{"kind":"compaction_done","compaction":{"trigger":"manual","messages":6,"summary":"Kept the current task.","archive":"/tmp/archive.jsonl"}}`,
-		`{"type":"user.message","text":"hello"}`,
-		`{"type":"model.final","content":"hi","reasoningContent":"thinking"}`,
-	}, "\n") + "\n"
-	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
-		t.Fatal(err)
-	}
-
-	got, err := previewSessionMessages(dir, path)
-	if err != nil {
-		t.Fatalf("previewSessionMessages: %v", err)
-	}
-	if len(got) != 6 {
-		t.Fatalf("preview history length = %d, want 6: %+v", len(got), got)
-	}
-	if got[0].Role != "phase" || got[0].Content != "Preparing context" {
-		t.Fatalf("phase event not preserved: %+v", got[0])
-	}
-	if got[1].Role != "notice" || got[1].Level != "warn" || got[1].Content != "Network changed" {
-		t.Fatalf("notice event not preserved: %+v", got[1])
-	}
-	if got[2].Role != "compaction" || !got[2].Pending || got[2].Trigger != "manual" {
-		t.Fatalf("pending compaction event not preserved: %+v", got[2])
-	}
-	if got[3].Role != "compaction" || got[3].Pending || got[3].Messages != 6 || got[3].Summary != "Kept the current task." || got[3].Archive != "/tmp/archive.jsonl" {
-		t.Fatalf("finished compaction event not preserved: %+v", got[3])
-	}
-	if got[4].Role != "user" || got[5].Reasoning != "thinking" {
-		t.Fatalf("conversation events not preserved: %+v", got[4:])
-	}
-}
-
-func TestResumeSessionForTabTargetsSpecifiedTab(t *testing.T) {
-	isolateDesktopUserDirs(t)
-	dir := desktopSessionDir(globalTabWorkspaceRoot())
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		t.Fatalf("mkdir session dir: %v", err)
-	}
-
-	activePath := filepath.Join(dir, "active.jsonl")
-	inactivePath := filepath.Join(dir, "inactive.jsonl")
-	targetPath := filepath.Join(dir, "target.jsonl")
-	writeHistoryTestSession(t, activePath, "active prompt")
-	writeHistoryTestSession(t, inactivePath, "inactive prompt")
-	writeHistoryTestSession(t, targetPath, "target prompt")
-
-	activeExec := agent.New(nil, nil, agent.NewSession(""), agent.Options{}, event.Discard)
-	inactiveExec := agent.New(nil, nil, agent.NewSession(""), agent.Options{}, event.Discard)
-	activeCtrl := control.New(control.Options{Executor: activeExec, SessionDir: dir, SessionPath: activePath, Label: "active"})
-	inactiveCtrl := control.New(control.Options{Executor: inactiveExec, SessionDir: dir, SessionPath: inactivePath, Label: "inactive"})
-	defer activeCtrl.Close()
-	defer inactiveCtrl.Close()
-
-	app := &App{
-		tabs: map[string]*WorkspaceTab{
-			"active": {
-				ID:            "active",
-				Scope:         "global",
-				WorkspaceRoot: globalTabWorkspaceRoot(),
-				Ctrl:          activeCtrl,
-				Ready:         true,
-				sink:          &tabEventSink{tabID: "active"},
-				disabledMCP:   map[string]ServerView{},
-			},
-			"inactive": {
-				ID:            "inactive",
-				Scope:         "global",
-				WorkspaceRoot: globalTabWorkspaceRoot(),
-				SessionPath:   inactivePath,
-				Ctrl:          inactiveCtrl,
-				Ready:         true,
-				sink:          &tabEventSink{tabID: "inactive"},
-				disabledMCP:   map[string]ServerView{},
-			},
-		},
-		tabOrder:    []string{"active", "inactive"},
-		activeTabID: "active",
-	}
-
-	got, err := app.ResumeSessionForTab("inactive", targetPath)
-	if err != nil {
-		t.Fatalf("ResumeSessionForTab: %v", err)
-	}
-	if activeCtrl.SessionPath() != activePath {
-		t.Fatalf("active tab session path = %q, want %q", activeCtrl.SessionPath(), activePath)
-	}
-	if inactiveCtrl.SessionPath() != inactivePath {
-		t.Fatalf("original inactive controller session path = %q, want %q", inactiveCtrl.SessionPath(), inactivePath)
-	}
-	if app.tabs["inactive"].Ctrl == inactiveCtrl {
-		t.Fatal("resume to a different sessionPath mutated the existing controller in place")
-	}
-	if app.tabs["inactive"].Ctrl.SessionPath() != targetPath {
-		t.Fatalf("inactive tab session path = %q, want %q", app.tabs["inactive"].Ctrl.SessionPath(), targetPath)
-	}
-	f := loadTabsFile()
-	var savedInactive string
-	for _, entry := range f.Tabs {
-		if entry.ID == "inactive" {
-			savedInactive = entry.SessionPath
-			break
-		}
-	}
-	if filepath.Clean(savedInactive) != filepath.Clean(targetPath) {
-		t.Fatalf("saved inactive session path = %q, want %q", savedInactive, targetPath)
-	}
-	if len(got) != 1 || got[0].Content != "target prompt" {
-		t.Fatalf("resumed history = %+v, want target prompt", got)
-	}
-}
-
-func TestResumeSessionForTabDetachesRunningRuntimeForDifferentSessionPath(t *testing.T) {
-	isolateDesktopUserDirs(t)
-	dir := desktopSessionDir(globalTabWorkspaceRoot())
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		t.Fatalf("mkdir session dir: %v", err)
-	}
-
-	topicID := "topic_same"
-	sessionA := filepath.Join(dir, "session-a.jsonl")
-	sessionB := filepath.Join(dir, "session-b.jsonl")
-	writeHistoryTestSession(t, sessionA, "session A prompt")
-	writeHistoryTestSession(t, sessionB, "session B prompt")
-
-	runner := &blockingRunner{started: make(chan struct{}), release: make(chan struct{})}
-	ctrlA := control.New(control.Options{
-		Runner:      runner,
-		SessionDir:  dir,
-		SessionPath: sessionA,
-		Label:       "session-a",
-		Sink:        event.Discard,
-	})
-	defer ctrlA.Close()
-
-	app := NewApp()
-	tab := &WorkspaceTab{
-		ID:            "topic-tab",
-		Scope:         "global",
-		WorkspaceRoot: globalTabWorkspaceRoot(),
-		TopicID:       topicID,
-		TopicTitle:    "Same topic",
-		SessionPath:   sessionA,
-		Ctrl:          ctrlA,
-		Ready:         true,
-		sink:          &tabEventSink{tabID: "topic-tab", app: app},
-		disabledMCP:   map[string]ServerView{},
-	}
-	app.tabs[tab.ID] = tab
-	app.tabOrder = []string{tab.ID}
-	app.activeTabID = tab.ID
-
-	ctrlA.Submit("keep running")
-	<-runner.started
-
-	got, err := app.ResumeSessionForTab(tab.ID, sessionB)
-	if err != nil {
-		t.Fatalf("ResumeSessionForTab: %v", err)
-	}
-	if !ctrlA.Running() {
-		t.Fatal("session A controller was cancelled while resuming session B")
-	}
-	if ctrlA.SessionPath() != sessionA {
-		t.Fatalf("session A controller path = %q, want %q", ctrlA.SessionPath(), sessionA)
-	}
-	detached := app.detachedSessions[sessionRuntimeKey(sessionA)]
-	if detached == nil || detached.Ctrl != ctrlA {
-		t.Fatalf("session A runtime was not detached: %+v", detached)
-	}
-	if detached.ID == tab.ID {
-		t.Fatalf("detached runtime kept visible tab id %q", detached.ID)
-	}
-	if detached.sink == nil {
-		t.Fatal("detached runtime lost its event sink")
-	}
-	if detached.sink.tabID == tab.ID {
-		t.Fatalf("detached sink tab id = %q, want non-visible id", detached.sink.tabID)
-	}
-	if app.tabs[tab.ID].Ctrl == ctrlA {
-		t.Fatal("visible tab still points at session A runtime after resuming session B")
-	}
-	if gotPath := app.tabs[tab.ID].Ctrl.SessionPath(); gotPath != sessionB {
-		t.Fatalf("visible tab session path = %q, want %q", gotPath, sessionB)
-	}
-	if len(got) != 1 || got[0].Content != "session B prompt" {
-		t.Fatalf("resumed history = %+v, want session B prompt", got)
-	}
-
-	visible := app.tabs[tab.ID]
-	detached.sink.Emit(event.Event{Kind: event.TurnStarted})
-	if visible.ActivityStatus != "" {
-		t.Fatalf("detached runtime event changed visible tab status to %q", visible.ActivityStatus)
-	}
-	detached.sink.Emit(event.Event{Kind: event.ToolResult, Tool: event.Tool{
-		Name:   "read_file",
-		Args:   `{"path":"detached.go","offset":3,"limit":7}`,
-		Output: "package main",
-	}})
-	if got := detached.telemetrySnapshot().ReadFiles; len(got) != 1 || got[0].Path != "detached.go" || got[0].Offset != 3 || got[0].Limit != 7 {
-		t.Fatalf("detached runtime read telemetry = %+v", got)
-	}
-	if got := visible.telemetrySnapshot().ReadFiles; len(got) != 0 {
-		t.Fatalf("detached runtime read telemetry was recorded on visible tab: %+v", got)
-	}
-	detached.sink.Emit(event.Event{Kind: event.Usage, Usage: &provider.Usage{PromptTokens: 42}})
-	detached.sink.Emit(event.Event{Kind: event.TurnDone})
-	if detached.usageTelemetry.PromptTokens != 42 {
-		t.Fatalf("detached runtime usage was not recorded on detached tab: %+v", detached.usageTelemetry)
-	}
-	if detached.usageTelemetry.RequestCount != 1 {
-		t.Fatalf("detached runtime request count = %d, want 1", detached.usageTelemetry.RequestCount)
-	}
-	if visible.usageTelemetry.PromptTokens != 0 {
-		t.Fatalf("detached runtime usage was recorded on visible tab: %+v", visible.usageTelemetry)
-	}
-	if visible.saveAgain || visible.saving {
-		t.Fatalf("detached runtime scheduled visible tab snapshot: saving=%v saveAgain=%v", visible.saving, visible.saveAgain)
-	}
-
-	close(runner.release)
-	waitNotRunning(t, ctrlA)
-}
-
-func TestRebindTabToLoadedSessionReusesPreloadedTranscript(t *testing.T) {
-	isolateDesktopUserDirs(t)
-	root := globalTabWorkspaceRoot()
-	dir := desktopSessionDir(root)
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		t.Fatalf("mkdir session dir: %v", err)
-	}
-
-	currentPath := filepath.Join(dir, "current.jsonl")
-	targetPath := filepath.Join(dir, "target.jsonl")
-	writeHistoryTestSession(t, currentPath, "current prompt")
-	writeHistoryTestSession(t, targetPath, "target prompt")
-
-	loaded, err := agent.LoadSession(targetPath)
-	if err != nil {
-		t.Fatalf("LoadSession: %v", err)
-	}
-	if err := os.Remove(targetPath); err != nil {
-		t.Fatalf("remove target session: %v", err)
-	}
-
-	ctrl := control.New(control.Options{SessionDir: dir, SessionPath: currentPath, Label: "current", Sink: event.Discard})
-	defer ctrl.Close()
-
-	app := NewApp()
-	tab := &WorkspaceTab{
-		ID:            "tab",
-		Scope:         "global",
-		WorkspaceRoot: root,
-		SessionPath:   currentPath,
-		Ctrl:          ctrl,
-		Ready:         true,
-		sink:          &tabEventSink{tabID: "tab", app: app},
-		disabledMCP:   map[string]ServerView{},
-	}
-	app.tabs[tab.ID] = tab
-	app.tabOrder = []string{tab.ID}
-	app.activeTabID = tab.ID
-
-	if err := app.rebindTabToLoadedSessionPath(tab, targetPath, loaded); err != nil {
-		t.Fatalf("rebindTabToLoadedSessionPath: %v", err)
-	}
-	got := app.HistoryForTab(tab.ID)
-	if len(got) != 1 || got[0].Content != "target prompt" {
-		t.Fatalf("rebound history = %+v, want target prompt", got)
-	}
-	if gotPath := app.tabs[tab.ID].Ctrl.SessionPath(); gotPath != targetPath {
-		t.Fatalf("rebound session path = %q, want %q", gotPath, targetPath)
-	}
-}
-
 func TestRebindTabToLoadedSessionPersistsAndRestoresSessionProfile(t *testing.T) {
 	isolateDesktopUserDirs(t)
 	root := globalTabWorkspaceRoot()
@@ -886,7 +966,6 @@ func TestRebindTabToLoadedSessionPersistsAndRestoresSessionProfile(t *testing.T)
 		SessionPath:      currentPath,
 		Ctrl:             ctrl,
 		Ready:            true,
-		tokenMode:        boot.TokenModeEconomy,
 		mode:             "plan",
 		toolApprovalMode: control.ToolApprovalAuto,
 		sink:             &tabEventSink{tabID: "tab", app: app},
@@ -904,9 +983,10 @@ func TestRebindTabToLoadedSessionPersistsAndRestoresSessionProfile(t *testing.T)
 	if err != nil || !ok {
 		t.Fatalf("LoadBranchMeta current ok=%v err=%v", ok, err)
 	}
-	if currentMeta.TokenMode != boot.TokenModeEconomy || currentMeta.Mode != "plan" || currentMeta.ToolApprovalMode != control.ToolApprovalAuto {
-		t.Fatalf("current session profile = token:%q mode:%q approval:%q, want economy/plan/auto",
-			currentMeta.TokenMode, currentMeta.Mode, currentMeta.ToolApprovalMode)
+	if currentMeta.TokenMode != boot.TokenModeFull || currentMeta.AgentPreset != boot.AgentPresetStandard ||
+		currentMeta.Mode != "plan" || currentMeta.ToolApprovalMode != control.ToolApprovalAuto {
+		t.Fatalf("current session profile = token:%q preset:%q mode:%q approval:%q, want full/standard/plan/auto",
+			currentMeta.TokenMode, currentMeta.AgentPreset, currentMeta.Mode, currentMeta.ToolApprovalMode)
 	}
 	if got := currentTabTokenMode(tab); got != boot.TokenModeFull {
 		t.Fatalf("rebound token mode = %q, want full", got)
@@ -917,6 +997,367 @@ func TestRebindTabToLoadedSessionPersistsAndRestoresSessionProfile(t *testing.T)
 	if got := currentTabToolApprovalMode(tab); got != control.ToolApprovalYolo {
 		t.Fatalf("rebound tool approval = %q, want yolo", got)
 	}
+}
+
+func TestRebindTabToDetachedSessionPreservesRunningSourceRuntime(t *testing.T) {
+	isolateDesktopUserDirs(t)
+	root := globalTabWorkspaceRoot()
+	dir := desktopSessionDir(root)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("mkdir session dir: %v", err)
+	}
+
+	sourcePath := filepath.Join(dir, "running-source.jsonl")
+	targetPath := filepath.Join(dir, "detached-target.jsonl")
+	writeHistoryTestSession(t, sourcePath, "source prompt")
+	writeHistoryTestSession(t, targetPath, "target prompt")
+	loaded, err := agent.LoadSession(targetPath)
+	if err != nil {
+		t.Fatalf("load target: %v", err)
+	}
+
+	app := NewApp()
+	app.ctx = context.Background()
+	app.readyHook = func() {}
+
+	sourceRunner := &blockingRunner{started: make(chan struct{}), release: make(chan struct{})}
+	sourceSink := &tabEventSink{tabID: "visible", app: app, ctx: app.ctx}
+	targetSink := &tabEventSink{tabID: "detached", app: app}
+	installNoopRuntimeEvents(app, sourceSink, targetSink)
+	sourceCtrl := control.New(control.Options{
+		Runner: sourceRunner, SessionDir: dir, SessionPath: sourcePath,
+		Label: "source", Sink: sourceSink,
+	})
+	targetCtrl := control.New(control.Options{
+		SessionDir: dir, SessionPath: targetPath, Label: "target", Sink: targetSink,
+	})
+	tab := &WorkspaceTab{
+		ID: "visible", Scope: "global", WorkspaceRoot: root,
+		SessionPath: sourcePath, Ctrl: sourceCtrl, Ready: true, sink: sourceSink,
+		disabledMCP: map[string]ServerView{},
+	}
+	app.tabs[tab.ID] = tab
+	app.tabOrder = []string{tab.ID}
+	app.activeTabID = tab.ID
+	if err := tab.ensureSessionLease(sourcePath); err != nil {
+		t.Fatalf("lease source: %v", err)
+	}
+	app.mu.Lock()
+	app.newSessionRuntimeLocked(tab, sessionRuntimeKey(sourcePath))
+	app.advanceSessionRuntimeEpochLocked(tab)
+	app.mu.Unlock()
+
+	targetLease, err := agent.TryAcquireSessionLease(targetPath)
+	if err != nil {
+		t.Fatalf("lease target: %v", err)
+	}
+	detachedTarget := &WorkspaceTab{
+		ID: detachedRuntimeTabID(sessionRuntimeKey(targetPath)), Scope: "global",
+		WorkspaceRoot: root, SessionPath: targetPath, Ctrl: targetCtrl,
+		Ready: true, sink: targetSink, disabledMCP: map[string]ServerView{},
+	}
+	detachedTarget.adoptSessionLease(targetLease)
+	app.mu.Lock()
+	app.detachedSessions[sessionRuntimeKey(targetPath)] = detachedTarget
+	app.newSessionRuntimeLocked(detachedTarget, sessionRuntimeKey(targetPath))
+	app.advanceSessionRuntimeEpochLocked(detachedTarget)
+	app.mu.Unlock()
+	sourceReleased := false
+	t.Cleanup(func() {
+		if !sourceReleased {
+			close(sourceRunner.release)
+		}
+		sourceCtrl.Close()
+		targetCtrl.Close()
+		tab.releaseSessionLease()
+		app.mu.RLock()
+		detachedSource := app.detachedSessions[sessionRuntimeKey(sourcePath)]
+		app.mu.RUnlock()
+		if detachedSource != nil {
+			detachedSource.releaseSessionLease()
+		}
+	})
+
+	sourceCtrl.Submit("keep source running")
+	select {
+	case <-sourceRunner.started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("source turn did not start")
+	}
+
+	if err := app.rebindTabToLoadedSessionPath(tab, targetPath, loaded); err != nil {
+		t.Fatalf("reattach target: %v", err)
+	}
+	if tab.Ctrl != targetCtrl || tab.sessionLeaseRuntimeKey() != sessionRuntimeKey(targetPath) {
+		t.Fatalf("visible target runtime = ctrl %p lease %q, want %p/%q",
+			tab.Ctrl, tab.sessionLeaseRuntimeKey(), targetCtrl, sessionRuntimeKey(targetPath))
+	}
+	if !sourceCtrl.Running() {
+		t.Fatal("reattaching the target cancelled the running source controller")
+	}
+	app.mu.RLock()
+	detachedSource := app.detachedSessions[sessionRuntimeKey(sourcePath)]
+	targetStillDetached := app.detachedSessions[sessionRuntimeKey(targetPath)]
+	app.mu.RUnlock()
+	if detachedSource == nil || detachedSource.Ctrl != sourceCtrl ||
+		detachedSource.sessionLeaseRuntimeKey() != sessionRuntimeKey(sourcePath) {
+		t.Fatalf("running source was not preserved as detached runtime: %#v", detachedSource)
+	}
+	if targetStillDetached != nil {
+		t.Fatalf("target remained detached after reattach: %#v", targetStillDetached)
+	}
+
+	close(sourceRunner.release)
+	sourceReleased = true
+	waitNotRunning(t, sourceCtrl)
+}
+
+func TestRebindTabToDetachedSessionReleasesIdleSourceSharedHost(t *testing.T) {
+	isolateDesktopUserDirs(t)
+	root := globalTabWorkspaceRoot()
+	dir := desktopSessionDir(root)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("mkdir session dir: %v", err)
+	}
+
+	sourcePath := filepath.Join(dir, "idle-source.jsonl")
+	targetPath := filepath.Join(dir, "detached-target.jsonl")
+	writeHistoryTestSession(t, sourcePath, "source prompt")
+	writeHistoryTestSession(t, targetPath, "target prompt")
+	loaded, err := agent.LoadSession(targetPath)
+	if err != nil {
+		t.Fatalf("load target: %v", err)
+	}
+
+	app := NewApp()
+	app.ctx = context.Background()
+	app.readyHook = func() {}
+	hostKey := root
+	sharedHost := app.acquireSharedHost(hostKey)
+	if got := app.acquireSharedHost(hostKey); got != sharedHost {
+		t.Fatal("source and detached target did not share one plugin host")
+	}
+
+	sourceSink := &tabEventSink{tabID: "visible", app: app, ctx: app.ctx}
+	targetSink := &tabEventSink{tabID: "detached", app: app}
+	installNoopRuntimeEvents(app, sourceSink, targetSink)
+	sourceCtrl := control.New(control.Options{
+		SessionDir: dir, SessionPath: sourcePath, Label: "source",
+		Sink: sourceSink, Host: sharedHost,
+	})
+	targetCtrl := control.New(control.Options{
+		SessionDir: dir, SessionPath: targetPath, Label: "target",
+		Sink: targetSink, Host: sharedHost,
+	})
+	tab := &WorkspaceTab{
+		ID: "visible", Scope: "global", WorkspaceRoot: root,
+		SessionPath: sourcePath, Ctrl: sourceCtrl, Ready: true, sink: sourceSink,
+		SharedHostKey: hostKey, disabledMCP: map[string]ServerView{},
+	}
+	app.tabs[tab.ID] = tab
+	app.tabOrder = []string{tab.ID}
+	app.activeTabID = tab.ID
+	if err := tab.ensureSessionLease(sourcePath); err != nil {
+		t.Fatalf("lease source: %v", err)
+	}
+	app.mu.Lock()
+	app.newSessionRuntimeLocked(tab, sessionRuntimeKey(sourcePath))
+	app.advanceSessionRuntimeEpochLocked(tab)
+	app.mu.Unlock()
+
+	targetLease, err := agent.TryAcquireSessionLease(targetPath)
+	if err != nil {
+		t.Fatalf("lease target: %v", err)
+	}
+	detachedTarget := &WorkspaceTab{
+		ID: detachedRuntimeTabID(sessionRuntimeKey(targetPath)), Scope: "global",
+		WorkspaceRoot: root, SessionPath: targetPath, Ctrl: targetCtrl,
+		Ready: true, sink: targetSink, SharedHostKey: hostKey,
+		disabledMCP: map[string]ServerView{},
+	}
+	detachedTarget.adoptSessionLease(targetLease)
+	app.mu.Lock()
+	app.detachedSessions[sessionRuntimeKey(targetPath)] = detachedTarget
+	app.newSessionRuntimeLocked(detachedTarget, sessionRuntimeKey(targetPath))
+	app.advanceSessionRuntimeEpochLocked(detachedTarget)
+	app.mu.Unlock()
+	t.Cleanup(func() {
+		sourceCtrl.Close()
+		targetCtrl.Close()
+		tab.releaseSessionLease()
+		detachedTarget.releaseSessionLease()
+		app.closeAllSharedHosts()
+	})
+
+	if refs, ok := sharedHostRefsForTest(t, app, hostKey); !ok || refs != 2 {
+		t.Fatalf("shared host refs before reattach = %d, present=%v, want 2/true", refs, ok)
+	}
+	if err := app.rebindTabToLoadedSessionPath(tab, targetPath, loaded); err != nil {
+		t.Fatalf("reattach target: %v", err)
+	}
+	if tab.Ctrl != targetCtrl || tab.SharedHostKey != hostKey {
+		t.Fatalf("visible target runtime = ctrl %p host %q, want %p/%q",
+			tab.Ctrl, tab.SharedHostKey, targetCtrl, hostKey)
+	}
+	if refs, ok := sharedHostRefsForTest(t, app, hostKey); !ok || refs != 1 {
+		t.Fatalf("shared host refs after reattach = %d, present=%v, want 1/true", refs, ok)
+	}
+}
+
+func newAtomicRebindTestApp(t *testing.T) (*App, *WorkspaceTab, control.SessionAPI, string, string, *agent.Session) {
+	t.Helper()
+	isolateDesktopUserDirs(t)
+	root := globalTabWorkspaceRoot()
+	dir := desktopSessionDir(root)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("mkdir session dir: %v", err)
+	}
+	sourcePath := filepath.Join(dir, "atomic-source.jsonl")
+	targetPath := filepath.Join(dir, "atomic-target.jsonl")
+	writeHistoryTestSession(t, sourcePath, "source prompt")
+	writeHistoryTestSession(t, targetPath, "target prompt")
+	if err := agent.SaveBranchMetaPreserveUpdated(targetPath, agent.BranchMeta{
+		TokenMode:        boot.TokenModeDelivery,
+		Mode:             "normal",
+		ToolApprovalMode: control.ToolApprovalAsk,
+	}); err != nil {
+		t.Fatalf("save target profile: %v", err)
+	}
+	loaded, err := agent.LoadSession(targetPath)
+	if err != nil {
+		t.Fatalf("load target: %v", err)
+	}
+	sourceSession, err := agent.LoadSession(sourcePath)
+	if err != nil {
+		t.Fatalf("load source: %v", err)
+	}
+	exec := agent.New(nil, nil, sourceSession, agent.Options{}, event.Discard)
+	oldCtrl := control.New(control.Options{
+		Executor: exec, SessionDir: dir, SessionPath: sourcePath, Label: "source", Sink: event.Discard,
+	})
+	oldCtrl.Resume(sourceSession, sourcePath)
+	oldCtrl.SetPlanMode(true)
+	oldCtrl.SetToolApprovalMode(control.ToolApprovalYolo)
+
+	app := NewApp()
+	app.ctx = context.Background()
+	app.readyHook = func() {}
+	tab := &WorkspaceTab{
+		ID:               "atomic-rebind",
+		Scope:            "global",
+		WorkspaceRoot:    root,
+		SessionPath:      sourcePath,
+		Ctrl:             oldCtrl,
+		Ready:            true,
+		model:            "",
+		mode:             "plan-yolo",
+		toolApprovalMode: control.ToolApprovalYolo,
+		sink:             &tabEventSink{tabID: "atomic-rebind", app: app, ctx: app.ctx},
+		disabledMCP:      map[string]ServerView{},
+	}
+	app.tabs[tab.ID] = tab
+	app.tabOrder = []string{tab.ID}
+	app.activeTabID = tab.ID
+	if err := tab.ensureSessionLease(sourcePath); err != nil {
+		t.Fatalf("lease source: %v", err)
+	}
+	app.mu.Lock()
+	app.newSessionRuntimeLocked(tab, sessionRuntimeKey(sourcePath))
+	app.advanceSessionRuntimeEpochLocked(tab)
+	app.mu.Unlock()
+	t.Cleanup(func() {
+		if ctrl := app.controllerForTab(tab); ctrl != nil {
+			ctrl.Close()
+		}
+		tab.releaseSessionLease()
+	})
+	return app, tab, oldCtrl, sourcePath, targetPath, loaded
+}
+
+func assertAtomicRebindFailurePreservedSource(
+	t *testing.T,
+	app *App,
+	tab *WorkspaceTab,
+	oldCtrl control.SessionAPI,
+	sourcePath string,
+	targetPath string,
+	oldEpoch string,
+) {
+	t.Helper()
+	if got := app.controllerForTab(tab); got != oldCtrl {
+		t.Fatalf("controller after failed rebind = %p, want source %p", got, oldCtrl)
+	}
+	if got := tab.currentSessionPath(); sessionRuntimeKey(got) != sessionRuntimeKey(sourcePath) {
+		t.Fatalf("session path after failed rebind = %q, want %q", got, sourcePath)
+	}
+	if got := tab.sessionLeaseRuntimeKey(); got != sessionRuntimeKey(sourcePath) {
+		t.Fatalf("lease after failed rebind = %q, want source key %q", got, sessionRuntimeKey(sourcePath))
+	}
+	if !oldCtrl.PlanMode() || oldCtrl.ToolApprovalMode() != control.ToolApprovalYolo ||
+		currentTabTokenMode(tab) != boot.TokenModeFull {
+		t.Fatalf("source profile changed after failed rebind: plan=%v approval=%q token=%q",
+			oldCtrl.PlanMode(), oldCtrl.ToolApprovalMode(), currentTabTokenMode(tab))
+	}
+	app.mu.RLock()
+	view := app.sessionRuntimeViewLocked(tab)
+	sourceRuntime := app.runtimeBySessionKey[sessionRuntimeKey(sourcePath)]
+	targetRuntime := app.runtimeBySessionKey[sessionRuntimeKey(targetPath)]
+	app.mu.RUnlock()
+	if view.Phase != sessionRuntimeReady || view.Epoch != oldEpoch {
+		t.Fatalf("runtime after failed rebind = phase %q epoch %q, want ready/%q", view.Phase, view.Epoch, oldEpoch)
+	}
+	if sourceRuntime == nil || sourceRuntime.Owner != tab || targetRuntime != nil {
+		t.Fatalf("registry after failed rebind source=%#v target=%#v", sourceRuntime, targetRuntime)
+	}
+	if meta := app.MetaForTab(tab.ID); !meta.Ready || meta.Runtime.Phase != sessionRuntimeReady {
+		t.Fatalf("failed rebind disabled source runtime: ready=%v phase=%q", meta.Ready, meta.Runtime.Phase)
+	}
+}
+
+func TestRebindTargetLeaseFailureKeepsSourceRuntimeAtomic(t *testing.T) {
+	app, tab, oldCtrl, sourcePath, targetPath, loaded := newAtomicRebindTestApp(t)
+	app.mu.RLock()
+	oldEpoch := app.sessionRuntimeViewLocked(tab).Epoch
+	app.mu.RUnlock()
+
+	holder, err := agent.TryAcquireSessionLease(targetPath)
+	if err != nil {
+		t.Fatalf("hold target lease: %v", err)
+	}
+	defer holder.Release()
+
+	err = app.rebindTabToLoadedSessionPath(tab, targetPath, loaded)
+	if !errors.Is(err, agent.ErrSessionLeaseHeld) {
+		t.Fatalf("rebind error = %v, want ErrSessionLeaseHeld", err)
+	}
+	assertAtomicRebindFailurePreservedSource(t, app, tab, oldCtrl, sourcePath, targetPath, oldEpoch)
+	if _, err := agent.TryAcquireSessionLease(sourcePath); !errors.Is(err, agent.ErrSessionLeaseHeld) {
+		t.Fatalf("source lease became acquirable after failed target claim: %v", err)
+	}
+}
+
+func TestRebindPostLeaseValidationFailureRollsBackCandidate(t *testing.T) {
+	app, tab, oldCtrl, sourcePath, targetPath, loaded := newAtomicRebindTestApp(t)
+	app.mu.RLock()
+	oldEpoch := app.sessionRuntimeViewLocked(tab).Epoch
+	app.mu.RUnlock()
+	app.rebindCandidateHook = func(stage string) error {
+		if stage == "lease_acquired" {
+			return errors.New("injected post-lease validation failure")
+		}
+		return nil
+	}
+
+	err := app.rebindTabToLoadedSessionPath(tab, targetPath, loaded)
+	if err == nil || !strings.Contains(err.Error(), "injected post-lease") {
+		t.Fatalf("rebind error = %v, want injected validation failure", err)
+	}
+	assertAtomicRebindFailurePreservedSource(t, app, tab, oldCtrl, sourcePath, targetPath, oldEpoch)
+	targetLease, err := agent.TryAcquireSessionLease(targetPath)
+	if err != nil {
+		t.Fatalf("candidate target lease leaked after rollback: %v", err)
+	}
+	targetLease.Release()
 }
 
 func TestCloseTabPersistsSessionProfileBeforeRemovingVisibleTab(t *testing.T) {
@@ -948,7 +1389,6 @@ func TestCloseTabPersistsSessionProfileBeforeRemovingVisibleTab(t *testing.T) {
 		SessionPath:      currentPath,
 		Ctrl:             ctrl,
 		Ready:            true,
-		tokenMode:        boot.TokenModeEconomy,
 		mode:             "plan",
 		toolApprovalMode: control.ToolApprovalAuto,
 		sink:             &tabEventSink{tabID: "profile", app: app},
@@ -975,9 +1415,10 @@ func TestCloseTabPersistsSessionProfileBeforeRemovingVisibleTab(t *testing.T) {
 	if err != nil || !ok {
 		t.Fatalf("LoadBranchMeta current ok=%v err=%v", ok, err)
 	}
-	if meta.TokenMode != boot.TokenModeEconomy || meta.Mode != "plan" || meta.ToolApprovalMode != control.ToolApprovalAuto || meta.Goal != "finish the review" {
-		t.Fatalf("closed session profile = token:%q mode:%q approval:%q goal:%q, want economy/plan/auto/goal",
-			meta.TokenMode, meta.Mode, meta.ToolApprovalMode, meta.Goal)
+	if meta.TokenMode != boot.TokenModeFull || meta.AgentPreset != boot.AgentPresetStandard ||
+		meta.Mode != "plan" || meta.ToolApprovalMode != control.ToolApprovalAuto || meta.Goal != "finish the review" {
+		t.Fatalf("closed session profile = token:%q preset:%q mode:%q approval:%q goal:%q, want full/standard/plan/auto/goal",
+			meta.TokenMode, meta.AgentPreset, meta.Mode, meta.ToolApprovalMode, meta.Goal)
 	}
 }
 
@@ -1018,7 +1459,6 @@ func TestKeepOnlyVisibleTabPersistsRemovedSessionProfile(t *testing.T) {
 		SessionPath:      removedPath,
 		Ctrl:             removedCtrl,
 		Ready:            true,
-		tokenMode:        boot.TokenModeEconomy,
 		mode:             "plan",
 		toolApprovalMode: control.ToolApprovalAuto,
 		sink:             &tabEventSink{tabID: "removed", app: app},
@@ -1037,41 +1477,51 @@ func TestKeepOnlyVisibleTabPersistsRemovedSessionProfile(t *testing.T) {
 	if err != nil || !ok {
 		t.Fatalf("LoadBranchMeta removed ok=%v err=%v", ok, err)
 	}
-	if meta.TokenMode != boot.TokenModeEconomy || meta.Mode != "plan" || meta.ToolApprovalMode != control.ToolApprovalAuto || meta.Goal != "keep this profile" {
-		t.Fatalf("removed session profile = token:%q mode:%q approval:%q goal:%q, want economy/plan/auto/goal",
-			meta.TokenMode, meta.Mode, meta.ToolApprovalMode, meta.Goal)
+	if meta.TokenMode != boot.TokenModeFull || meta.AgentPreset != boot.AgentPresetStandard ||
+		meta.Mode != "plan" || meta.ToolApprovalMode != control.ToolApprovalAuto || meta.Goal != "keep this profile" {
+		t.Fatalf("removed session profile = token:%q preset:%q mode:%q approval:%q goal:%q, want full/standard/plan/auto/goal",
+			meta.TokenMode, meta.AgentPreset, meta.Mode, meta.ToolApprovalMode, meta.Goal)
 	}
 }
 
 func TestLoadTabSessionProfileIgnoresTerminalGoalState(t *testing.T) {
 	isolateDesktopUserDirs(t)
-	root := globalTabWorkspaceRoot()
-	dir := desktopSessionDir(root)
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		t.Fatalf("mkdir session dir: %v", err)
+	sessionPath := filepath.Join(desktopSessionDir(globalTabWorkspaceRoot()), "terminal-goal.jsonl")
+	if err := os.MkdirAll(filepath.Dir(sessionPath), 0o755); err != nil {
+		t.Fatal(err)
 	}
-
-	sessionPath := filepath.Join(dir, "terminal-goal.jsonl")
 	writeHistoryTestSession(t, sessionPath, "terminal prompt")
 	if err := agent.SaveBranchMetaPreserveUpdated(sessionPath, agent.BranchMeta{
-		TokenMode:        boot.TokenModeEconomy,
-		Mode:             "plan",
-		ToolApprovalMode: control.ToolApprovalAuto,
-		Goal:             "stale terminal goal",
+		TokenMode: "economy", Mode: "plan", ToolApprovalMode: control.ToolApprovalAuto, Goal: "stale terminal goal",
 	}); err != nil {
-		t.Fatalf("SaveBranchMetaPreserveUpdated: %v", err)
+		t.Fatal(err)
 	}
 	if err := os.WriteFile(store.SessionGoalState(sessionPath), []byte(`{"goal":"stale terminal goal","status":"complete"}`), 0o644); err != nil {
-		t.Fatalf("write goal state: %v", err)
+		t.Fatal(err)
 	}
-
 	profile := loadTabSessionProfile(sessionPath)
-	if profile.goal != "" {
-		t.Fatalf("loaded profile goal = %q, want terminal goal ignored", profile.goal)
+	if profile.goal != "" || profile.tokenMode != "full" || profile.qualityFloor != control.QualityFloorStandard || profile.mode != "plan" || profile.toolApprovalMode != control.ToolApprovalAuto {
+		t.Fatalf("profile=%+v", profile)
 	}
-	if profile.tokenMode != boot.TokenModeEconomy || profile.mode != "plan" || profile.toolApprovalMode != control.ToolApprovalAuto {
-		t.Fatalf("loaded profile = token:%q mode:%q approval:%q, want economy/plan/auto",
-			profile.tokenMode, profile.mode, profile.toolApprovalMode)
+	tab := &WorkspaceTab{}
+	applyTabSessionProfile(tab, profile)
+	if currentTabTokenMode(tab) != boot.TokenModeFull {
+		t.Fatal("legacy economy must fold to standard")
+	}
+}
+
+func TestLoadTabSessionProfileMissingApprovalDefaultsAsk(t *testing.T) {
+	isolateDesktopUserDirs(t)
+	sessionPath := filepath.Join(desktopSessionDir(globalTabWorkspaceRoot()), "legacy-missing-approval.jsonl")
+	if err := os.MkdirAll(filepath.Dir(sessionPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeHistoryTestSession(t, sessionPath, "legacy prompt")
+	if err := agent.SaveBranchMetaPreserveUpdated(sessionPath, agent.BranchMeta{Mode: "normal"}); err != nil {
+		t.Fatal(err)
+	}
+	if profile := loadTabSessionProfile(sessionPath); profile.toolApprovalMode != control.ToolApprovalAsk {
+		t.Fatalf("legacy missing tool approval mode = %q, want ask", profile.toolApprovalMode)
 	}
 }
 

@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -19,6 +20,8 @@ import (
 	fileenc "reasonix/internal/fileutil/encoding"
 	"reasonix/internal/proc"
 	"reasonix/internal/sandbox"
+	"reasonix/internal/secrets"
+	"reasonix/internal/sessiontemp"
 	"reasonix/internal/tool"
 )
 
@@ -73,15 +76,20 @@ type grepTool struct {
 	rg          string
 	forbidRoots []string
 	sb          sandbox.Spec
+	sessionTemp *sessiontemp.Manager
+	// overlay serves exact-file searches from the same unsaved editor buffer as
+	// read_file. Directory searches still use disk/ripgrep because FileOverlay
+	// intentionally has no directory-enumeration contract.
+	overlay FileOverlay
 }
 
 func (grepTool) Name() string { return "grep" }
 
 func (g grepTool) Description() string {
 	if g.rg != "" {
-		return "Search for a regular expression in a file, or recursively under a directory — ripgrep-backed, so it honors .gitignore. Returns matching lines as path:line:text, capped at 200 matches."
+		return "Search for a regular expression in a file, or recursively under a directory — ripgrep-backed, so it honors .gitignore. Returns matching lines as path:line:text, capped at 200 matches. Independent searches with no data dependency should be issued in the same round."
 	}
-	return "Search for a regular expression in a file, or recursively under a directory (skips hidden files and files matched by .gitignore). Returns matching lines as path:line:text, capped at 200 matches."
+	return "Search for a regular expression in a file, or recursively under a directory (skips hidden files and files matched by .gitignore). Returns matching lines as path:line:text, capped at 200 matches. Independent searches with no data dependency should be issued in the same round."
 }
 
 func (grepTool) Schema() json.RawMessage {
@@ -118,22 +126,29 @@ func (g grepTool) Execute(ctx context.Context, args json.RawMessage) (string, er
 	ctx, cancel := context.WithTimeout(ctx, to)
 	defer cancel()
 
+	if confineRead(g.forbidRoots, p.Path) {
+		info, err := os.Stat(p.Path)
+		if err == nil && info.IsDir() {
+			return formatGrep(ctx, nil, false, to), nil
+		}
+		pathErr := &os.PathError{Op: "stat", Path: p.Path, Err: os.ErrNotExist}
+		if rp.External {
+			return "", fmt.Errorf("grep %s: %s", rp.DisplayPath, rp.ErrorText(pathErr))
+		}
+		return "", pathErr
+	}
+	if g.overlay != nil && !rp.External && filepath.IsAbs(p.Path) {
+		if content, ok := g.overlay.ReadTextFile(ctx, p.Path); ok {
+			return g.runOverlay(ctx, p.Pattern, p.Path, content, to, rp)
+		}
+	}
+
 	info, err := os.Stat(p.Path)
 	if err != nil {
 		if rp.External {
 			return "", fmt.Errorf("grep %s: %s", rp.DisplayPath, rp.ErrorText(err))
 		}
 		return "", fmt.Errorf("grep %s: %w", rp.DisplayPath, err)
-	}
-	if confineRead(g.forbidRoots, p.Path) {
-		if info.IsDir() {
-			return formatGrep(ctx, nil, false, to), nil
-		}
-		err := &os.PathError{Op: "stat", Path: p.Path, Err: os.ErrNotExist}
-		if rp.External {
-			return "", fmt.Errorf("grep %s: %s", rp.DisplayPath, rp.ErrorText(err))
-		}
-		return "", err
 	}
 
 	if g.rg != "" {
@@ -146,6 +161,37 @@ func (g grepTool) Execute(ctx context.Context, args json.RawMessage) (string, er
 	}
 
 	return g.runNative(ctx, p.Pattern, p.Path, info, to, rp)
+}
+
+func (g grepTool) runOverlay(ctx context.Context, pattern, path, content string, to time.Duration, rp ResolvedPath) (string, error) {
+	re, err := regexp.Compile(pattern)
+	if err != nil {
+		return "", fmt.Errorf("invalid pattern: %w", err)
+	}
+	var out []string
+	sc := bufio.NewScanner(strings.NewReader(content))
+	sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+	line := 0
+	for sc.Scan() {
+		if ctx.Err() != nil {
+			break
+		}
+		line++
+		text := sc.Text()
+		if strings.IndexByte(text, 0) >= 0 {
+			return formatGrep(ctx, nil, false, to), nil
+		}
+		if re.MatchString(text) {
+			out = append(out, fmt.Sprintf("%s:%d:%s", rp.DisplayFor(path), line, text))
+			if len(out) >= grepMaxMatches {
+				return formatGrep(ctx, out, true, to), nil
+			}
+		}
+	}
+	if err := sc.Err(); err != nil {
+		return "", fmt.Errorf("grep overlay: %w", err)
+	}
+	return formatGrep(ctx, out, false, to), nil
 }
 
 func (g grepTool) runNative(ctx context.Context, pattern, path string, info os.FileInfo, to time.Duration, rp ResolvedPath) (string, error) {
@@ -179,46 +225,33 @@ func (g grepTool) runNative(ctx context.Context, pattern, path string, info os.F
 		peek := peekBuf[:n]
 
 		bomKind := fileenc.DetectQuick(peek)
+		enc := bomKind
 		if bomKind != fileenc.UTF16LE && bomKind != fileenc.UTF16BE && bomKind != fileenc.UTF8BOM {
-			if bytes.IndexByte(peek, 0) >= 0 {
-				return nil // binary, skip
+			if detected, ok := fileenc.DetectUTF16NoBOM(peek); ok {
+				enc = detected
+			} else {
+				if bytes.IndexByte(peek, 0) >= 0 {
+					return nil // binary, skip
+				}
+				// A full peek is only the start of the file and can end inside
+				// a character.
+				detect := fileenc.Detect
+				if n == len(peekBuf) {
+					detect = fileenc.DetectFragment
+				}
+				enc, _ = detect(peek)
 			}
 		}
 
-		// Detect encoding from the peek alone — sufficient for the
-		// UTF-8 vs GB18030 distinction (utf8.Valid on 8 KiB is reliable).
-		// Then stream the rest through a decoder so the 200-match cap can
-		// stop reading early instead of buffering the entire file.
-		enc, _ := fileenc.Detect(peek)
-
 		var src io.Reader
-		if enc == fileenc.UTF16LE || enc == fileenc.UTF16BE {
-			// UTF-16 needs full-file decode (multi-byte units span the
-			// whole stream). These files are rare in grep targets.
-			rest, err := io.ReadAll(f)
-			if err != nil {
-				return nil
-			}
-			all := append(peek, rest...)
-			src = bytes.NewReader(fileenc.Decode(all, enc))
+		// Stream through the decoder so the 200-match cap can stop reading
+		// early. x/text's UTF-16 decoder preserves split code units across reads.
+		dec := fileenc.Decoder(enc)
+		if dec != nil {
+			src = transform.NewReader(io.MultiReader(bytes.NewReader(peek), f), dec)
 		} else {
-			// Non-BOM path: stream. The peek bytes are prepended via
-			// io.MultiReader; the remaining bytes flow through a decoder
-			// pipe so the scanner can stop as soon as the cap is reached.
-			dec := fileenc.Decoder(enc)
-			if dec != nil {
-				head := append([]byte(nil), peek...) // goroutine can outlive an early return; don't alias the reused buffer
-				pr, pw := io.Pipe()
-				go func() {
-					_, _ = pw.Write(head)
-					io.Copy(pw, f) //nolint:errcheck
-					pw.Close()
-				}()
-				src = transform.NewReader(pr, dec)
-			} else {
-				// UTF-8 or LossyUTF8 — no transformation needed.
-				src = io.MultiReader(bytes.NewReader(peek), f)
-			}
+			// UTF-8 or LossyUTF8 — no transformation needed.
+			src = io.MultiReader(bytes.NewReader(peek), f)
 		}
 
 		sc := bufio.NewScanner(src)
@@ -260,7 +293,7 @@ func (g grepTool) runNative(ctx context.Context, pattern, path string, info os.F
 			if ig.skip(path, d.Name(), false) {
 				return nil
 			}
-			if searchFile(path) == io.EOF {
+			if errors.Is(searchFile(path), io.EOF) {
 				return filepath.SkipAll
 			}
 			return nil
@@ -280,17 +313,45 @@ func (g grepTool) runNative(ctx context.Context, pattern, path string, info os.F
 func (g grepTool) runRipgrep(ctx context.Context, pattern, path string, to time.Duration, rp ResolvedPath) (string, bool, error) {
 	// Build the ripgrep argv and wrap it in the OS sandbox so forbid-read
 	// directories are invisible to the ripgrep subprocess.
-	argv, wrapped := sandbox.CommandArgs(g.sb, []string{
+	args := []string{
 		g.rg,
 		"--no-heading", "--line-number", "--with-filename", "--color", "never",
-		"--regexp", pattern,
-		"--", path,
-	})
+	}
+	if secrets.ProtectSensitiveFiles() {
+		// Mirror sensitiveReadPath for the subprocess: ripgrep cannot call
+		// back into confineRead, so the denylist rides along as glob excludes.
+		args = append(args,
+			"--glob", "!.env",
+			"--glob", "!.git-credentials",
+			"--glob", "!.netrc",
+			"--glob", "!*.pem",
+			"--glob", "!*.key",
+			"--glob", "!*.p12",
+			"--glob", "!*.pfx",
+			"--glob", "!.ssh/**",
+		)
+	}
+	args = append(args, "--regexp", pattern, "--", path)
+
+	var lease *sessiontemp.Lease
+	sessionDir := ""
+	if m := g.sessionTempManager(ctx); m != nil {
+		l, err := m.Acquire()
+		if err != nil {
+			return "", false, fmt.Errorf("session temporary directory: %w", err)
+		}
+		lease = l
+		sessionDir = l.Dir()
+		defer lease.Release()
+	}
+	prepared := sandbox.PrepareArgs(g.sb, args, sessionDir)
+	argv, wrapped := prepared.Argv, prepared.Wrapped
 	if len(g.forbidRoots) > 0 && !wrapped {
 		return "", wrapped, nil
 	}
 
-	cmd := exec.CommandContext(ctx, argv[0], argv[1:]...)
+	cmd := proc.CommandContext(ctx, argv[0], argv[1:]...)
+	cmd.Env = applyEnvOverrides(secrets.ProcessEnv(), prepared.EnvOverrides)
 	proc.HideWindow(cmd)
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
@@ -330,6 +391,13 @@ func (g grepTool) runRipgrep(ctx context.Context, pattern, path string, to time.
 		}
 	}
 	return formatGrep(ctx, out, truncated, to), wrapped, nil
+}
+
+func (g grepTool) sessionTempManager(ctx context.Context) *sessiontemp.Manager {
+	if m := sessiontemp.FromContext(ctx); m != nil {
+		return m
+	}
+	return g.sessionTemp
 }
 
 func displayRipgrepLine(line string, rp ResolvedPath) string {
@@ -394,6 +462,8 @@ func ResolveSearch(engine, rgPath string, warn io.Writer) SearchSpec {
 // ConfineSearch returns the grep built-in bound to a resolved search engine,
 // os sandbox spec for the ripgrep subprocess, and forbid-read roots for the
 // native scanner, overriding the native instance registered at init.
+// Session-private temporary directories are bound via BindSessionTemp or
+// Workspace.SessionTemp.
 func ConfineSearch(spec SearchSpec, sb sandbox.Spec, forbidRoots []string) tool.Tool {
 	return grepTool{rg: spec.RgPath, sb: sb, forbidRoots: forbidRoots}
 }

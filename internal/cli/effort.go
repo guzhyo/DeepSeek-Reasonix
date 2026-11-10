@@ -16,12 +16,12 @@ func (m *chatTUI) runEffortCommand(input string) tea.Cmd {
 		return nil
 	}
 	cap := config.EffortCapabilityForEntry(entry)
-	if !cap.Supported {
+	args := tokenizeArgs(input)
+	if !cap.Supported && !(len(args) == 2 && args[1] == "auto") {
 		m.notice(fmt.Sprintf("effort is not configurable for %s", entry.Name))
 		return nil
 	}
 
-	args := tokenizeArgs(input)
 	if len(args) < 2 {
 		current := config.EffortDisplay(entry)
 		options := strings.Join(cap.Levels, "|")
@@ -41,8 +41,12 @@ func (m *chatTUI) runEffortCommand(input string) tea.Cmd {
 		m.notice("model switching is unavailable in this session")
 		return nil
 	}
-	if m.ctrl.Running() {
-		m.notice("finish or cancel the current turn before changing effort")
+	if m.runtimeSwitchBusy() {
+		m.notice("finish or cancel active work and stop background jobs before changing effort")
+		return nil
+	}
+	if m.modelSwitchPending {
+		m.notice("wait for the current runtime switch to finish")
 		return nil
 	}
 
@@ -90,11 +94,24 @@ func (m *chatTUI) runEffortCommand(input string) tea.Cmd {
 	// controller back to the original file, re-conflicting on every later save.
 	carried := m.ctrl.History()
 	prevPath := m.ctrl.SessionPath()
+	// Move the lease before the rebuilt controller binds prevPath for writing
+	// (AdoptHistory resumes there): after a snapshot retarget the lease still
+	// guards the old path, and the async build must not open an unguarded
+	// writer on the recovery branch.
+	if err := m.rebindSessionLease(prevPath); err != nil {
+		m.notice("effort: " + sessionLeaseHeldNotice(err))
+		return nil
+	}
 	oldCtrl := m.ctrl
 	build := m.buildController
 	m.modelSwitchPending = true
 	m.pendingModelSwitch = func() tea.Msg {
-		c, err := build(ref, carried, prevPath)
+		c, err := build(controllerBuildSpec{
+			ModelRef:         ref,
+			ToolApprovalMode: oldCtrl.ToolApprovalMode(),
+			PlanMode:         oldCtrl.PlanMode(),
+			EffortOverride:   &effort,
+		}, carried, prevPath, oldCtrl)
 		if err != nil {
 			return modelSwitchMsg{ref: ref, err: err}
 		}
@@ -104,7 +121,7 @@ func (m *chatTUI) runEffortCommand(input string) tea.Cmd {
 			oldCtrl:  oldCtrl,
 			label:    c.Label(),
 			commands: c.Commands(),
-			skills:   c.Skills(),
+			skills:   c.SlashSkills(),
 			host:     c.Host(),
 		}
 	}
@@ -117,9 +134,20 @@ func (m *chatTUI) currentConfigProvider() (*config.ProviderEntry, string, error)
 	if err != nil {
 		return nil, "", err
 	}
+	// When the per-tab ref is empty we are inheriting the configured
+	// default — let resolveModelForCLI fall through a keyless default to
+	// the next configured provider (issue #6996). When m.modelRef is
+	// already set we honor it verbatim: the user picked that model
+	// explicitly (via /model, on the model switcher, or in the bootstrap
+	// step) and we must not silently swap to a different provider just
+	// because the entry happens to be keyless.
 	ref := m.modelRef
 	if strings.TrimSpace(ref) == "" {
-		ref = cfg.DefaultModel
+		var rerr error
+		ref, _, rerr = resolveModelForCLI("", cfg)
+		if rerr != nil {
+			return nil, "", rerr
+		}
 	}
 	entry, ok := cfg.ResolveModel(ref)
 	if !ok {

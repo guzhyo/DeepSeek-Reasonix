@@ -1,23 +1,24 @@
 package cli
 
 import (
+	"context"
 	"fmt"
 	"strings"
 
 	"github.com/charmbracelet/x/ansi"
 
-	"reasonix/internal/agent"
 	"reasonix/internal/control"
+	"reasonix/internal/provider"
 )
 
 func (m *chatTUI) showBranchTree() {
 	branches, err := m.ctrl.Branches()
+	m.followSessionLease()
 	if err != nil {
 		m.notice("tree: " + err.Error())
 		return
 	}
-	current := agent.BranchID(m.ctrl.SessionPath())
-	tree := renderBranchTree(control.FormatBranchTree(branches, current))
+	tree := renderBranchTree(control.FormatBranchTree(branches, m.ctrl.CurrentBranchID()))
 	m.commitLine(ansi.Hardwrap(tree, max(m.width, 20), false))
 }
 
@@ -71,6 +72,7 @@ func (m *chatTUI) runBranchCommand(input string) {
 		return
 	} else if fromTurn {
 		if _, err := m.ctrl.ForkNamed(n-1, name); err != nil {
+			m.followSessionLease()
 			return
 		}
 		m.followSessionLease()
@@ -78,6 +80,7 @@ func (m *chatTUI) runBranchCommand(input string) {
 		return
 	} else {
 		if _, err := m.ctrl.Branch(name); err != nil {
+			m.followSessionLease()
 			return
 		}
 		m.followSessionLease()
@@ -96,12 +99,15 @@ func (m *chatTUI) runSwitchCommand(input string) {
 	// failures fall through to SwitchBranch, which reports them as before.
 	if m.leases != nil {
 		if branches, err := m.ctrl.Branches(); err == nil {
+			m.followSessionLease()
 			if match, err := control.ResolveBranchRef(branches, ref); err == nil {
 				if err := m.rebindSessionLease(match.Path); err != nil {
 					m.notice("switch: " + sessionLeaseHeldNotice(err))
 					return
 				}
 			}
+		} else {
+			m.followSessionLease()
 		}
 	}
 	if _, err := m.ctrl.SwitchBranch(ref); err != nil {
@@ -113,11 +119,32 @@ func (m *chatTUI) runSwitchCommand(input string) {
 	m.replayActiveBranch("switched branch")
 }
 
+// chatUIDisplayHistory returns the durable display history for the bound
+// session. Controller.History is the provider workset — session-context and
+// reasoning-language wrappers included, with Origin/RawContent stripped by the
+// provider projection — which is wrong for rendering: the replay would leak
+// host wrappers and lose the raw user text. Exclusive sessions read the
+// session service's display projection instead, the same view the desktop
+// renders through the transcript snapshot protocol.
+func chatUIDisplayHistory(ctrl control.SessionAPI) []provider.Message {
+	if identity, ok := ctrl.(control.IdentityLifecycle); ok && identity.UsesExclusiveSession() {
+		if service := identity.SessionService(); service != nil {
+			if ref, bound := identity.SessionRef(); bound {
+				if messages, err := service.Query().History(context.Background(), ref); err == nil {
+					return messages
+				}
+			}
+		}
+	}
+	return ctrl.History()
+}
+
 func (m *chatTUI) replayActiveBranch(title string) {
 	m.finalizeStreamed()
 	m.pending.Reset()
 	m.reasoning.Reset()
-	m.todoArgs = ""
+	m.todos = nil
+	m.todosDismissed = false
 	m.chooser = nil
 	m.pendingApproval = nil
 	m.bubblePending = false
@@ -139,9 +166,8 @@ func (m *chatTUI) replayActiveBranch(title string) {
 	if title != "" {
 		m.commitLine(dim("  -- " + title + " --"))
 	}
-	contentW := transcriptContentWidth(m.width, m.nativeScrollback)
-	m.commitLine(strings.TrimRight(renderTUIBanner(m.label, "", contentW), "\n"))
-	for _, section := range replaySectionsFor(m.ctrl.History(), contentW, m.renderer) {
-		m.commitLine(strings.TrimRight(section, "\n"))
-	}
+	m.commitTranscriptSource(transcriptSource{
+		kind:    transcriptSourceReplayBundle,
+		history: append([]provider.Message(nil), chatUIDisplayHistory(m.ctrl)...),
+	})
 }

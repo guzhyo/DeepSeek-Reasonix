@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -35,7 +36,7 @@ func TestRunResumeRefusedWhenSessionLeaseHeld(t *testing.T) {
 	holdSessionLease(t, path)
 
 	errOut := captureStderr(t, func() {
-		if rc := runAgent([]string{"--resume", path, "continue task"}); rc != 1 {
+		if rc := runAgent([]string{"--resume", path, "continue task"}, "dev"); rc != 1 {
 			t.Fatalf("run --resume held rc = %d, want 1", rc)
 		}
 	})
@@ -54,7 +55,7 @@ func TestRunCopyRequiresResumeTarget(t *testing.T) {
 	isolateCLIConfigHome(t)
 
 	errOut := captureStderr(t, func() {
-		if rc := runAgent([]string{"--copy", "do things"}); rc != 2 {
+		if rc := runAgent([]string{"--copy", "do things"}, "dev"); rc != 2 {
 			t.Fatalf("run --copy without target rc = %d, want 2", rc)
 		}
 	})
@@ -63,8 +64,45 @@ func TestRunCopyRequiresResumeTarget(t *testing.T) {
 	}
 }
 
+// TestRunResumeCopyJSONKeepsStdoutClean guards that --copy under a structured
+// output format writes its human notice to stderr, leaving stdout a single valid
+// JSON object (the copy notice used to pollute it).
+func TestRunResumeCopyJSONKeepsStdoutClean(t *testing.T) {
+	isolateCLIConfigHome(t)
+	pinProviderOffline(t)
+
+	dir := t.TempDir()
+	src := filepath.Join(dir, "held-src.jsonl")
+	saveTestSession(t, src, "copy me")
+	holdSessionLease(t, src)
+
+	var rc int
+	var errOut string
+	out := captureStdout(t, func() {
+		errOut = captureStderr(t, func() {
+			rc = runAgent([]string{"--resume", src, "--copy", "--output-format", "json", "continue task"}, "dev")
+		})
+	})
+	// Setup fails in the isolated home (no provider), so the run ends with a JSON
+	// error object — but the copy still happened first.
+	if rc != 1 {
+		t.Fatalf("rc = %d, want 1 (setup fails in isolated home)", rc)
+	}
+	if strings.Contains(out, "continuing in a session copy") {
+		t.Fatalf("json stdout leaked the copy notice:\n%s", out)
+	}
+	if !strings.Contains(errOut, "continuing in a session copy: ") {
+		t.Fatalf("copy notice should be on stderr, got stderr:\n%s", errOut)
+	}
+	var obj map[string]any
+	if err := json.Unmarshal([]byte(strings.TrimSpace(out)), &obj); err != nil {
+		t.Fatalf("stdout is not a single JSON object: %v\nstdout:\n%s", err, out)
+	}
+}
+
 func TestRunResumeCopyContinuesInDuplicate(t *testing.T) {
 	isolateCLIConfigHome(t)
+	pinProviderOffline(t)
 
 	dir := t.TempDir()
 	src := filepath.Join(dir, "held-src.jsonl")
@@ -78,7 +116,7 @@ func TestRunResumeCopyContinuesInDuplicate(t *testing.T) {
 	var rc int
 	out := captureStdout(t, func() {
 		_ = captureStderr(t, func() {
-			rc = runAgent([]string{"--resume", src, "--copy", "continue task"})
+			rc = runAgent([]string{"--resume", src, "--copy", "continue task"}, "dev")
 		})
 	})
 	// The isolated home has no provider config, so the run itself fails after
@@ -131,6 +169,7 @@ func TestRunResumeCopyContinuesInDuplicate(t *testing.T) {
 
 func TestRunResumeReleasesLeaseOnExit(t *testing.T) {
 	isolateCLIConfigHome(t)
+	pinProviderOffline(t)
 
 	path := filepath.Join(t.TempDir(), "release-run.jsonl")
 	saveTestSession(t, path, "resume me")
@@ -138,7 +177,7 @@ func TestRunResumeReleasesLeaseOnExit(t *testing.T) {
 	// No provider config in the isolated home: the run fails after the lease
 	// was taken, and the deferred release must still run.
 	_ = captureStderr(t, func() {
-		if rc := runAgent([]string{"--resume", path, "continue task"}); rc != 1 {
+		if rc := runAgent([]string{"--resume", path, "continue task"}, "dev"); rc != 1 {
 			t.Fatalf("run --resume rc = %d, want 1 (setup fails in isolated home)", rc)
 		}
 	})
@@ -243,7 +282,7 @@ func chatLeaseFixture(t *testing.T) (m chatTUI, active, target string) {
 	exec := agent.New(nil, nil, agent.NewSession("sys"), agent.Options{}, event.Discard)
 	m = newTestChatTUI()
 	m.width = 80
-	m.ctrl = control.New(control.Options{Executor: exec, SessionDir: dir, SessionPath: active, Label: "test"})
+	m.ctrl = newOwnedTestController(t, control.Options{Executor: exec, SessionDir: dir, SessionPath: active, Label: "test"})
 	m.leases = control.NewSessionLeaseKeeper()
 	t.Cleanup(m.leases.Release)
 	if err := m.leases.Rebind(active); err != nil {

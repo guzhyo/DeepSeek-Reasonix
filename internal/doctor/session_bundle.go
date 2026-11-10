@@ -54,6 +54,11 @@ type SessionBundleEntry struct {
 	Recovered      bool   `json:"recovered,omitempty"`
 	RecoveryReason string `json:"recovery_reason,omitempty"`
 	RecoveryDepth  int    `json:"recovery_depth,omitempty"`
+	// Head fields are set for a schema-2 session log; its versions are heads
+	// of one file, not separate transcripts in the chain above.
+	LogFormat    int                 `json:"log_format,omitempty"`
+	SelectedHead string              `json:"selected_head,omitempty"`
+	Heads        []SessionBundleHead `json:"heads,omitempty"`
 }
 
 type SessionBundleFile struct {
@@ -143,6 +148,9 @@ func WriteSessionBundle(opts SessionBundleOptions) (SessionBundleResult, error) 
 			entry.Recovered = meta.Recovered
 			entry.RecoveryReason = meta.RecoveryReason
 			entry.RecoveryDepth = meta.RecoveryDepth
+		}
+		if headErr := describeSessionBundleHeads(&entry, path); headErr != nil {
+			manifest.Missing = append(manifest.Missing, redactSessionBundlePath(store.SessionEventLog(path))+": "+redactSessionBundleError(headErr))
 		}
 		manifest.Sessions = append(manifest.Sessions, entry)
 
@@ -383,6 +391,11 @@ func sessionBundleArtifacts(sessionPath string) []sessionArtifact {
 		{role: "meta", path: store.SessionMeta(sessionPath)},
 		{role: "goal_state", path: store.SessionGoalState(sessionPath)},
 		{role: "events", path: store.SessionEventLog(sessionPath)},
+		// The salvage sidecar is the primary evidence for truncation incidents
+		// (torn tails, dual-writer interleaves) — exactly what session bundles
+		// exist to debug. Bundles copy artifact contents verbatim already, so
+		// it adds no new sensitivity class.
+		{role: "events_damaged", path: store.SessionEventLogDamaged(sessionPath)},
 		{role: "event_index", path: store.SessionEventIndex(sessionPath)},
 		{role: "conflicts", path: store.SessionConflictLog(sessionPath)},
 		{role: "lease", path: store.SessionLeaseInfo(sessionPath)},

@@ -7,7 +7,51 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+
+	"reasonix/internal/memory"
 )
+
+func TestResolveRefsInjectsOnlyNewNestedInstructionsOnce(t *testing.T) {
+	root := t.TempDir()
+	service := filepath.Join(root, "services", "api")
+	sibling := filepath.Join(root, "services", "web")
+	for _, dir := range []string{service, sibling} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for path, body := range map[string]string{
+		filepath.Join(root, "AGENTS.md"):             "ROOT RULE",
+		filepath.Join(root, "services", "AGENTS.md"): "SERVICES RULE",
+		filepath.Join(service, "AGENTS.md"):          "API RULE",
+		filepath.Join(sibling, "AGENTS.md"):          "WEB RULE",
+		filepath.Join(service, "handler.go"):         "package api",
+		filepath.Join(service, "handler_test.go"):    "package api",
+	} {
+		if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	c := newOwnedTestController(t, Options{WorkspaceRoot: root, Memory: memory.Load(memory.Options{CWD: root})})
+	block, errs := c.ResolveRefs(context.Background(), "review @services/api/handler.go and @services/api/handler_test.go")
+	if len(errs) != 0 {
+		t.Fatalf("ResolveRefs errors = %v", errs)
+	}
+	for _, want := range []string{"<path-instructions", "SERVICES RULE", "API RULE", "package api"} {
+		if !strings.Contains(block, want) {
+			t.Fatalf("resolved block missing %q:\n%s", want, block)
+		}
+	}
+	for _, unwanted := range []string{"ROOT RULE", "WEB RULE"} {
+		if strings.Contains(block, unwanted) {
+			t.Fatalf("resolved block included %q outside the nested delta:\n%s", unwanted, block)
+		}
+	}
+	if strings.Count(block, "SERVICES RULE") != 1 || strings.Count(block, "API RULE") != 1 {
+		t.Fatalf("nested instructions were duplicated across refs:\n%s", block)
+	}
+}
 
 func TestFileRefLine(t *testing.T) {
 	dir := t.TempDir()
@@ -30,6 +74,44 @@ func TestFileRefLine(t *testing.T) {
 	}
 	if _, ok := FileRefLine(""); ok {
 		t.Fatal("empty must not resolve as a file ref")
+	}
+
+	spaced := filepath.Join(dir, "report 2026.pdf")
+	if err := os.WriteFile(spaced, []byte("%PDF-1.4 fake"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if got, ok := FileRefLine(spaced); !ok || got != "@"+EscapeRefPath(spaced) {
+		t.Fatalf("FileRefLine(spaced) = %q, %v; want escaped ref", got, ok)
+	}
+}
+
+func TestEscapeRefPathRoundTrip(t *testing.T) {
+	cases := []struct{ in, escaped string }{
+		{"plain.txt", "plain.txt"},
+		{"my file.txt", `my\ file.txt`},
+		{"a\tb.txt", "a\\\tb.txt"},
+		{`C:\dir\file.png`, `C:\dir\file.png`},
+	}
+	for _, c := range cases {
+		if got := EscapeRefPath(c.in); got != c.escaped {
+			t.Errorf("EscapeRefPath(%q) = %q, want %q", c.in, got, c.escaped)
+		}
+		if got := UnescapeRefPath(c.escaped); got != c.in {
+			t.Errorf("UnescapeRefPath(%q) = %q, want %q", c.escaped, got, c.in)
+		}
+	}
+}
+
+// TestDetectRefsEscapedSpacePath closes the loop pastedFileRef and completion
+// rely on: an @token with escaped spaces resolves to the real workspace file.
+func TestDetectRefsEscapedSpacePath(t *testing.T) {
+	workspace := t.TempDir()
+	if err := os.WriteFile(filepath.Join(workspace, "my file.txt"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	refs := (&Controller{workspaceRoot: workspace}).detectRefs(`see @my\ file.txt after`)
+	if len(refs) != 1 || refs[0].kind != refFile || refs[0].path != "my file.txt" {
+		t.Fatalf("refs = %+v, want one file ref for \"my file.txt\"", refs)
 	}
 }
 
@@ -63,6 +145,10 @@ func TestParseRefTokens(t *testing.T) {
 		{"dedup @a @a", []string{"a"}},
 		{"no refs here", nil},
 		{"email a@b.com keeps token", []string{"b.com"}},
+		{`open @docs/my\ file.md now`, []string{"docs/my file.md"}},
+		{`trailing @my\ file.md.`, []string{"my file.md"}},
+		{`win @C:\dir\shot.png ok`, []string{`C:\dir\shot.png`}},
+		{`unescaped @my file.md`, []string{"my"}},
 	}
 	for _, c := range cases {
 		got := parseRefTokens(c.line)
@@ -110,57 +196,6 @@ func TestClassifyRef(t *testing.T) {
 		if ok && r.kind != c.wantKnd {
 			t.Errorf("classifyRef(%q) kind = %v, want %v", c.token, r.kind, c.wantKnd)
 		}
-	}
-}
-
-func TestResolveRefsAttachmentKinds(t *testing.T) {
-	temp := t.TempDir()
-	attachmentsDir := filepath.Join(temp, ".reasonix", "attachments")
-	if err := os.MkdirAll(attachmentsDir, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	ymlRef := filepath.ToSlash(".reasonix/attachments/config.yml")
-	zipRef := filepath.ToSlash(".reasonix/attachments/archive.zip")
-	pngRef := filepath.ToSlash(".reasonix/attachments/shot.png")
-	if err := os.WriteFile(filepath.Join(temp, filepath.FromSlash(ymlRef)), []byte("name: reasonix\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(temp, filepath.FromSlash(zipRef)), []byte{'P', 'K', 0x03, 0x04, 0x00}, 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(temp, filepath.FromSlash(pngRef)), []byte("\x89PNG\r\n\x1a\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-
-	oldCwd, err := os.Getwd()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Chdir(temp); err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() {
-		if err := os.Chdir(oldCwd); err != nil {
-			t.Error(err)
-		}
-	})
-
-	line := "check @" + ymlRef + " @" + zipRef + " @" + pngRef
-	block, errs := (&Controller{}).ResolveRefs(context.Background(), line)
-	if len(errs) != 0 {
-		t.Fatalf("ResolveRefs errors = %v", errs)
-	}
-	if !strings.Contains(block, `<file path="`+ymlRef+`">`) || !strings.Contains(block, "name: reasonix") {
-		t.Fatalf("expected yml attachment to resolve as file content, got: %s", block)
-	}
-	if !strings.Contains(block, `<file path="`+zipRef+`">`) || !strings.Contains(block, "[binary file "+zipRef) {
-		t.Fatalf("expected zip attachment to resolve as binary file note, got: %s", block)
-	}
-	if !strings.Contains(block, `<image path="`+pngRef+`">`) {
-		t.Fatalf("expected png attachment to resolve as image block, got: %s", block)
-	}
-	if !strings.Contains(block, "OCR/image/vision tool") || !strings.Contains(block, "image bytes are not inlined") {
-		t.Fatalf("expected image attachment note to mention tool-readable path without inlined bytes, got: %s", block)
 	}
 }
 
@@ -772,7 +807,7 @@ func TestWorkspaceImageRefsAlsoAttachAsModelImages(t *testing.T) {
 	}
 
 	writeVisionTestConfig(t, workspace)
-	c := &Controller{workspaceRoot: workspace, modelRef: "custom/vision-pro"}
+	c := &Controller{workspaceRoot: workspace, selection: modelSelection{ref: "custom/vision-pro"}}
 	refs := c.detectRefs("see @" + diagram + " @" + attachment)
 	if len(refs) != 2 {
 		t.Fatalf("detectRefs = %+v, want two refs", refs)
@@ -788,8 +823,8 @@ func TestWorkspaceImageRefsAlsoAttachAsModelImages(t *testing.T) {
 	if len(errs) != 0 {
 		t.Fatalf("ResolveRefs errors = %v", errs)
 	}
-	if !strings.Contains(block, `<file path="docs/diagram.png">`) || !strings.Contains(block, "sent as direct model image input only when the selected model supports vision") || !strings.Contains(block, "OCR/image/vision tool") {
-		t.Fatalf("workspace png should resolve as direct-vision-or-tool image metadata:\n%s", block)
+	if !strings.Contains(block, `<file path="docs/diagram.png">`) || !strings.Contains(block, "attached as visual input") || strings.Contains(block, "OCR/image/vision tool") {
+		t.Fatalf("workspace png on a vision model should ask the model to look at the image, not OCR it:\n%s", block)
 	}
 	if urls := c.inputImages("see @" + diagram); len(urls) != 1 || !strings.HasPrefix(urls[0], "data:image/png;base64,") {
 		t.Fatalf("workspace png inputImages = %v, want one png data URL", urls)
@@ -803,12 +838,12 @@ func TestResolveRefsWithoutWorkspaceDoesNotClaimImageAttachment(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	block, errs := New(Options{}).ResolveRefs(context.Background(), "see @"+imagePath)
-	if len(errs) != 0 {
-		t.Fatalf("ResolveRefs errors = %v", errs)
+	block, errs := newOwnedTestController(t, Options{}).ResolveRefs(context.Background(), "see @"+imagePath)
+	if len(errs) != 1 || !strings.Contains(errs[0], "workspace root is required") {
+		t.Fatalf("ResolveRefs errors = %v, want an explicit unscoped-image error", errs)
 	}
-	if !strings.Contains(block, "not sent as direct model image input") || !strings.Contains(block, "OCR/image/vision tool") {
-		t.Fatalf("unscoped image ref should not claim model image attachment:\n%s", block)
+	if strings.Contains(block, "attached as visual input") {
+		t.Fatalf("unscoped image ref claimed model image attachment:\n%s", block)
 	}
 }
 

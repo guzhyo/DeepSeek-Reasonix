@@ -12,13 +12,63 @@ export interface TodoPanelScopeInput {
   eventChannel?: string | null;
 }
 
+export type TodoPresentationStatus = "pending" | "in_progress" | "waiting" | "paused" | "completed";
+
+export interface TodoRuntimePresentation {
+  running: boolean;
+  pendingPrompt: boolean;
+}
+
+export function todoPresentationStatus(
+  status: Todo["status"],
+  runtime: TodoRuntimePresentation,
+): TodoPresentationStatus {
+  switch (todoStatus(status)) {
+    case "completed":
+      return "completed";
+    case "in_progress":
+      if (runtime.pendingPrompt) return "waiting";
+      return runtime.running ? "in_progress" : "paused";
+    default:
+      return "pending";
+  }
+}
+
+export function todoContinueTarget(
+  targetTabId: string | null | undefined,
+  activeTabId: string | null | undefined,
+  runtime: TodoRuntimePresentation & { ready: boolean; readOnly?: boolean },
+): string | null {
+  const target = String(targetTabId ?? "").trim();
+  if (!target || target !== String(activeTabId ?? "").trim()) return null;
+  if (!runtime.ready || runtime.readOnly || runtime.running || runtime.pendingPrompt) return null;
+  return target;
+}
+
+export function resolveTodoPanelTodos(
+	canonical: Todo[] | null | undefined,
+): Todo[] {
+	if (Array.isArray(canonical)) return canonical;
+	return [];
+}
+
+export function sameTodoList(a: Todo[] | null | undefined, b: Todo[] | null | undefined): boolean {
+  if (a === b) return true;
+  if (!Array.isArray(a) || !Array.isArray(b) || a.length !== b.length) return false;
+  return a.every((todo, index) => {
+    const other = b[index];
+    return (
+      todo.content === other.content &&
+      todo.status === other.status
+    );
+  });
+}
+
 export function todoDismissalKey(todos: Todo[]): string {
   if (todos.length === 0) return "";
   return JSON.stringify(todos.map((todo) => ({
     content: String(todo.content ?? ""),
     status: todoStatus(todo.status),
-    activeForm: String(todo.activeForm ?? ""),
-    level: typeof todo.level === "number" ? todo.level : 0,
   })));
 }
 
@@ -55,7 +105,6 @@ export function todoBatchKey(todos: Todo[]): string {
   if (todos.length === 0) return "";
   return JSON.stringify(todos.map((todo) => ({
     content: String(todo.content ?? ""),
-    level: typeof todo.level === "number" ? todo.level : 0,
   })));
 }
 
@@ -67,17 +116,18 @@ export function scopedTodoBatchKey(scope: string | null | undefined, batchKey: s
 }
 
 export function shouldShowTodoPanel(
-  todoKey: string | null | undefined,
-  dismissedTodoKey: string | null,
-  todos: Todo[],
+	todoKey: string | null | undefined,
+	dismissedTodoKey: string | null,
+	todos: Todo[],
 ): boolean {
   if (!todoKey || todos.length === 0) return false;
   if (hasIncompleteTodos(todos)) return true;
-  return todoKey !== dismissedTodoKey;
+  if (todoKey === dismissedTodoKey) return false;
+	return true;
 }
 
-export function shouldOpenTodoPanelByDefault(todos: Todo[]): boolean {
-  return hasIncompleteTodos(todos);
+export function shouldOpenTodoPanelByDefault(): boolean {
+  return false;
 }
 
 function todoStatus(status: unknown): string {

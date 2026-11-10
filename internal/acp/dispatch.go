@@ -4,15 +4,20 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
 	"unicode/utf8"
 
+	"reasonix/internal/agent"
 	"reasonix/internal/control"
 	"reasonix/internal/event"
+	"reasonix/internal/eventwire"
 	"reasonix/internal/permission"
 	"reasonix/internal/provider"
+	"reasonix/internal/shellparse"
+	"reasonix/internal/tool"
 )
 
 // notifier is the slice of Conn the dispatch sink depends on: it pushes
@@ -47,15 +52,33 @@ const maxResultChars = 8000
 type updateSink struct {
 	conn      notifier
 	sessionID string
-	approve   func(id string, allow, session, persist bool)
-	answer    func(id string, answers []event.AskAnswer)
-	mu        sync.Mutex
-	turnCtx   context.Context
+	// cwd resolves relative tool-arg paths for tool_call locations. Set once
+	// via bindCwd before the sink receives events.
+	cwd                     string
+	approve                 func(id string, allow, session, persist bool)
+	answer                  func(id string, answers []event.AskAnswer)
+	mcpInteractionSupported bool
+	answerMCPInteraction    func(string, string, map[string]any) error
+	status                  func(event.Event)
+	// extensionSurface records the client's negotiated
+	// reasonix.extensionSurface support: structured surfaces go out as vendor
+	// session/update payloads on top of the always-sent text fallback.
+	extensionSurface bool
+	// speculativeToolIDs tracks parent-sampling tool IDs published under the
+	// active stream_attempt (attempt-scoped partials only). Guarded by mu —
+	// parent sampling and background sub-agents may Emit concurrently.
+	speculativeToolIDs map[string]struct{}
+	activeAttemptID    string
+	mu                 sync.Mutex
+	turnCtx            context.Context
 }
 
 func newUpdateSink(conn notifier, sessionID string) *updateSink {
 	return &updateSink{conn: conn, sessionID: sessionID}
 }
+
+// bindCwd installs the session root used to absolutize tool_call locations.
+func (s *updateSink) bindCwd(cwd string) { s.cwd = cwd }
 
 // bindApprove installs the controller's Approve callback, called by the service
 // once the controller exists (the sink is built first, to hand to the Factory).
@@ -72,6 +95,14 @@ func (s *updateSink) bindApprove(fn func(id string, allow, session, persist bool
 func (s *updateSink) bindAnswer(fn func(id string, answers []event.AskAnswer)) {
 	s.answer = fn
 }
+
+// bindStatus installs the vendor-status observer. It receives typed events,
+// never raw reasoning text or terminal transcripts.
+func (s *updateSink) bindStatus(fn func(event.Event)) { s.status = fn }
+
+// bindExtensionSurface records whether the client negotiated structured
+// extension-surface support in the initialize handshake.
+func (s *updateSink) bindExtensionSurface(supported bool) { s.extensionSurface = supported }
 
 func (s *updateSink) setTurnContext(ctx context.Context) {
 	s.mu.Lock()
@@ -98,6 +129,9 @@ func (s *updateSink) currentTurnContext() context.Context {
 // Emit implements event.Sink. The agent calls it serially (see event.Sink), so no
 // locking is needed; write serialization lives in Conn.
 func (s *updateSink) Emit(e event.Event) {
+	if s.status != nil {
+		s.status(e)
+	}
 	switch e.Kind {
 	case event.Reasoning:
 		if e.Text == "" {
@@ -111,12 +145,31 @@ func (s *updateSink) Emit(e event.Event) {
 		}
 		s.send(messageChunk{SessionUpdate: "agent_message_chunk", Content: textBlock(e.Text)})
 
+	case event.StreamAttempt:
+		// Attempt bookkeeping only. ACP still skips partial ToolDispatch (no
+		// pending card until full args arrive after commit), so discard must not
+		// invent failures for unpublished IDs. Full dispatches and parentId
+		// nested tools are real work and are never speculative.
+		s.mu.Lock()
+		switch e.StreamAttempt.Action {
+		case event.StreamAttemptBegin:
+			s.activeAttemptID = e.StreamAttempt.ID
+			s.speculativeToolIDs = nil
+		case event.StreamAttemptCommit, event.StreamAttemptDiscard:
+			s.activeAttemptID = ""
+			s.speculativeToolIDs = nil
+		}
+		s.mu.Unlock()
+
 	case event.ToolDispatch:
-		// Skip the early (Partial) dispatch: it carries no args, and the full one
-		// that follows is the single pending tool_call the protocol expects.
-		if e.Tool.Partial {
+		// Skip the early (Partial) dispatch and later same-ID preview refresh: ACP
+		// expects one pending tool_call and has no file-diff update payload.
+		if e.Tool.Partial || e.Tool.Refreshed {
 			return
 		}
+		// Full dispatches only arrive after a committed sampling attempt (or from
+		// nested sub-agents). Never mark them speculative. A dispatch is still
+		// intent, so it cannot update the current todo projection.
 		s.send(toolCall{
 			SessionUpdate: "tool_call",
 			ToolCallID:    e.Tool.ID,
@@ -124,14 +177,23 @@ func (s *updateSink) Emit(e event.Event) {
 			Kind:          toolKindFor(e.Tool.Name),
 			Status:        "pending",
 			RawInput:      rawJSON(e.Tool.Args),
+			Locations:     s.toolLocations(e.Tool.Name, e.Tool.Args),
 		})
 
 	case event.ToolResult:
+		if e.Tool.TodoWritten {
+			s.send(planUpdate{SessionUpdate: "plan", Entries: planEntriesFromTodos(e.Tool.Todos)})
+		}
 		status := "completed"
 		text := e.Tool.Output
 		if e.Tool.Err != "" {
 			status = "failed"
 			text = e.Tool.Err
+		}
+		if e.Tool.ID != "" {
+			s.mu.Lock()
+			delete(s.speculativeToolIDs, e.Tool.ID)
+			s.mu.Unlock()
 		}
 		s.send(toolCallUpdateMsg{
 			SessionUpdate: "tool_call_update",
@@ -142,11 +204,17 @@ func (s *updateSink) Emit(e event.Event) {
 
 	case event.Notice:
 		// Surface warnings to the host as a message chunk so they're not lost;
-		// info-level notices stay out of band.
+		// generic info-level notices stay out of band. Completion uncertainty is
+		// a recoverable terminal result and is shown without warning severity.
 		if e.Level == event.LevelWarn && e.Text != "" {
 			s.send(messageChunk{
 				SessionUpdate: "agent_message_chunk",
 				Content:       textBlock("\n\n[warning] " + e.Text),
+			})
+		} else if e.Code == event.NoticeCodeCompletionUncertain && e.Text != "" {
+			s.send(messageChunk{
+				SessionUpdate: "agent_message_chunk",
+				Content:       textBlock("\n\n" + e.Text),
 			})
 		}
 
@@ -160,20 +228,102 @@ func (s *updateSink) Emit(e event.Event) {
 			})
 		}
 
-	case event.ApprovalRequest:
-		// The run loop is now blocked awaiting Approve(id, …). Do the
-		// client round-trip off the emit goroutine so Emit returns at once
-		// (the agent emits serially); the answer unblocks the loop.
-		turnCtx := s.currentTurnContext()
-		go s.requestPermission(turnCtx, e.Approval)
+	case event.ApprovalRequest, event.AskRequest, event.MCPInteractionRequest:
+		s.emitPrompt(e)
 
-	case event.AskRequest:
-		// ACP has no separate "ask the user a business question" method. Reuse
-		// the standard permission round-trip with the question options as choices;
-		// clients such as Zed already know how to render this interaction.
-		turnCtx := s.currentTurnContext()
-		go s.requestAsk(turnCtx, e.Ask)
+	case event.ExtensionSurface, event.ExtensionStatus:
+		s.emitExtension(e)
 	}
+}
+
+// emitExtension maps one extension structured-UI event onto ACP updates. A
+// client that negotiated reasonix.extensionSurface receives the structured DTO
+// (the shared eventwire JSON contract) in a vendor session/update variant;
+// every client — including that one, belt and suspenders — also receives the
+// flattened text fallback as an ordinary agent_message_chunk. Blocking
+// form/request prompts never arrive here: the hub routes those through
+// AskRequest, which already rides the session/request_permission round-trip.
+func (s *updateSink) emitExtension(e event.Event) {
+	p := e.Extension
+	if p == nil {
+		return
+	}
+	if s.extensionSurface {
+		if dto := eventwire.ToWireExtensionSurface(p); dto != nil {
+			s.send(extensionSurfaceUpdate{
+				SessionUpdate: extensionSurfaceUpdateKind,
+				Meta: map[string]any{
+					"reasonix.io": map[string]any{
+						"extensionSurface": dto,
+					},
+				},
+			})
+		}
+	}
+	text := extensionSurfaceText(p)
+	if text == "" {
+		return
+	}
+	prefix := "\n\n"
+	if extensionSeverityWarns(p) {
+		prefix += "[warning] "
+	}
+	s.send(messageChunk{SessionUpdate: "agent_message_chunk", Content: textBlock(prefix + text)})
+}
+
+// extensionSurfaceText flattens one extension surface payload to plain text
+// for clients without structured-surface support: status →
+// "[plugin] label: detail", card → title + body + fields, form → title +
+// message, notification → title + body.
+func extensionSurfaceText(p *event.ExtensionSurfacePayload) string {
+	var b strings.Builder
+	write := func(s string) {
+		if s == "" {
+			return
+		}
+		if b.Len() > 0 {
+			b.WriteString("\n")
+		}
+		b.WriteString(s)
+	}
+	switch {
+	case p.Status != nil:
+		line := "[" + p.PluginID + "] " + p.Status.Label
+		if p.Status.Detail != "" {
+			line += ": " + p.Status.Detail
+		}
+		write(line)
+	case p.Card != nil:
+		write(p.Card.Title)
+		body := p.Card.Text
+		if p.Card.Markdown != "" {
+			body = p.Card.Markdown
+		}
+		write(body)
+		for _, f := range p.Card.Fields {
+			write(f.Key + ": " + f.Value)
+		}
+	case p.Form != nil:
+		write(p.Form.Title)
+		write(p.Form.Message)
+	case p.Notification != nil:
+		write(p.Notification.Title)
+		write(p.Notification.Body)
+	}
+	return b.String()
+}
+
+// extensionSeverityWarns reports whether the payload carries a warn/error
+// severity, which earns the same "[warning] " prefix as event.Notice.
+func extensionSeverityWarns(p *event.ExtensionSurfacePayload) bool {
+	severity := ""
+	if p.Status != nil {
+		severity = p.Status.Severity
+	}
+	if p.Notification != nil {
+		severity = p.Notification.Severity
+	}
+	return severity == "warn" || severity == "error"
 }
 
 func (s *updateSink) send(update any) {
@@ -186,17 +336,32 @@ func (s *updateSink) send(update any) {
 // completed since it is history, not a live turn.
 func (s *updateSink) replay(msgs []provider.Message) {
 	for _, m := range msgs {
+		if agent.IsPinnedContextRevision(m) {
+			continue
+		}
 		switch m.Role {
 		case provider.RoleUser:
-			if m.Content != "" {
-				s.send(messageChunk{SessionUpdate: "user_message_chunk", Content: textBlock(m.Content)})
+			// Replay the user-authored view, not the persisted wire form:
+			// UserMessageText strips injected transient blocks (<response-language>
+			// etc.) and unwraps memory-compiler contracts, same as every other
+			// surface (#6882). A turn that was pure injection replays as nothing.
+			text := m.Content
+			if steer, ok := agent.SteerText(text); ok {
+				text = steer
+			} else {
+				text = agent.UserMessageText(m)
+			}
+			if text != "" {
+				s.send(messageChunk{SessionUpdate: "user_message_chunk", Content: textBlock(text)})
 			}
 		case provider.RoleAssistant:
 			if m.ReasoningContent != "" {
 				s.send(messageChunk{SessionUpdate: "agent_thought_chunk", Content: textBlock(m.ReasoningContent)})
 			}
-			if m.Content != "" {
-				s.send(messageChunk{SessionUpdate: "agent_message_chunk", Content: textBlock(m.Content)})
+			// Same display filter as live emission: goal markers and evidence
+			// blocks stay in history for parsing but never reach the client.
+			if display := agent.DisplayAssistantText(m.Content); display != "" {
+				s.send(messageChunk{SessionUpdate: "agent_message_chunk", Content: textBlock(display)})
 			}
 			for _, tc := range m.ToolCalls {
 				s.send(toolCall{
@@ -206,6 +371,7 @@ func (s *updateSink) replay(msgs []provider.Message) {
 					Kind:          toolKindFor(tc.Name),
 					Status:        "completed",
 					RawInput:      rawJSON(tc.Arguments),
+					Locations:     s.toolLocations(tc.Name, tc.Arguments),
 				})
 			}
 		case provider.RoleTool:
@@ -231,7 +397,10 @@ func (s *updateSink) requestPermission(ctx context.Context, a event.Approval) {
 	if a.Subject != "" {
 		title = a.Tool + " " + a.Subject
 	}
-	options := approvalOptions(a.Tool, a.Subject)
+	options := approvalOptions(a.Tool, a.Subject, a.Fresh)
+	if a.Kind == event.ApprovalKindWriteAccess || a.WriteAccess != nil {
+		options = writeAccessApprovalOptions()
+	}
 	params := PermissionRequestParams{
 		SessionID: s.sessionID,
 		ToolCall: PermissionToolCall{
@@ -239,23 +408,94 @@ func (s *updateSink) requestPermission(ctx context.Context, a event.Approval) {
 			Title:      title,
 			Kind:       toolKindFor(a.Tool),
 			Status:     "pending",
+			RawInput:   rawJSON(string(a.RawInput)),
+			Locations:  s.toolLocations(a.Tool, string(a.RawInput)),
+			Meta:       s.permissionMeta(a),
 		},
 		Options: options,
 	}
 
-	allow, session, persist := false, false, false
+	allow, session := false, false
 	if raw, err := s.conn.Request(ctx, "session/request_permission", params); err == nil {
 		var res PermissionRequestResult
 		if json.Unmarshal(raw, &res) == nil && res.Outcome.Outcome == "selected" {
-			switch PermissionOptionKind(res.Outcome.OptionID) {
-			case OptAllowOnce:
+			switch res.Outcome.OptionID {
+			case "reasonix_write_once":
 				allow = true
-			case OptAllowAlways:
+			case "reasonix_write_session":
+				allow, session = true, true
+			case "reasonix_write_deny":
+			case string(OptAllowOnce):
+				allow = true
+			case string(OptAllowAlways):
 				allow, session = true, true
 			}
 		}
 	}
-	s.approve(a.ID, allow, session, persist)
+	s.approve(a.ID, allow, session, false)
+}
+
+func writeAccessApprovalOptions() []PermissionOption {
+	return []PermissionOption{
+		{OptionID: "reasonix_write_once", Name: "Allow once", Kind: OptAllowOnce},
+		{OptionID: "reasonix_write_session", Name: "Allow these directories for this session", Kind: OptAllowAlways},
+		{OptionID: "reasonix_write_deny", Name: "Reject", Kind: OptRejectOnce},
+	}
+}
+
+// permissionMeta carries Reasonix-owned structured data that an ACP supervisor
+// may trust independently from model-supplied rawInput. A foreground bash call
+// receives argv only when the command is a single static command: shell
+// expansion, control operators, redirects, assignments, and background jobs are
+// omitted from this advisory argv field; execution still follows the active
+// permission preset and OS sandbox rather than the command's syntax shape.
+func (s *updateSink) permissionMeta(a event.Approval) map[string]any {
+	reasonix := map[string]any{
+		"approvalId": a.ID,
+		"tool":       a.Tool,
+		"subject":    a.Subject,
+		"fresh":      a.Fresh,
+	}
+	if reason := strings.TrimSpace(a.Reason); reason != "" {
+		reasonix["reason"] = reason
+	}
+	if wa := a.WriteAccess; wa != nil {
+		reasonix["kind"] = event.ApprovalKindWriteAccess
+		reasonix["directories"] = append([]string{}, wa.Directories...)
+		reasonix["displayDirectories"] = append([]string{}, wa.DisplayDirectories...)
+		reasonix["justification"] = wa.Justification
+		reasonix["broadHomeAccess"] = wa.BroadHomeAccess
+		reasonix["ordinaryPermissionNeeded"] = wa.OrdinaryPermissionNeeded
+		reasonix["persistAllowed"] = wa.PersistAllowed
+	}
+	if tool.IsShellToolName(a.Tool) && strings.TrimSpace(s.cwd) != "" {
+		var input struct {
+			Command                     string `json:"command"`
+			RunInBackground             bool   `json:"run_in_background"`
+			PreserveBackgroundProcesses bool   `json:"preserve_background_processes"`
+		}
+		if json.Unmarshal(a.RawInput, &input) == nil &&
+			!input.RunInBackground && !input.PreserveBackgroundProcesses {
+			cwd, cwdErr := filepath.Abs(s.cwd)
+			features, featureOK := shellparse.AnalyzeApprovalFeatures(input.Command)
+			command, commandErr := shellparse.ParseStaticCommand(input.Command, shellparse.StaticCommandPolicy{})
+			exact := featureOK && !features.DynamicCommandName && !features.NestedExecution &&
+				!features.Expansion && !features.Assignment && !features.Redirection &&
+				!shellparse.ContainsUnquotedGlob(input.Command)
+			for _, arg := range command.Argv {
+				// Tilde expansion is shell-dependent and therefore not exact argv.
+				if strings.HasPrefix(arg, "~") {
+					exact = false
+				}
+			}
+			if cwdErr == nil && commandErr == nil && exact && len(command.Argv) > 0 {
+				reasonix["commandSchemaVersion"] = 1
+				reasonix["argv"] = command.Argv
+				reasonix["cwd"] = cwd
+			}
+		}
+	}
+	return map[string]any{"reasonix.io": reasonix}
 }
 
 func (s *updateSink) requestAsk(ctx context.Context, a event.Ask) {
@@ -338,8 +578,8 @@ func approvalSessionOptionName(tool, subject string) string {
 	return "Allow " + sessionRule + " for this session"
 }
 
-func approvalOptions(tool, subject string) []PermissionOption {
-	if control.RequiresFreshHumanApprovalTool(tool) {
+func approvalOptions(tool, subject string, fresh bool) []PermissionOption {
+	if fresh || control.RequiresFreshHumanApprovalTool(tool) {
 		if tool == control.SandboxEscapeApprovalTool {
 			return []PermissionOption{
 				{OptionID: string(OptAllowOnce), Name: "Allow", Kind: OptAllowOnce},
@@ -398,7 +638,7 @@ func toolKindFor(name string) string {
 		return "search"
 	case "edit_file", "move_file", "multiedit", "write_file":
 		return "edit"
-	case "bash":
+	case "bash", "pwsh", "powershell", "shell":
 		return "execute"
 	case control.SandboxEscapeApprovalTool:
 		return "execute"
@@ -416,4 +656,68 @@ func toolKindFor(name string) string {
 	default:
 		return "other"
 	}
+}
+
+// locationTools names the builtin tools whose "path" argument is a real file
+// target worth a follow-along location. Search/list tools are excluded: their
+// path is a directory scope, not a file the user would want opened.
+var locationTools = map[string]bool{
+	"read_file":     true,
+	"write_file":    true,
+	"edit_file":     true,
+	"multi_edit":    true,
+	"notebook_edit": true,
+	"delete_range":  true,
+	"delete_symbol": true,
+	"code_index":    true,
+}
+
+// toolLocations derives the file location a tool call touches from its raw
+// args, so the client can follow along in the editor. Unknown tools and
+// path-less args yield nil.
+func (s *updateSink) toolLocations(name, rawArgs string) []ToolCallLocation {
+	if !locationTools[name] {
+		return nil
+	}
+	var p struct {
+		Path   string `json:"path"`
+		Offset int    `json:"offset"`
+	}
+	if json.Unmarshal([]byte(rawArgs), &p) != nil || strings.TrimSpace(p.Path) == "" {
+		return nil
+	}
+	loc := ToolCallLocation{Path: s.absPath(p.Path)}
+	// read_file's offset is a 0-based start line; surface it so the editor can
+	// jump to the region being read.
+	if name == "read_file" && p.Offset > 0 {
+		line := p.Offset + 1
+		loc.Line = &line
+	}
+	return []ToolCallLocation{loc}
+}
+
+func (s *updateSink) absPath(p string) string {
+	if filepath.IsAbs(p) || s.cwd == "" {
+		return p
+	}
+	return filepath.Join(s.cwd, p)
+}
+
+// planEntriesFromTodos maps the committed host projection onto ACP's complete
+// replacement plan. Empty input deliberately clears the client plan.
+func planEntriesFromTodos(todos []event.Todo) []PlanEntry {
+	entries := make([]PlanEntry, 0, len(todos))
+	for _, t := range todos {
+		if strings.TrimSpace(t.Content) == "" {
+			continue
+		}
+		status := t.Status
+		switch status {
+		case "pending", "in_progress", "completed":
+		default:
+			status = "pending"
+		}
+		entries = append(entries, PlanEntry{Content: t.Content, Priority: "medium", Status: status})
+	}
+	return entries
 }

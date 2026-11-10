@@ -10,6 +10,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"reasonix/internal/secrets"
 )
 
 func TestFormatSectionSortsAndRedacts(t *testing.T) {
@@ -249,7 +251,7 @@ func TestRunProbesCacheSeparatesOverrides(t *testing.T) {
 func TestFormatSectionLimitsToolOutput(t *testing.T) {
 	overrides := map[string]string{}
 	var results []ProbeResult
-	for i := 0; i < maxRenderedTools+2; i++ {
+	for i := range maxRenderedTools + 2 {
 		name := fmt.Sprintf("tool%02d", i)
 		overrides[name] = "/bin/" + name
 		results = append(results, ProbeResult{Binary: name, Found: true, Output: "ok"})
@@ -351,4 +353,31 @@ func setProbeTimeoutForTest(t *testing.T, timeout time.Duration) {
 		probeTimeout = ProbeTimeout
 		probeCacheMu.Unlock()
 	})
+}
+
+func TestRunProbesFilterSubprocessEnv(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX shell probe tool")
+	}
+	resetProbeCacheForTest(t, time.Unix(90, 0))
+	setProbeTimeoutForTest(t, 10*time.Second)
+	dir := t.TempDir()
+	toolPath := filepath.Join(dir, "envtool")
+	body := "#!/bin/sh\nprintf 'tok=%s' \"${REASONIX_TEST_SECRET_TOKEN:-none}\"\n"
+	if err := os.WriteFile(toolPath, []byte(body), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("REASONIX_TEST_SECRET_TOKEN", "ghp_abcdefghijklmnopqrstuvwxyz")
+	secrets.SetFilterSubprocessEnv(true)
+	t.Cleanup(func() { secrets.SetFilterSubprocessEnv(false) })
+
+	results := RunProbesWithOverrides(context.Background(), []string{"envtool --version"}, map[string]string{"envtool": toolPath})
+	if len(results) != 1 || !results[0].Found {
+		t.Fatalf("probe result = %+v", results)
+	}
+	// Probes declaring no extra env of their own must still get the filtered
+	// environment, not inherit the full one.
+	if results[0].Output != "tok=none" {
+		t.Fatalf("probe leaked filtered env: output = %q", results[0].Output)
+	}
 }

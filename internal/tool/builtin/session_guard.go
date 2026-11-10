@@ -55,6 +55,11 @@ func (g SessionDataGuard) Check(target string) error {
 	if err != nil {
 		return nil // can't resolve -> let the caller's normal error path handle it
 	}
+	if g.deniesSecurity(abs) {
+		return fmt.Errorf("path %q is a Reasonix security boundary file (%s holds the global hooks; hooks execute arbitrary shell commands on every future session). Agents may not modify it. "+
+			"Ask the user to edit it themselves, or to add the directory to [sandbox] allow_write in reasonix.toml if raw access is truly intended",
+			target, g.stateRoot)
+	}
 	if !g.denies(abs) {
 		return nil
 	}
@@ -63,12 +68,42 @@ func (g SessionDataGuard) Check(target string) error {
 		target, g.stateRoot)
 }
 
+// securityStateFile reports whether name (a state-root-direct file name,
+// already case-folded when the platform folds) is a security boundary rather
+// than a mere runtime ledger. settings.json defines the global hooks:
+// arbitrary shell commands executed on harness events in every project.
+func securityStateFile(name string) bool {
+	switch name {
+	case "settings.json":
+		return true
+	}
+	return false
+}
+
+// deniesSecurity reports whether abs (absolute, symlink-free) is a state-root-
+// direct security boundary file (see securityStateFile) not covered by an
+// explicit allow_write root. Deny-side, so comparisons fold case on
+// case-insensitive platforms, mirroring denies.
+func (g SessionDataGuard) deniesSecurity(abs string) bool {
+	root, allow, target := foldGuardPaths(g.stateRoot, g.allowRoots, abs)
+	rel, err := filepath.Rel(root, target)
+	if err != nil || rel == "." || strings.Contains(rel, string(filepath.Separator)) {
+		return false
+	}
+	if !securityStateFile(rel) {
+		return false
+	}
+	return !allowLiftsProtected(allow, target, filepath.Join(root, rel))
+}
+
 // runtimeStateFile reports whether name (a state-root-direct file name, already
 // case-folded when the platform folds) is a desktop runtime ledger the app
 // rewrites wholesale while running — quit snapshots, topic-index rebuilds,
 // periodic flushes — so an agent edit vanishes the same way a session-file edit
 // does. config.toml / credentials / skills stay writable: editing those on the
-// user's request is a legitimate flow with no autonomous rewriter racing it.
+// user's request is a legitimate flow with no autonomous rewriter racing it —
+// but settings.json is a security boundary, not a ledger, and is denied
+// separately by securityStateFile.
 // heartbeat-tasks.json stays writable too — it is documented as human- and
 // AI-editable (desktop/heartbeat.go, and the heartbeat panel tip says "AI
 // agents can also edit heartbeat-tasks.json"), so the product explicitly
@@ -91,43 +126,60 @@ func runtimeStateFile(name string) bool {
 // volumes ~/.reasonix/SESSIONS reaches the very same files (the same shape as
 // the Windows lease-key case split fixed in #6023).
 func (g SessionDataGuard) denies(abs string) bool {
-	root := g.stateRoot
-	allow := g.allowRoots
-	if foldPaths {
-		abs = strings.ToLower(abs)
-		root = strings.ToLower(root)
-		folded := make([]string, len(allow))
-		for i, a := range allow {
-			folded[i] = strings.ToLower(a)
-		}
-		allow = folded
+	root, allow, target := foldGuardPaths(g.stateRoot, g.allowRoots, abs)
+	if prot := filepath.Join(root, "sessions"); within(prot, target) {
+		return !allowLiftsProtected(allow, target, prot)
 	}
-	for _, a := range allow {
-		if within(a, abs) {
-			return false
-		}
-	}
-	if within(filepath.Join(root, "sessions"), abs) {
-		return true
-	}
-	// State-root-direct runtime ledgers (desktop-tabs.json & friends).
-	if rel, err := filepath.Rel(root, abs); err == nil && rel != "." && !strings.Contains(rel, string(filepath.Separator)) {
+	if rel, err := filepath.Rel(root, target); err == nil && rel != "." && !strings.Contains(rel, string(filepath.Separator)) {
 		if runtimeStateFile(rel) {
-			return true
+			return !allowLiftsProtected(allow, target, filepath.Join(root, rel))
 		}
 	}
-	// <state root>/projects/<slug>/sessions/** — every per-project store, so
-	// the slug segment is matched positionally rather than enumerated.
 	projects := filepath.Join(root, "projects")
-	if !within(projects, abs) {
+	if !within(projects, target) {
 		return false
 	}
-	rel, err := filepath.Rel(projects, abs)
+	rel, err := filepath.Rel(projects, target)
 	if err != nil {
 		return false
 	}
 	parts := strings.Split(rel, string(filepath.Separator))
-	return len(parts) >= 2 && parts[1] == "sessions"
+	if len(parts) == 2 && parts[1] == ".workspace-root" {
+		return !allowLiftsProtected(allow, target, filepath.Join(projects, parts[0], ".workspace-root"))
+	}
+	if len(parts) < 2 || parts[1] != "sessions" {
+		return false
+	}
+	return !allowLiftsProtected(allow, target, filepath.Join(projects, parts[0], "sessions"))
+}
+
+func foldGuardPaths(stateRoot string, allowRoots []string, abs string) (root string, allow []string, target string) {
+	root, allow, target = stateRoot, allowRoots, abs
+	if !foldPaths {
+		return root, allow, target
+	}
+	target = strings.ToLower(target)
+	root = strings.ToLower(root)
+	folded := make([]string, len(allow))
+	for i, a := range allow {
+		folded[i] = strings.ToLower(a)
+	}
+	return root, folded, target
+}
+
+// allowLiftsProtected reports whether an explicit allow_write root lifts
+// protection for target. The allow root must itself sit inside protectedRoot;
+// an ancestor such as $HOME does not lift.
+func allowLiftsProtected(allowRoots []string, target, protectedRoot string) bool {
+	if protectedRoot == "" {
+		return false
+	}
+	for _, allow := range allowRoots {
+		if within(allow, target) && within(protectedRoot, allow) {
+			return true
+		}
+	}
+	return false
 }
 
 // CommandHint returns a warning to append to bash output when the command
@@ -217,8 +269,12 @@ func sessionHintNeedles(rawRoot, realRoot string, allowRoots []string) []string 
 		for _, sub := range []string{"sessions", "projects", "desktop-", "metrics-pending.json", "crash-pending.json"} {
 			tree := filepath.Join(prefix, sub)
 			if covered := func() bool {
+				tree := filepath.Join(realRoot, sub)
 				for _, a := range allowRoots {
-					if withinFold(a, filepath.Join(realRoot, sub)) {
+					if withinFold(a, tree) && withinFold(tree, a) {
+						return true
+					}
+					if withinFold(tree, a) {
 						return true
 					}
 				}

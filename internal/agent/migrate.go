@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	fileencoding "reasonix/internal/fileutil/encoding"
 	"reasonix/internal/provider"
 )
 
@@ -31,8 +32,9 @@ type legacyEvent struct {
 type legacyToolCall struct {
 	ID       string `json:"id"`
 	Function struct {
-		Name      string `json:"name"`
-		Arguments string `json:"arguments"`
+		Name             string `json:"name"`
+		Arguments        string `json:"arguments"`
+		ThoughtSignature string `json:"thought_signature"`
 	} `json:"function"`
 }
 
@@ -192,7 +194,10 @@ func migrateLegacySessionsWithMarkers(srcDir, globalDest, marker, jsonlMarker st
 			continue
 		}
 		s := &Session{Messages: msgs}
-		if err := s.Save(dest); err != nil {
+		if err := s.SaveIfAbsent(dest); err != nil {
+			if errors.Is(err, os.ErrExist) {
+				continue
+			}
 			return imported, err
 		}
 		if eventsInfo != nil {
@@ -458,7 +463,10 @@ func migrateSubDirectory(subDir, globalDest string, projectDir func(string) stri
 				continue
 			}
 			s := &Session{Messages: msgs}
-			if err := s.Save(dest); err != nil {
+			if err := s.SaveIfAbsent(dest); err != nil {
+				if errors.Is(err, os.ErrExist) {
+					continue
+				}
 				return imported, err
 			}
 		} else if isNativeSessionEventLog(SessionEventLogPath(srcPath)) {
@@ -508,7 +516,7 @@ func saveNativeSessionCopy(src, dst string) error {
 	if err != nil {
 		return err
 	}
-	return session.Save(dst)
+	return session.SaveIfAbsent(dst)
 }
 
 func fileExists(path string) bool {
@@ -529,8 +537,9 @@ type legacyAssistantMsg struct {
 type legacyToolCallObj struct {
 	ID       string `json:"id"`
 	Function struct {
-		Name      string `json:"name"`
-		Arguments string `json:"arguments"`
+		Name             string `json:"name"`
+		Arguments        string `json:"arguments"`
+		ThoughtSignature string `json:"thought_signature"`
 	} `json:"function"`
 }
 
@@ -588,9 +597,10 @@ func transformAndCopyJsonl(src, dst string) error {
 		flatCalls := make([]provider.ToolCall, len(legacyCalls))
 		for i, tc := range legacyCalls {
 			flatCalls[i] = provider.ToolCall{
-				ID:        tc.ID,
-				Name:      tc.Function.Name,
-				Arguments: tc.Function.Arguments,
+				ID:               tc.ID,
+				Name:             tc.Function.Name,
+				Arguments:        tc.Function.Arguments,
+				ThoughtSignature: tc.Function.ThoughtSignature,
 			}
 		}
 		// Re-serialize the full message with flat tool_calls. We only modify
@@ -618,7 +628,7 @@ func transformAndCopyJsonl(src, dst string) error {
 	if err := tmp.Close(); err != nil {
 		return err
 	}
-	if err := os.Rename(tmpPath, dst); err != nil {
+	if err := publishFileNoReplace(tmpPath, dst); err != nil {
 		return err
 	}
 	ok = true
@@ -629,7 +639,7 @@ func transformAndCopyJsonl(src, dst string) error {
 // sidecars yield the zero value (session routes to the global dir, untitled).
 func readLegacyMeta(srcDir, base string) legacyMeta {
 	var m legacyMeta
-	b, err := os.ReadFile(filepath.Join(srcDir, base+".meta.json"))
+	b, err := fileencoding.ReadFileUTF8(filepath.Join(srcDir, base+".meta.json"))
 	if err != nil {
 		return m
 	}
@@ -644,25 +654,25 @@ func dirExists(path string) bool {
 	return err == nil && info.IsDir()
 }
 
-// moveFlatImport re-homes a session the flat import left in the global dir.
-// The legacy event log's mtime was stamped onto the imported file, so a match
-// identifies it; a same-named native v1+ session never matches and stays put.
-func moveFlatImport(oldPath, newPath string, srcInfo os.FileInfo) bool {
-	if srcInfo == nil {
-		return false
+// publishFileNoReplace atomically publishes a completed sibling temp file
+// without replacing a destination another startup/import writer created.
+// The temp and destination share a directory, so a hard link is atomic and
+// portable across the filesystems Reasonix supports.
+func publishFileNoReplace(tmp, dst string) error {
+	if err := linkFileNoReplace(tmp, dst); err != nil {
+		return err
 	}
-	info, err := os.Stat(oldPath)
-	if err != nil {
-		return false
+	return os.Remove(tmp)
+}
+
+func linkFileNoReplace(src, dst string) error {
+	if err := os.Link(src, dst); err != nil {
+		if os.IsExist(err) {
+			return os.ErrExist
+		}
+		return err
 	}
-	d := info.ModTime().Sub(srcInfo.ModTime())
-	if d < -2*time.Second || d > 2*time.Second {
-		return false
-	}
-	if err := os.MkdirAll(filepath.Dir(newPath), 0o755); err != nil {
-		return false
-	}
-	return os.Rename(oldPath, newPath) == nil
+	return nil
 }
 
 // recordImportedTitle stores the legacy summary as the session's display title
@@ -674,7 +684,7 @@ func recordImportedTitle(destDir, base, summary string) {
 	}
 	path := filepath.Join(destDir, ".titles.json")
 	titles := map[string]string{}
-	if b, err := os.ReadFile(path); err == nil {
+	if b, err := fileencoding.ReadFileUTF8(path); err == nil {
 		_ = json.Unmarshal(b, &titles)
 	}
 	key := base + ".jsonl"
@@ -973,7 +983,10 @@ func reconstructSession(path string) ([]provider.Message, error) {
 		case "model.final":
 			m := provider.Message{Role: provider.RoleAssistant, Content: e.Content, ReasoningContent: e.ReasoningContent}
 			for _, tc := range e.ToolCalls {
-				m.ToolCalls = append(m.ToolCalls, provider.ToolCall{ID: tc.ID, Name: tc.Function.Name, Arguments: tc.Function.Arguments})
+				m.ToolCalls = append(m.ToolCalls, provider.ToolCall{
+					ID: tc.ID, Name: tc.Function.Name, Arguments: tc.Function.Arguments,
+					ThoughtSignature: tc.Function.ThoughtSignature,
+				})
 				toolName[tc.ID] = tc.Function.Name
 			}
 			msgs = append(msgs, m)

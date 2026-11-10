@@ -9,6 +9,7 @@ import (
 	"reasonix/internal/agent"
 	"reasonix/internal/event"
 	"reasonix/internal/provider"
+	"reasonix/internal/session"
 )
 
 // TestCompactRefusedWhileRunning locks in the same guard Rewind/Branch have:
@@ -19,7 +20,7 @@ func TestCompactRefusedWhileRunning(t *testing.T) {
 	sess := agent.NewSession("sys")
 	sess.Add(provider.Message{Role: provider.RoleUser, Content: "hi"})
 	exec := agent.New(nil, nil, sess, agent.Options{}, event.Discard)
-	c := New(Options{
+	c := newOwnedTestController(t, Options{
 		Executor:   exec,
 		SessionDir: t.TempDir(),
 		Label:      "test",
@@ -27,7 +28,7 @@ func TestCompactRefusedWhileRunning(t *testing.T) {
 	})
 
 	c.mu.Lock()
-	c.running = true
+	c.turns.phase = session.RuntimeRunning
 	c.mu.Unlock()
 
 	err := c.Compact(context.Background(), "")
@@ -52,10 +53,8 @@ func TestRewindConcurrentWithHistoryReads(t *testing.T) {
 
 	stop := make(chan struct{})
 	var wg sync.WaitGroup
-	for i := 0; i < 4; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+	for range 4 {
+		wg.Go(func() {
 			for {
 				select {
 				case <-stop:
@@ -65,7 +64,7 @@ func TestRewindConcurrentWithHistoryReads(t *testing.T) {
 					_ = c.CheckpointHasBoundary(lastTurn)
 				}
 			}
-		}()
+		})
 	}
 
 	err := c.Rewind(lastTurn, RewindConversation)

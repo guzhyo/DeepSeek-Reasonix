@@ -2,14 +2,20 @@ package config
 
 import (
 	"fmt"
+	"slices"
 	"strings"
 
+	"reasonix/internal/provider"
+	_ "reasonix/internal/provider/anthropic"
 	"reasonix/internal/provider/openai"
+	_ "reasonix/internal/provider/responses"
 )
 
 const (
 	ReasoningProtocolAuto     = "auto"
 	ReasoningProtocolDeepSeek = "deepseek"
+	ReasoningProtocolGLM      = "glm"
+	ReasoningProtocolKimiK3   = "kimi-k3"
 	ReasoningProtocolOpenAI   = "openai"
 	ReasoningProtocolNone     = "none"
 )
@@ -22,194 +28,68 @@ type EffortCapability struct {
 	Default   string
 }
 
-type modelReasoningCapability struct {
-	Protocol string
-	Levels   []string
-	Default  string
-}
+type modelReasoningCapability struct{ Protocol string }
 
 var modelReasoningCapabilities = map[string]modelReasoningCapability{
-	"deepseek-v4-flash": {Protocol: ReasoningProtocolDeepSeek, Levels: []string{"disabled", "high", "max"}, Default: "high"},
-	"deepseek-v4-pro":   {Protocol: ReasoningProtocolDeepSeek, Levels: []string{"disabled", "high", "max"}, Default: "high"},
+	"deepseek-v4-flash": {Protocol: ReasoningProtocolDeepSeek},
+	"deepseek-v4-pro":   {Protocol: ReasoningProtocolDeepSeek},
 }
 
 // EffortCapabilityForEntry returns the user-facing /effort levels for a resolved
 // provider entry. Provider implementations still decide how a stored effort is
 // serialized into requests.
-func EffortCapabilityForEntry(e *ProviderEntry) EffortCapability {
-	if explicitReasoningProtocol(e) == ReasoningProtocolNone {
-		return EffortCapability{}
+func ReasoningCapabilityForEntry(e *ProviderEntry) provider.ReasoningCapability {
+	e = ResolveReasoningEntry(e)
+	if e == nil {
+		return provider.ReasoningOptions("")
 	}
-	supported := normalizedSupportedEfforts(e)
-	if len(supported) > 0 {
-		levels := make([]string, 0, len(supported)+1)
-		levels = append(levels, "auto")
-		levels = append(levels, supported...)
-		def := normalizeEffortLevel(e.DefaultEffort)
-		if def == "" || !containsString(supported, def) {
-			def = supported[0]
+	// Resolver-backed entries carry the remote adapter declaration, not a local kind.
+	if e.Kind == "" {
+		if e.ReasoningMetadataUnknown && len(e.SupportedEfforts) == 0 {
+			cap := provider.UnknownReasoning()
+			cap.Default = e.DefaultEffort
+			return cap
 		}
-		return EffortCapability{Supported: true, Levels: levels, Default: def}
+		return provider.ReasoningOptions(e.DefaultEffort, e.SupportedEfforts...)
 	}
-	switch explicitReasoningProtocol(e) {
-	case ReasoningProtocolDeepSeek:
-		return deepSeekEffortCapability()
-	case ReasoningProtocolOpenAI:
-		return openAIEffortCapability()
-	}
-	if cap, ok := resolvedModelReasoningCapability(e); ok {
-		return effortCapabilityFromModel(cap)
-	}
-	switch ReasoningProtocolForEntry(e) {
-	case ReasoningProtocolDeepSeek:
-		return deepSeekEffortCapability()
-	case ReasoningProtocolOpenAI:
-		return openAIEffortCapability()
-	}
-	switch {
-	case isMiniMaxEntry(e):
-		// MiniMax-M3 only exposes a binary thinking knob (adaptive|disabled)
-		// on its OpenAI-compatible endpoint, so /effort mirrors the API
-		// vocabulary verbatim. Default is "adaptive" because the M3 model
-		// runs with thinking on out of the box; "auto" means "don't override
-		// the model default" (== adaptive for M3).
-		return EffortCapability{Supported: true, Levels: []string{"auto", "adaptive", "disabled"}, Default: "adaptive"}
-	case isZhipuEntry(e):
-		// Zhipu GLM exposes a binary thinking knob (enabled|disabled) on its
-		// OpenAI-compatible endpoint and ignores reasoning_effort, so /effort
-		// mirrors that vocabulary. Default is "enabled" because GLM runs with
-		// thinking on out of the box; "auto" means "don't override the model
-		// default" (== enabled for GLM).
-		return EffortCapability{Supported: true, Levels: []string{"auto", "enabled", "disabled"}, Default: "enabled"}
-	case isLongCatEntry(e):
-		// LongCat exposes the same binary thinking vocabulary on its
-		// OpenAI-compatible endpoint and documents no reasoning_effort depth scale.
-		return EffortCapability{Supported: true, Levels: []string{"auto", "enabled", "disabled"}, Default: "enabled"}
-	case isOllamaCloudEntry(e):
-		// Ollama Cloud accepts top-level reasoning_effort values low|medium|
-		// high|max. "none" means omit the field so the hosted model runs without
-		// thinking. Leave auto as the default so existing traffic stays provider-
-		// default until the user chooses an effort explicitly.
-		return EffortCapability{Supported: true, Levels: []string{"auto", "none", "low", "medium", "high", "max"}, Default: "auto"}
-	case e != nil && e.Kind == "anthropic":
-		return EffortCapability{Supported: true, Levels: []string{"auto", "low", "medium", "high", "xhigh", "max"}, Default: "auto"}
-	default:
+	cfg := provider.Config{Name: e.Name, BaseURL: e.BaseURL, Model: e.Model, Extra: map[string]any{
+		"thinking": e.Thinking, "reasoning_protocol": ReasoningProtocolForEntry(e),
+		"request_url": e.RequestURL, "chat_url": e.ChatURL,
+		"supported_efforts": normalizedSupportedEfforts(e), "default_effort": normalizeEffortLevel(e.DefaultEffort),
+	}}
+	return provider.ReasoningForConfig(e.Kind, cfg)
+}
+func EffortCapabilityForEntry(e *ProviderEntry) EffortCapability {
+	cap := ReasoningCapabilityForEntry(e)
+	if len(cap.Options) == 0 {
 		return EffortCapability{}
 	}
+	def := cap.Default
+	if def == "" {
+		def = "auto"
+	}
+	return EffortCapability{Supported: true, Levels: append([]string{"auto"}, cap.IDs()...), Default: def}
 }
 
 // NormalizeEffort maps a user-supplied /effort level into the value stored in
 // config. Empty means auto/provider default.
 func NormalizeEffort(e *ProviderEntry, raw string) (string, error) {
-	level := normalizeEffortLevel(raw)
-	if level == "" {
-		return "", fmt.Errorf("usage: /effort auto|<level>")
-	}
-	if level == "auto" {
+	// auto is the historical spelling for inheriting the provider default.
+	if raw == "auto" {
 		return "", nil
 	}
-	if explicitReasoningProtocol(e) == ReasoningProtocolNone {
-		return "", effortNotConfigurableError(e)
+	if raw == "" {
+		return "", fmt.Errorf("usage: /effort auto|<level>")
 	}
-	supported := normalizedSupportedEfforts(e)
-	if len(supported) > 0 {
-		if containsString(supported, level) {
-			return level, nil
-		}
-		return "", fmt.Errorf("usage: /effort auto|%s", strings.Join(supported, "|"))
+	cap := ReasoningCapabilityForEntry(e)
+	model := ""
+	if e != nil {
+		model = e.Model
 	}
-	switch ReasoningProtocolForEntry(e) {
-	case ReasoningProtocolDeepSeek:
-		switch level {
-		case "disabled":
-			return "disabled", nil
-		case "off": // retired DeepSeek "no thinking" → disabled
-			return "disabled", nil
-		case "high", "max":
-			return level, nil
-		case "low", "medium":
-			return "high", nil
-		case "xhigh":
-			return "max", nil
-		default:
-			return "", fmt.Errorf("usage: /effort auto|disabled|high|max")
-		}
-	case ReasoningProtocolOpenAI:
-		switch level {
-		case "low", "medium", "high":
-			return level, nil
-		default:
-			return "", fmt.Errorf("usage: /effort auto|low|medium|high")
-		}
+	if err := cap.Validate(model, raw); err != nil {
+		return "", err
 	}
-	switch {
-	case isMiniMaxEntry(e):
-		// The M3 knob is binary; map Anthropic / OpenAI-style levels onto the
-		// nearest valid value so a stale /effort high|low still works. "off"
-		// is a retired DeepSeek level meaning "no thinking" — on M3 that maps
-		// to "disabled" rather than the model default, since M3 actually
-		// supports a "thinking off" mode and "off" is the natural request.
-		switch level {
-		case "adaptive", "disabled":
-			return level, nil
-		case "off":
-			return "disabled", nil
-		case "low", "medium", "high":
-			return "adaptive", nil
-		case "xhigh", "max":
-			return "disabled", nil
-		default:
-			return "", fmt.Errorf("usage: /effort auto|adaptive|disabled")
-		}
-	case isZhipuEntry(e):
-		// GLM's knob is binary (enabled|disabled); map Anthropic / OpenAI-style
-		// depth levels onto the nearest valid value so a stale /effort high|low
-		// still works. "off" is a retired DeepSeek level meaning "no thinking",
-		// which maps to "disabled".
-		switch level {
-		case "enabled", "disabled":
-			return level, nil
-		case "off":
-			return "disabled", nil
-		case "low", "medium", "high", "xhigh", "max":
-			return "enabled", nil
-		default:
-			return "", fmt.Errorf("usage: /effort auto|enabled|disabled")
-		}
-	case isLongCatEntry(e):
-		// LongCat's knob is binary (enabled|disabled); depth-like aliases mean
-		// thinking on, while the legacy off spellings disable it.
-		switch level {
-		case "enabled", "disabled":
-			return level, nil
-		case "off":
-			return "disabled", nil
-		case "low", "medium", "high", "xhigh", "max":
-			return "enabled", nil
-		default:
-			return "", fmt.Errorf("usage: /effort auto|enabled|disabled")
-		}
-	case isOllamaCloudEntry(e):
-		switch level {
-		case "none", "disabled", "off":
-			return "none", nil
-		case "low", "medium", "high", "max":
-			return level, nil
-		case "xhigh":
-			return "max", nil
-		default:
-			return "", fmt.Errorf("usage: /effort auto|none|low|medium|high|max")
-		}
-	case e != nil && e.Kind == "anthropic":
-		switch level {
-		case "low", "medium", "high", "xhigh", "max":
-			return level, nil
-		default:
-			return "", fmt.Errorf("usage: /effort auto|low|medium|high|xhigh|max")
-		}
-	default:
-		return "", effortNotConfigurableError(e)
-	}
+	return raw, nil
 }
 
 // EffortDisplay returns the selected /effort level, using "auto" for provider
@@ -218,7 +98,9 @@ func EffortDisplay(e *ProviderEntry) string {
 	if e == nil || strings.TrimSpace(e.Effort) == "" {
 		return "auto"
 	}
-	return normalizeEffortLevel(e.Effort)
+	effort := normalizeEffortLevel(e.Effort)
+
+	return effort
 }
 
 // EffectiveEffort resolves the provider-visible effort value. Explicit
@@ -226,18 +108,22 @@ func EffortDisplay(e *ProviderEntry) string {
 // DefaultEffort (or the first supported level) the runtime default. Empty means
 // provider default / omit the provider-specific effort field.
 func EffectiveEffort(e *ProviderEntry) string {
+	e = ResolveReasoningEntry(e)
 	if e == nil {
 		return ""
 	}
 	if effort := normalizeStoredEffort(e.Effort); effort != "" {
-		return effort
+		return migrateStoredDeepSeekEffort(e, effort)
+	}
+	if explicitReasoningProtocol(e) == ReasoningProtocolKimiK3 {
+		return ""
 	}
 	supported := normalizedSupportedEfforts(e)
 	if len(supported) == 0 {
 		return ""
 	}
 	def := normalizeEffortLevel(e.DefaultEffort)
-	if def == "" || !containsString(supported, def) {
+	if def == "" {
 		return supported[0]
 	}
 	return def
@@ -256,6 +142,7 @@ func normalizeProviderEffortFields(e *ProviderEntry) {
 	if e == nil {
 		return
 	}
+	stripRuntimeReasoningDefaults(e)
 	e.Headers = normalizedProviderHeaders(e.Headers)
 	e.Effort = normalizeStoredEffort(e.Effort)
 	e.ReasoningProtocol = normalizeReasoningProtocol(e.ReasoningProtocol)
@@ -276,11 +163,23 @@ func normalizeStoredEffort(raw string) string {
 // controls. Explicit config wins, then the model capability registry, then legacy
 // endpoint heuristics.
 func ReasoningProtocolForEntry(e *ProviderEntry) string {
+	return reasoningProtocolForResolvedEntry(ResolveReasoningEntry(e))
+}
+
+func reasoningProtocolForResolvedEntry(e *ProviderEntry) string {
 	if explicit := explicitReasoningProtocol(e); explicit != "" {
 		return explicit
 	}
+	if e != nil {
+		if contract, ok := provider.LookupOpenCodeGoContract(e.Kind, e.BaseURL, e.RequestURL, e.ChatURL, e.Model); ok {
+			return contract.ReasoningProtocol
+		}
+	}
 	if cap, ok := resolvedModelReasoningCapability(e); ok {
 		return cap.Protocol
+	}
+	if isTokenRhythmGLMEntry(e) {
+		return ReasoningProtocolGLM
 	}
 	if isDeepSeekEntry(e) {
 		return ReasoningProtocolDeepSeek
@@ -303,7 +202,7 @@ func normalizeReasoningProtocol(raw string) string {
 	switch strings.ToLower(strings.TrimSpace(raw)) {
 	case "", ReasoningProtocolAuto:
 		return ""
-	case ReasoningProtocolDeepSeek, ReasoningProtocolOpenAI, ReasoningProtocolNone:
+	case ReasoningProtocolDeepSeek, ReasoningProtocolGLM, ReasoningProtocolKimiK3, ReasoningProtocolOpenAI, ReasoningProtocolNone:
 		return strings.ToLower(strings.TrimSpace(raw))
 	default:
 		return ""
@@ -331,6 +230,22 @@ func isZhipuEntry(e *ProviderEntry) bool {
 	return e != nil && e.Kind == "openai" && openai.IsZhipu(e.BaseURL)
 }
 
+// isTokenRhythmGLMEntry upgrades older Token Rhythm configurations that predate
+// per-model protocol overrides. Keep the rule scoped to the gateway and exact
+// official model IDs so unrelated mixed-model providers retain their existing
+// request shape.
+func isTokenRhythmGLMEntry(e *ProviderEntry) bool {
+	if e == nil || e.Kind != "openai" || !openai.IsTokenRhythm(e.BaseURL) {
+		return false
+	}
+	switch strings.ToLower(strings.TrimSpace(e.Model)) {
+	case "glm-5", "glm-5.1", "glm-5.2":
+		return true
+	default:
+		return false
+	}
+}
+
 // isLongCatEntry reports whether the entry points at LongCat's OpenAI-compatible
 // endpoint. See openai.IsLongCat for the host-matching rule.
 func isLongCatEntry(e *ProviderEntry) bool {
@@ -344,51 +259,38 @@ func isOllamaCloudEntry(e *ProviderEntry) bool {
 	return e != nil && e.Kind == "openai" && openai.IsOllamaCloud(e.BaseURL)
 }
 
+// isMimoEntry reports whether the entry points at Xiaomi MiMo's Responses API
+// (api.xiaomimimo.com). Host matching mirrors provider/responses.DetectVendor
+// but lives in the config layer to avoid an import cycle (control → config,
+// not control → provider). Host-based exact/suffix matching (not full-URL
+// substring) so unrelated or attacker-controlled URLs can't enable MiMo
+// effort. The kind check is intentionally absent: MiMo is served through both
+// kind="responses" and kind="openai" presets.
+func isMimoEntry(e *ProviderEntry) bool {
+	if e == nil {
+		return false
+	}
+	host := officialProviderHost(e.BaseURL)
+	return host == "api.xiaomimimo.com" || strings.HasSuffix(host, ".xiaomimimo.com")
+}
+
 func resolvedModelReasoningCapability(e *ProviderEntry) (modelReasoningCapability, bool) {
 	if e == nil || e.Kind != "openai" {
+		return modelReasoningCapability{}, false
+	}
+	return modelReasoningCapabilityForEntry(e)
+}
+
+func modelReasoningCapabilityForEntry(e *ProviderEntry) (modelReasoningCapability, bool) {
+	if e == nil {
 		return modelReasoningCapability{}, false
 	}
 	cap, ok := modelReasoningCapabilities[strings.ToLower(strings.TrimSpace(e.Model))]
 	return cap, ok
 }
 
-func effortCapabilityFromModel(cap modelReasoningCapability) EffortCapability {
-	levels := make([]string, 0, len(cap.Levels)+1)
-	levels = append(levels, "auto")
-	levels = append(levels, cap.Levels...)
-	def := normalizeEffortLevel(cap.Default)
-	if def == "" || !containsString(cap.Levels, def) {
-		def = "auto"
-	}
-	return EffortCapability{Supported: true, Levels: levels, Default: def}
-}
-
-func deepSeekEffortCapability() EffortCapability {
-	return EffortCapability{Supported: true, Levels: []string{"auto", "disabled", "high", "max"}, Default: "high"}
-}
-
-func openAIEffortCapability() EffortCapability {
-	return EffortCapability{Supported: true, Levels: []string{"auto", "low", "medium", "high"}, Default: "auto"}
-}
-
-func effortNotConfigurableError(e *ProviderEntry) error {
-	name := ""
-	if e != nil {
-		name = e.Name
-	}
-	if name == "" {
-		name = "this model"
-	}
-	return fmt.Errorf("effort is not configurable for %s", name)
-}
-
 func containsString(haystack []string, needle string) bool {
-	for _, s := range haystack {
-		if s == needle {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(haystack, needle)
 }
 
 func normalizeEffortLevel(s string) string {
@@ -444,6 +346,7 @@ func normalizedModelOverrides(overrides map[string]ProviderModelOverride) map[st
 	}
 	out := make(map[string]ProviderModelOverride, len(overrides))
 	for rawModel, ov := range overrides {
+		ov = explicitModelReasoning(ov)
 		model := strings.TrimSpace(rawModel)
 		if model == "" {
 			continue
@@ -451,10 +354,14 @@ func normalizedModelOverrides(overrides map[string]ProviderModelOverride) map[st
 		ov.ReasoningProtocol = normalizeReasoningProtocol(ov.ReasoningProtocol)
 		ov.SupportedEfforts = normalizedEffortLevels(ov.SupportedEfforts)
 		ov.DefaultEffort = normalizeEffortLevel(ov.DefaultEffort)
-		if ov.DefaultEffort != "" && !containsString(ov.SupportedEfforts, ov.DefaultEffort) {
-			ov.DefaultEffort = ""
+		if ov.ContextWindow < 0 {
+			ov.ContextWindow = 0
 		}
-		if ov.ReasoningProtocol == "" && len(ov.SupportedEfforts) == 0 && ov.DefaultEffort == "" && ov.Vision == nil {
+
+		// One definition of "empty", shared with the renderer. The inline copy
+		// that used to live here omitted MaxOutputTokens, so the loader dropped
+		// an override the renderer would have written back out.
+		if modelOverrideEmpty(ov) {
 			continue
 		}
 		out[model] = ov

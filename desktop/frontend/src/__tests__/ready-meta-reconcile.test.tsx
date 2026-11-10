@@ -5,7 +5,9 @@ import React, { act } from "react";
 import { createRoot } from "react-dom/client";
 import type { AppBindings } from "../lib/bridge";
 import { useController } from "../lib/useController";
-import type { BalanceInfo, CheckpointMeta, ContextInfo, EffortInfo, HistoryMessage, JobView, Meta, TabMeta } from "../lib/types";
+import { historySliceFromMessages } from "./mockHistorySlice";
+import type { BalanceInfo, CheckpointMeta, ContextInfo, EffortInfo, HistoryMessage, HistorySliceRequest, JobView, Meta, TabMeta } from "../lib/types";
+import { installDesktopHostStub } from "./desktopHostStub";
 
 let passed = 0;
 let failed = 0;
@@ -128,11 +130,7 @@ let metaCalls = 0;
 let approvalModeCalls = 0;
 const metaTabIds: string[] = [];
 
-window.runtime = {
-  EventsOn: () => () => {},
-  BrowserOpenURL: () => {},
-};
-window.go = {
+installDesktopHostStub(({
   main: {
     App: {
       ListTabs: async () => {
@@ -152,6 +150,7 @@ window.go = {
       BalanceForTab: async () => balance,
       JobsForTab: async () => jobs,
       CheckpointsForTab: async () => checkpoints,
+      ForkTargetsForTab: async () => ({ targets: [], verifiable: false }),
       HistoryForTab: async () => historyGate.promise,
       HistoryPageForTab: async (tabId: string) => {
         historyCalls += 1;
@@ -164,6 +163,10 @@ window.go = {
           hasOlder: false,
         };
       },
+      HistorySliceForTab: async (tabId: string, req: HistorySliceRequest) => {
+        historyCalls += 1;
+        return historySliceFromMessages(tabId, await historyGate.promise, req);
+      },
       HistoryCheckpointTurnsForTab: async () => [],
       ReplayPendingPrompts: async () => {},
       SetToolApprovalModeForTab: async () => {
@@ -171,7 +174,7 @@ window.go = {
       },
     } as Partial<AppBindings> as AppBindings,
   },
-};
+}).main.App);
 
 type Controller = ReturnType<typeof useController>;
 let controller: Controller | undefined;

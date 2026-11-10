@@ -1,22 +1,26 @@
 // Package config loads Reasonix's runtime configuration from TOML. Resolution order:
 // flag > project ./reasonix.toml > user config.toml (in the OS user-config dir) > built-in defaults.
-// User-global runtime controls, such as agent step limits, are documented exceptions.
 // Secrets come from the environment via api_key_env and are never stored in
 // config files.
 package config
 
 import (
+	"errors"
 	"fmt"
+	"io"
+	"io/fs"
 	"net/netip"
 	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"slices"
 	"strings"
 
-	"reasonix/internal/fileutil"
+	fileencoding "reasonix/internal/fileutil/encoding"
 	"reasonix/internal/netclient"
+	"reasonix/internal/permissionpreset"
 	"reasonix/internal/provider"
 )
 
@@ -44,11 +48,15 @@ type Config struct {
 	Language         string              `toml:"language"` // ui/model language tag (e.g. "zh"); empty = auto-detect from $LANG / $REASONIX_LANG
 	CredentialsStore string              `toml:"credentials_store"`
 	UI               UIConfig            `toml:"ui"`
+	CLI              CLIConfig           `toml:"cli"`
 	Desktop          DesktopConfig       `toml:"desktop"`
+	Billing          BillingConfig       `toml:"billing"`
+	Telemetry        TelemetryConfig     `toml:"telemetry"`
 	Notifications    NotificationsConfig `toml:"notifications"`
 	Agent            AgentConfig         `toml:"agent"`
 	Providers        []ProviderEntry     `toml:"providers"`
 	Tools            ToolsConfig         `toml:"tools"`
+	Checkpoints      CheckpointsConfig   `toml:"checkpoints"`
 	Permissions      PermissionsConfig   `toml:"permissions"`
 	Sandbox          SandboxConfig       `toml:"sandbox"`
 	Network          NetworkConfig       `toml:"network"`
@@ -57,12 +65,193 @@ type Config struct {
 	Skills           SkillsConfig        `toml:"skills"`
 	Statusline       StatuslineConfig    `toml:"statusline"`
 	LSP              LSPConfig           `toml:"lsp"`
+	Browser          BrowserConfig       `toml:"browser"`
 	Bot              BotConfig           `toml:"bot"`
 	Serve            ServeConfig         `toml:"serve"`
+	Secrets          SecretsConfig       `toml:"secrets"`
+	Remote           RemoteConfig        `toml:"remote"`
+	Attachments      AttachmentsConfig   `toml:"attachments,omitempty"`
 
-	providerSources          map[string]providerSourceScope
-	shadowedProjectProviders []ProviderEntry
-	expansionEnv             map[string]string
+	systemPromptFileSource     promptFileSource
+	providerSources            map[string]providerSourceScope
+	shadowedProjectProviders   []ProviderEntry
+	ignoredProjectDefaultModel string
+	ignoredLegacyStepLimits    bool
+	expansionEnv               map[string]string
+	pluginPackageOwners        map[string]string
+	pluginPackageSkillOwners   map[string][]string
+	pluginPackageAgentOwners   map[string][]string
+	// explicitProjectSkillKeys records project-level skill fields that the
+	// settings UI intentionally owns even when their value equals the built-in
+	// default. It is transient edit metadata and is never serialized directly.
+	explicitProjectSkillKeys map[string]bool
+	stagedModelCredentials   []string
+	modelCredentialCommit    *modelCredentialCommitJournal
+	editLoadErr              error
+	// loadWarnings are non-fatal issues observed while loading config (corrupt
+	// user/project files recovered via last-known-good or defaults). They never
+	// rewrite the original file; the UI may surface them for doctor repair.
+	loadWarnings      []string
+	openCodeGoJournal *openCodeGoJournal
+	projectScope      projectScopeReport
+}
+
+// KeepProjectSkillKey marks a skill field as an intentional project override.
+// An explicit empty/false project value must still be written so it can
+// override a non-default user setting in the layered configuration.
+func (c *Config) KeepProjectSkillKey(key string) error {
+	key = strings.TrimSpace(key)
+	switch key {
+	case "paths", "excluded_paths", "disabled_skills", "disable_implicit_invocation", "max_depth":
+	default:
+		return fmt.Errorf("unknown project skill key %q", key)
+	}
+	if c.explicitProjectSkillKeys == nil {
+		c.explicitProjectSkillKeys = make(map[string]bool)
+	}
+	c.explicitProjectSkillKeys[key] = true
+	return nil
+}
+
+func (c *Config) keepsProjectSkillKey(key string) bool {
+	return c != nil && c.explicitProjectSkillKeys[key]
+}
+
+type promptFileSource uint8
+
+const (
+	promptFileSourceUnknown promptFileSource = iota
+	promptFileSourceUser
+	promptFileSourceProject
+)
+
+type systemPromptFileError struct {
+	configured string
+	candidates []string
+	errors     []error
+	allMissing bool
+}
+
+func (e *systemPromptFileError) Error() string {
+	detail := "could not be read from any configured location"
+	if e.allMissing {
+		detail = "not found at any configured location"
+	}
+	message := fmt.Sprintf("system_prompt_file %q %s: %s", e.configured, detail, strings.Join(e.candidates, ", "))
+	if !e.allMissing && len(e.errors) > 0 {
+		message += ": " + errors.Join(e.errors...).Error()
+	}
+	return message
+}
+
+func (e *systemPromptFileError) Unwrap() error { return errors.Join(e.errors...) }
+
+// IsMissingSystemPromptFile reports whether every allowed location for a
+// configured prompt file was absent. Permission, containment, and other I/O
+// failures deliberately return false so callers do not start without an
+// explicitly configured prompt.
+func IsMissingSystemPromptFile(err error) bool {
+	var target *systemPromptFileError
+	return errors.As(err, &target) && target.allMissing
+}
+
+// TelemetryConfig controls content-free CLI usage metrics. It is user-global:
+// project reasonix.toml values are ignored so a cloned repository cannot opt a
+// user into reporting.
+type TelemetryConfig struct {
+	CLIMetrics string `toml:"cli_metrics"` // auto|on|off; empty means consent has not been requested
+}
+
+// CLITelemetryConfigured reports whether the user has made an explicit CLI
+// telemetry choice. The runtime policy still treats an absent value as auto,
+// but persistence must preserve absence until the first eligible consent prompt.
+func (c *Config) CLITelemetryConfigured() bool {
+	if c == nil {
+		return false
+	}
+	switch strings.ToLower(strings.TrimSpace(c.Telemetry.CLIMetrics)) {
+	case "auto", "on", "off":
+		return true
+	default:
+		return false
+	}
+}
+
+// CLITelemetryMode returns the normalized CLI telemetry policy.
+func (c *Config) CLITelemetryMode() string {
+	if c == nil {
+		return "auto"
+	}
+	switch strings.ToLower(strings.TrimSpace(c.Telemetry.CLIMetrics)) {
+	case "on":
+		return "on"
+	case "off":
+		return "off"
+	default:
+		return "auto"
+	}
+}
+
+// LoadWarnings returns non-fatal config load issues (corrupt files recovered in
+// memory). The returned slice is a copy.
+func (c *Config) LoadWarnings() []string {
+	if c == nil || len(c.loadWarnings) == 0 {
+		return nil
+	}
+	out := make([]string, len(c.loadWarnings))
+	copy(out, c.loadWarnings)
+	return out
+}
+
+// HasLoadWarnings reports whether the load used a degraded in-memory fallback.
+func (c *Config) HasLoadWarnings() bool {
+	return c != nil && len(c.loadWarnings) > 0
+}
+
+func (c *Config) addLoadWarning(msg string) {
+	if c == nil {
+		return
+	}
+	msg = strings.TrimSpace(msg)
+	if msg == "" {
+		return
+	}
+	c.loadWarnings = append(c.loadWarnings, msg)
+}
+
+// IgnoredLegacyAgentStepLimits reports whether this load found and ignored the
+// retired [agent].max_steps or planner_max_steps settings. Boot removes standard
+// key assignments before loading, while read-only/config-only loads only report
+// and normalize them in memory.
+func (c *Config) IgnoredLegacyAgentStepLimits() bool {
+	return c != nil && c.ignoredLegacyStepLimits
+}
+
+// IgnoredProjectDefaultModel returns the project reasonix.toml default_model
+// that LoadForRoot ignored because no configured provider serves it (see
+// restoreUnresolvableProjectDefaultModel), or "" when none was ignored.
+func (c *Config) IgnoredProjectDefaultModel() string {
+	if c == nil {
+		return ""
+	}
+	return c.ignoredProjectDefaultModel
+}
+
+// SecretsConfig controls the credential protection layers. It is a user-global
+// setting: project reasonix.toml values are ignored (see LoadForRoot), so a
+// cloned repository cannot silently opt the user into workflow-breaking
+// protections.
+type SecretsConfig struct {
+	// FilterSubprocessEnv strips credential-like environment variables
+	// (*_API_KEY, *TOKEN*, *SECRET*, ...) from tool subprocesses (bash, hooks,
+	// LSP, MCP stdio). Default off: it breaks token-based workflows such as
+	// `gh`, HTTPS `git push`, and `npm publish`.
+	FilterSubprocessEnv bool `toml:"filter_subprocess_env"`
+	// ProtectSensitiveFiles makes read/list/search tools treat credential
+	// paths (.env, .git-credentials, .netrc, *.pem/*.key/*.p12/*.pfx, ~/.ssh)
+	// as invisible. Default off because hiding the files breaks legitimate
+	// "edit my .env" workflows.
+	ProtectSensitiveFiles bool `toml:"protect_sensitive_files"`
 }
 
 type providerSourceScope string
@@ -80,27 +269,18 @@ type UIConfig struct {
 	ShortcutLayout string `toml:"shortcut_layout"` // classic|desktop; accepted for compatibility
 	CloseBehavior  string `toml:"close_behavior"`  // legacy desktop close behavior; prefer desktop.close_behavior
 	ShowReasoning  bool   `toml:"show_reasoning"`  // Ctrl+O / /verbose: show thinking text in CLI; false = collapsed
-	CursorShape    string `toml:"cursor_shape"`    // block|underline|bar; empty defaults to underline
+	ShowTurnUsage  bool   `toml:"show_turn_usage"` // show per-request token/cost receipts in the CLI/TUI transcript
+	CursorShape    string `toml:"cursor_shape"`    // block|underline|bar; empty defaults to bar
 }
 
-// DesktopConfig controls desktop-only UI preferences. It is intentionally
-// separate from top-level language and [ui] so desktop choices do not affect CLI
-// language, terminal colours, or provider-visible prompt/request data.
-type DesktopConfig struct {
-	Language                string   `toml:"language"`                   // auto|en|zh; empty/auto = browser/OS auto-detect
-	LayoutStyle             string   `toml:"layout_style"`               // classic|workbench|creation; desktop layout style
-	Theme                   string   `toml:"theme"`                      // auto|dark|light; empty resolves to auto
-	ThemeStyle              string   `toml:"theme_style"`                // graphite|aurora|slate|carbon|nocturne|amber and legacy aliases
-	CloseBehavior           string   `toml:"close_behavior"`             // quit|background; desktop window close behavior
-	DisplayMode             string   `toml:"display_mode"`               // standard|compact (legacy "minimal" maps to compact); transcript display mode
-	StatusBarStyle          string   `toml:"status_bar_style"`           // icon|text; desktop status bar metric labels
-	StatusBarItems          []string `toml:"status_bar_items"`           // ordered visible desktop status bar items
-	DefaultToolApprovalMode string   `toml:"default_tool_approval_mode"` // ask|auto|yolo; default for newly-created desktop sessions
-	CheckUpdates            *bool    `toml:"check_updates"`              // startup update checks; nil keeps the default enabled
-	Telemetry               *bool    `toml:"telemetry"`                  // anonymous launch ping (install id + version + OS); nil keeps the default enabled
-	Metrics                 *bool    `toml:"metrics"`                    // aggregate desktop metrics (anonymous signal/bucket counts; no content); nil keeps the default enabled
-	ProviderAccess          []string `toml:"provider_access"`            // desktop-only list of provider entries shown in Settings > Model > Access
-	ExpandThinking          bool     `toml:"expand_thinking"`            // true = show reasoning text expanded by default; false = collapsed
+// CLIConfig controls user-global native CLI behavior. It is separate from
+// project runtime settings so a repository cannot change the installed
+// binary's update channel.
+type CLIConfig struct {
+	// UpdateChannel is decoded for compatibility with pre-single-channel
+	// configurations. Runtime behavior is always the official release channel,
+	// and the canonical renderer intentionally drops this field.
+	UpdateChannel string `toml:"update_channel"`
 }
 
 // NotificationsConfig controls optional system notifications for CLI chat/run.
@@ -109,14 +289,6 @@ type NotificationsConfig struct {
 	TurnDone        bool `toml:"turn_done"`
 	ApprovalRequest bool `toml:"approval_request"`
 	AskRequest      bool `toml:"ask_request"`
-}
-
-// EnvironmentConfig controls the stable startup environment block injected into
-// the model-facing prompt. Enabled nil means the default (enabled); Tools maps a
-// tool name to an explicit executable path when PATH probing is not enough.
-type EnvironmentConfig struct {
-	Enabled *bool             `toml:"enabled"`
-	Tools   map[string]string `toml:"tools"`
 }
 
 // EnvironmentEnabled reports whether startup environment probing should feed the
@@ -143,9 +315,9 @@ func (c *Config) UIThemeStyle() string {
 	return normalizeThemeStyle(c.UI.ThemeStyle)
 }
 
-// UIShortcutLayout normalizes the legacy CLI shortcut layout setting. It is kept
-// for compatibility; Shift+Tab toggles Plan and Ctrl+Y toggles YOLO in both
-// layouts.
+// UIShortcutLayout normalizes the legacy CLI shortcut layout setting. It is
+// retained for configuration compatibility; permission presets are selected
+// explicitly and are not encoded in this layout.
 func (c *Config) UIShortcutLayout() string {
 	switch strings.ToLower(strings.TrimSpace(c.UI.ShortcutLayout)) {
 	case "desktop", "dual", "dual-axis", "dual_axis":
@@ -155,18 +327,17 @@ func (c *Config) UIShortcutLayout() string {
 	}
 }
 
-// UICursorShape normalizes ui.cursor_shape. Defaults to "underline" to avoid
-// block-cursor visual corruption with CJK wide characters in the textarea
-// (Bubble Tea real-cursor + CJK column-counting drift). Valid values:
-// "block", "underline", "bar".
+// UICursorShape normalizes ui.cursor_shape. The slim "bar" default stays
+// visible without covering CJK wide characters. Valid values are "block",
+// "underline", and "bar".
 func (c *Config) UICursorShape() string {
 	switch strings.ToLower(strings.TrimSpace(c.UI.CursorShape)) {
 	case "block":
 		return "block"
-	case "bar":
-		return "bar"
-	default:
+	case "underline":
 		return "underline"
+	default:
+		return "bar"
 	}
 }
 
@@ -179,12 +350,11 @@ func normalizeThemeStyle(style string) string {
 	}
 }
 
+// The retired "classic" style normalizes to workbench, like any other value
+// this build does not know, so a config written before the style was removed
+// keeps working and the Go side and the UI agree on what it means.
 func normalizeDesktopLayoutStyle(style string) string {
 	switch strings.ToLower(strings.TrimSpace(style)) {
-	case "classic":
-		return "classic"
-	case "workbench", "workspace":
-		return "workbench"
 	case "creation":
 		return "creation"
 	default:
@@ -215,6 +385,23 @@ func (c *Config) DesktopLanguage() string {
 	}
 }
 
+// DesktopCurrency returns the explicit user-global pricing currency. The
+// persisted field keeps its original desktop namespace for compatibility;
+// empty means the pricing region follows the desktop/CLI language.
+func (c *Config) DesktopCurrency() string {
+	if c == nil {
+		return ""
+	}
+	switch strings.ToUpper(strings.TrimSpace(c.Desktop.Currency)) {
+	case "CNY", "RMB", "CNH":
+		return "CNY"
+	case "USD":
+		return "USD"
+	default:
+		return ""
+	}
+}
+
 // DesktopTheme normalizes desktop.theme. New desktop users default to the OS
 // automatic graphite product look; an explicit auto/light/dark is preserved.
 func (c *Config) DesktopTheme() string {
@@ -236,8 +423,23 @@ func (c *Config) DesktopThemeStyle() string {
 	return normalizeThemeStyle(c.Desktop.ThemeStyle)
 }
 
-// DesktopLayoutStyle normalizes the desktop layout style. New installs default
-// to workbench; explicit classic remains respected.
+// DesktopTerminalTheme normalizes the integrated terminal colour preference.
+// Auto deliberately follows the resolved desktop app theme, including OS theme
+// changes while desktop.theme is also auto.
+func (c *Config) DesktopTerminalTheme() string {
+	switch strings.ToLower(strings.TrimSpace(c.Desktop.TerminalTheme)) {
+	case "dark":
+		return "dark"
+	case "light":
+		return "light"
+	default:
+		return "auto"
+	}
+}
+
+// DesktopLayoutStyle defaults to workbench. The retired "classic" value is
+// normalized on read rather than migrated to disk: nothing behaves differently
+// for it, so there is no rewritten value worth persisting.
 func (c *Config) DesktopLayoutStyle() string {
 	if strings.EqualFold(strings.TrimSpace(c.Desktop.ThemeStyle), "workbench") && strings.TrimSpace(c.Desktop.LayoutStyle) == "" {
 		return "workbench"
@@ -260,52 +462,44 @@ func (c *Config) UICloseBehavior() string {
 	return c.DesktopCloseBehavior()
 }
 
-// DesktopDisplayMode normalizes the transcript display mode. Default is
-// "standard" (flat rendering, no folding).
-func (c *Config) DesktopDisplayMode() string {
-	switch strings.ToLower(strings.TrimSpace(c.Desktop.DisplayMode)) {
-	case "standard":
-		return "standard"
-	case "compact", "minimal":
-		return "compact"
-	default:
-		return "standard"
+// DesktopConversationWidth returns the normalized desktop conversation width.
+// Unknown and missing values fall back to standard for backward compatibility.
+func (c *Config) DesktopConversationWidth() string {
+	if c != nil && strings.EqualFold(strings.TrimSpace(c.Desktop.ConversationWidth), "full") {
+		return "full"
 	}
+	return "standard"
 }
 
-// NormalizeToolApprovalMode returns the canonical desktop/session tool approval
-// posture. Unknown or missing values fall back to ask for safety.
+// NormalizeToolApprovalMode returns the canonical execution permission preset.
+// Legacy ask/auto/yolo values are migrated conservatively.
 func NormalizeToolApprovalMode(mode string) string {
-	switch strings.ToLower(strings.TrimSpace(mode)) {
-	case "auto":
-		return "auto"
-	case "yolo", "full", "full-access", "bypass":
-		return "yolo"
-	default:
-		return "ask"
-	}
+	return string(permissionpreset.Normalize(mode))
 }
 
-// DesktopDefaultToolApprovalMode is the Ask/Auto/YOLO default used only when
-// creating a new desktop session. Existing tabs and restored sessions keep their
-// own persisted runtime state.
+// DesktopDefaultToolApprovalMode is the permission preset for new desktop
+// sessions. An omitted value defaults to workspace-write; restored legacy
+// values use the conservative migration in permissionpreset.Normalize.
 func (c *Config) DesktopDefaultToolApprovalMode() string {
 	if c == nil {
-		return "ask"
+		return string(permissionpreset.WorkspaceWrite)
 	}
-	return NormalizeToolApprovalMode(c.Desktop.DefaultToolApprovalMode)
+	return string(permissionpreset.NormalizeDefault(c.Desktop.DefaultToolApprovalMode))
 }
 
 // DesktopStatusBarStyle normalizes the desktop status bar metric label style.
-// Default is "text"; explicit "icon" preserves the user's compact choice.
+// Unmigrated configurations adopt icon labels once; later choices are preserved.
 func (c *Config) DesktopStatusBarStyle() string {
+	if !c.Desktop.StatusBarStyleInitialized {
+		return "icon"
+	}
 	switch strings.ToLower(strings.TrimSpace(c.Desktop.StatusBarStyle)) {
 	case "icon":
 		return "icon"
 	case "text":
 		return "text"
 	default:
-		return "text"
+		return "icon"
 	}
 }
 
@@ -317,6 +511,9 @@ var defaultDesktopStatusBarItems = []string{
 	"cache_avg",
 	"session_tokens",
 	"turn_tokens",
+	"turn_tps",
+	"turn_output_tokens",
+	"turn_cache_tokens",
 	"turn_cost",
 	"session_turns",
 	"context",
@@ -372,6 +569,36 @@ func (c *Config) DesktopCheckUpdates() bool {
 		return true
 	}
 	return *c.Desktop.CheckUpdates
+}
+
+// NormalizeCLIUpdateChannel returns the only public native CLI update channel.
+// The input remains accepted so older preview configurations keep loading.
+func NormalizeCLIUpdateChannel(_ string) string {
+	return "stable"
+}
+
+// CLIUpdateChannel returns the user-global native CLI update channel.
+func (c *Config) CLIUpdateChannel() string {
+	if c == nil {
+		return "stable"
+	}
+	return NormalizeCLIUpdateChannel(c.CLI.UpdateChannel)
+}
+
+// NormalizeDesktopUpdateChannel returns the only public Desktop update channel.
+// Legacy preview/canary/beta/next values are deliberately ignored so an old
+// configuration cannot strand the installation on the retired channel.
+func NormalizeDesktopUpdateChannel(_ string) string {
+	return "stable"
+}
+
+// DesktopUpdateChannel returns the desktop channel whose latest pointer should be
+// checked. Missing or unknown configs default to stable.
+func (c *Config) DesktopUpdateChannel() string {
+	if c == nil {
+		return "stable"
+	}
+	return NormalizeDesktopUpdateChannel(c.Desktop.UpdateChannel)
 }
 
 // ColdResumePruneEnabled reports whether stale tool results are elided when a
@@ -480,6 +707,16 @@ type StatuslineConfig struct {
 	Command string `toml:"command"`
 }
 
+// CheckpointsConfig tunes rewind snapshot retention. Zero values leave the
+// built-in defaults in place (100 turns, 1 GiB soft budget).
+type CheckpointsConfig struct {
+	// RetainTurns caps how many turns of file payloads are kept.
+	RetainTurns int `toml:"retain_turns"`
+	// BlobQuotaBytes is the soft byte budget for retained file payloads. A
+	// protected or current turn may temporarily exceed it.
+	BlobQuotaBytes int64 `toml:"blob_quota_bytes"`
+}
+
 // BotConfig 控制多渠道 IM bot 消息网关。
 type BotConfig struct {
 	Enabled            bool                  `toml:"enabled"`
@@ -498,14 +735,30 @@ type BotConfig struct {
 	QQ                 QQBotConfig           `toml:"qq"`
 	Feishu             FeishuBotConfig       `toml:"feishu"`
 	Weixin             WeixinBotConfig       `toml:"weixin"`
+	Dingtalk           DingtalkBotConfig     `toml:"dingtalk"`
 	Routes             []BotRouteConfig      `toml:"routes"`
 	Connections        []BotConnectionConfig `toml:"connections"`
+	// DesktopWatchers persists /desktop watch subscriptions so god-view
+	// notifications survive a desktop restart. Managed by the desktop bot
+	// bridge, not the settings UI.
+	DesktopWatchers []BotDesktopWatcherConfig `toml:"desktop_watchers"`
+}
+
+// BotDesktopWatcherConfig is one bot chat subscribed to desktop events
+// (/desktop watch on).
+type BotDesktopWatcherConfig struct {
+	Platform     string `toml:"platform"`
+	ConnectionID string `toml:"connection_id"`
+	Domain       string `toml:"domain"`
+	ChatType     string `toml:"chat_type"`
+	ChatID       string `toml:"chat_id"`
 }
 
 type BotSelfUserIDs struct {
-	QQ     []string `toml:"qq"`
-	Feishu []string `toml:"feishu"`
-	Weixin []string `toml:"weixin"`
+	QQ       []string `toml:"qq"`
+	Feishu   []string `toml:"feishu"`
+	Weixin   []string `toml:"weixin"`
+	Dingtalk []string `toml:"dingtalk"`
 }
 
 type BotControlConfig struct {
@@ -528,20 +781,24 @@ type BotRouteConfig struct {
 
 // BotAllowlist 控制哪些用户可以使用 bot。
 type BotAllowlist struct {
-	Enabled         bool     `toml:"enabled"`
-	AllowAll        bool     `toml:"allow_all"`
-	QQUsers         []string `toml:"qq_users"`
-	FeishuUsers     []string `toml:"feishu_users"`
-	WeixinUsers     []string `toml:"weixin_users"`
-	QQApprovers     []string `toml:"qq_approvers"`
-	FeishuApprovers []string `toml:"feishu_approvers"`
-	WeixinApprovers []string `toml:"weixin_approvers"`
-	QQAdmins        []string `toml:"qq_admins"`
-	FeishuAdmins    []string `toml:"feishu_admins"`
-	WeixinAdmins    []string `toml:"weixin_admins"`
-	QQGroups        []string `toml:"qq_groups"`
-	FeishuGroups    []string `toml:"feishu_groups"`
-	WeixinGroups    []string `toml:"weixin_groups"`
+	Enabled           bool     `toml:"enabled"`
+	AllowAll          bool     `toml:"allow_all"`
+	QQUsers           []string `toml:"qq_users"`
+	FeishuUsers       []string `toml:"feishu_users"`
+	WeixinUsers       []string `toml:"weixin_users"`
+	QQApprovers       []string `toml:"qq_approvers"`
+	FeishuApprovers   []string `toml:"feishu_approvers"`
+	WeixinApprovers   []string `toml:"weixin_approvers"`
+	QQAdmins          []string `toml:"qq_admins"`
+	FeishuAdmins      []string `toml:"feishu_admins"`
+	WeixinAdmins      []string `toml:"weixin_admins"`
+	QQGroups          []string `toml:"qq_groups"`
+	FeishuGroups      []string `toml:"feishu_groups"`
+	WeixinGroups      []string `toml:"weixin_groups"`
+	DingtalkUsers     []string `toml:"dingtalk_users"`
+	DingtalkApprovers []string `toml:"dingtalk_approvers"`
+	DingtalkAdmins    []string `toml:"dingtalk_admins"`
+	DingtalkGroups    []string `toml:"dingtalk_groups"`
 }
 
 type BotPairingConfig struct {
@@ -583,6 +840,11 @@ type FeishuBotConfig struct {
 	Mode              string `toml:"mode"`               // webhook（默认）| websocket
 	WebhookPort       int    `toml:"webhook_port"`       // webhook 模式端口
 	RequireMention    bool   `toml:"require_mention"`
+	// OutboundMediaRoots contains absolute local directories the loopback /send
+	// control API may attach files from. Media refs must be bare filenames and
+	// must exist in exactly one configured root. Empty (the default) disables
+	// outbound file sending.
+	OutboundMediaRoots []string `toml:"outbound_media_roots"`
 }
 
 // WeixinBotConfig 微信 iLink Bot 配置。
@@ -591,6 +853,25 @@ type WeixinBotConfig struct {
 	AccountID string `toml:"account_id"`
 	TokenEnv  string `toml:"token_env"` // 环境变量名，如 WEIXIN_BOT_TOKEN
 	APIBase   string `toml:"api_base"`  // iLink API base URL
+}
+
+// DingtalkBotConfig 钉钉企业内部应用机器人（Stream 模式）配置。
+type DingtalkBotConfig struct {
+	Enabled          bool            `toml:"enabled"`
+	ClientID         string          `toml:"client_id"`          // 钉钉应用 AppKey（ClientID）
+	ClientSecret     string          `toml:"client_secret"`      // 钉钉应用 AppSecret（ClientSecret）
+	ClientIDEnv      string          `toml:"client_id_env"`      // 环境变量名，如 DINGTALK_CLIENT_ID
+	SecretEnv        string          `toml:"secret_env"`         // 环境变量名，如 DINGTALK_CLIENT_SECRET
+	BotName          string          `toml:"bot_name"`           // 机器人昵称；群聊 @ 剥离时匹配
+	RequireMention   bool            `toml:"require_mention"`    // 群聊是否必须 @ 机器人
+	Model            string          `toml:"model"`              // 会话模型；空 = 全局默认
+	ToolApprovalMode string          `toml:"tool_approval_mode"` // read-only|workspace-write|danger-full-access；空 = 全局默认
+	WorkspaceRoot    string          `toml:"workspace_root"`     // 会话工作目录；空 = 启动 Bot 时的 cwd
+	Access           BotAccessConfig `toml:"access"`             // 该渠道访问控制（allowlist）
+	// SessionMappings 直配渠道的会话绑定（与 [[bot.connections]] 同构）。
+	// legacy [bot.dingtalk] 没有 connection 记录，/new 旋转后的新会话路径
+	// 持久化在这里，重启后仍能恢复（见 botruntime.rememberInbound）。
+	SessionMappings []BotConnectionSessionMapping `toml:"session_mappings"`
 }
 
 // BotConnectionConfig is the desktop-friendly connection record for IM bot
@@ -683,17 +964,19 @@ type NetworkProxyConfig struct {
 	Password string `toml:"password"`
 }
 
-// NetworkProxySpec returns the expanded proxy settings used by netclient.
+// NetworkProxySpec returns the expanded proxy settings used by netclient. The
+// settings are the user's, so ${VAR} expands from the process environment and
+// never from a workspace .env.
 func (c *Config) NetworkProxySpec() netclient.ProxySpec {
 	return netclient.ProxySpec{
 		Mode:        c.Network.ProxyMode,
-		URL:         c.expandVars(c.Network.ProxyURL),
-		NoProxy:     c.expandVars(c.Network.NoProxy),
+		URL:         ExpandVars(c.Network.ProxyURL),
+		NoProxy:     ExpandVars(c.Network.NoProxy),
 		Type:        c.Network.Proxy.Type,
-		Server:      c.expandVars(c.Network.Proxy.Server),
+		Server:      ExpandVars(c.Network.Proxy.Server),
 		Port:        c.Network.Proxy.Port,
-		Username:    c.expandVars(c.Network.Proxy.Username),
-		Password:    c.expandVars(c.Network.Proxy.Password),
+		Username:    ExpandVars(c.Network.Proxy.Username),
+		Password:    ExpandVars(c.Network.Proxy.Password),
 		DirectHosts: c.directProxyHosts(),
 	}
 }
@@ -740,12 +1023,22 @@ func (c *Config) NetworkProxyMode() string {
 // the global roots. ExcludedPaths hides matching discovery roots without deleting
 // folders. ~, relative paths, and ${VAR} expansion are supported. DisabledSkills
 // hides named skills from the agent prompt, slash invocation, and skill tools
-// while keeping them manageable.
+// while keeping them manageable. DisableImplicitInvocation keeps skills
+// discoverable to the host for explicit /skill use and management, but hides
+// their index and model-facing invocation tools.
 type SkillsConfig struct {
-	Paths          []string `toml:"paths"`
-	ExcludedPaths  []string `toml:"excluded_paths"`
-	DisabledSkills []string `toml:"disabled_skills"`
-	MaxDepth       int      `toml:"max_depth"`
+	Paths                     []string `toml:"paths"`
+	ExcludedPaths             []string `toml:"excluded_paths"`
+	DisabledSkills            []string `toml:"disabled_skills"`
+	DisableImplicitInvocation bool     `toml:"disable_implicit_invocation"`
+	MaxDepth                  int      `toml:"max_depth"`
+}
+
+// ImplicitSkillInvocationEnabled reports whether the model may discover and
+// invoke skills without an explicit user slash command. The zero value keeps
+// the historical default enabled for old configs.
+func (c *Config) ImplicitSkillInvocationEnabled() bool {
+	return c == nil || !c.Skills.DisableImplicitInvocation
 }
 
 // SkillCustomPaths returns the configured custom skill roots with ${VAR}
@@ -830,7 +1123,7 @@ func (c *Config) IsSkillDisabled(name string) bool {
 // (write_file / edit_file / multi_edit / move_file) may modify; empty means the
 // current working directory, so writes stay inside the project by default.
 // AllowWrite lists extra directories writers may also touch (e.g. a sibling repo
-// or a temp dir). ForbidRead lists directories the agent may not read or list at all
+// or a temp dir). ForbidRead lists files or directories the agent may not read or list
 // (e.g. ~/.ssh for secrets). Both support ${VAR} / ${VAR:-default} expansion. Reads are
 // unrestricted; confining `bash` is Phase 1 (OS-level sandbox).
 type SandboxConfig struct {
@@ -859,7 +1152,7 @@ func (c *Config) WriteRoots() []string {
 // config doesn't explicitly set a workspace_root. Desktop tabs pass their
 // project root here so tool confinement is correct without changing cwd.
 func (c *Config) WriteRootsForRoot(fallbackRoot string) []string {
-	root := c.expandVars(c.Sandbox.WorkspaceRoot)
+	root := c.expandSandboxPath(c.Sandbox.WorkspaceRoot)
 	if root == "" {
 		root = fallbackRoot
 		if root == "" || root == "." {
@@ -872,7 +1165,7 @@ func (c *Config) WriteRootsForRoot(fallbackRoot string) []string {
 	}
 	roots := []string{root}
 	for _, d := range c.Sandbox.AllowWrite {
-		if d = c.expandVars(d); d != "" {
+		if d = c.expandSandboxPath(d); d != "" {
 			roots = append(roots, d)
 		}
 	}
@@ -886,14 +1179,14 @@ func (c *Config) WriteRootsForRoot(fallbackRoot string) []string {
 func (c *Config) AllowWriteRoots() []string {
 	var roots []string
 	for _, d := range c.Sandbox.AllowWrite {
-		if d = c.expandVars(d); d != "" {
+		if d = c.expandSandboxPath(d); d != "" {
 			roots = append(roots, d)
 		}
 	}
 	return roots
 }
 
-// ForbidReadRoots returns the directories the agent is forbidden from reading
+// ForbidReadRoots returns the paths the agent is forbidden from reading
 // or listing, with ${VAR} expanded. Relative roots are resolved against the
 // current working directory; the confiner resolves them to symlink-free paths.
 // Empty when no forbid_read entries are configured.
@@ -914,7 +1207,7 @@ func (c *Config) ForbidReadRootsForRoot(fallbackRoot string) []string {
 	}
 	roots := make([]string, 0, len(c.Sandbox.ForbidRead))
 	for _, d := range c.Sandbox.ForbidRead {
-		if d = c.expandVars(d); d != "" {
+		if d = c.expandSandboxPath(d); d != "" {
 			if !filepath.IsAbs(d) {
 				d = filepath.Join(root, d)
 			}
@@ -930,18 +1223,21 @@ func (c *Config) BashMode() string {
 }
 
 // BashModeForGOOS normalises the bash-sandbox mode for tests and cross-platform
-// rendering. Explicit "enforce" and "off" always win; only the empty default is
-// platform-specific.
+// rendering. macOS and Linux default to enforcement; backend capability is
+// checked at launch and restricted presets fail closed when it is unavailable.
+// Windows has no OS-level shell sandbox, so every value resolves to "off":
+// an explicit "enforce" stays readable (doctor reports it as ignored) but
+// never turns into a fail-closed launch.
 func (c *Config) BashModeForGOOS(goos string) string {
+	if goos == "windows" {
+		return "off"
+	}
 	switch strings.TrimSpace(c.Sandbox.Bash) {
 	case "enforce":
 		return "enforce"
 	case "off":
 		return "off"
 	case "":
-		if goos == "windows" {
-			return "off"
-		}
 		return "enforce"
 	default:
 		return "enforce"
@@ -954,132 +1250,141 @@ func (c *Config) BashModeForGOOS(goos string) string {
 // each model's prompt prefix stays cache-stable). SubagentModel is the optional
 // default for runAs=subagent skills; SubagentModels overrides it per skill name.
 type AgentConfig struct {
-	SystemPrompt        string            `toml:"system_prompt"`
-	SystemPromptFile    string            `toml:"system_prompt_file"`
-	MaxSteps            int               `toml:"max_steps"`         // tool-call rounds per turn; 0 = unlimited
-	PlannerMaxSteps     int               `toml:"planner_max_steps"` // planner read-only tool-call rounds; 0 = unlimited
-	Temperature         float64           `toml:"temperature"`
-	PlannerModel        string            `toml:"planner_model"`
-	GuardianModel       string            `toml:"guardian_model"`
-	GuardianTemperature float64           `toml:"guardian_temperature"`
+	SystemPrompt     string `toml:"system_prompt"`
+	SystemPromptFile string `toml:"system_prompt_file"`
+	// Deprecated compatibility fields. Old TOML and desktop clients may still
+	// send them, but config loading normalizes both to zero and rendering omits
+	// them. One-off CLI and unattended bot limits remain separate controls.
+	MaxSteps        int     `toml:"max_steps"`
+	PlannerMaxSteps int     `toml:"planner_max_steps"`
+	Temperature     float64 `toml:"temperature"`
+	PlannerModel    string  `toml:"planner_model"`
+	WebSearchModel  string  `toml:"web_search_model"` // empty or auto preserves automatic search selection
+	// VisionModel is empty (off), "auto", or a canonical provider/model ref
+	// used to summarize images before a text-only executor turn.
+	VisionModel         string  `toml:"vision_model"`
+	GuardianModel       string  `toml:"guardian_model"`
+	GuardianTemperature float64 `toml:"guardian_temperature"`
+	// RecoveryModel is decoded from old configurations for compatibility. The
+	// Auto Guard reviewer is retired, so runtime and renderers ignore it.
+	RecoveryModel string `toml:"recovery_model"`
+	// RecoveryTemperature is accepted from older configs but ignored. Auto
+	// Guard review is deterministic at temperature zero.
+	RecoveryTemperature float64           `toml:"recovery_temperature"`
 	SubagentModel       string            `toml:"subagent_model"`
 	SubagentModels      map[string]string `toml:"subagent_models"`
 	SubagentEffort      string            `toml:"subagent_effort"`
 	SubagentEfforts     map[string]string `toml:"subagent_efforts"`
 	MaxSubagentDepth    int               `toml:"max_subagent_depth"`
+	// TaskCostBudget lands a task on one summary once it spends this much.
+	TaskCostBudget float64 `toml:"task_cost_budget"`
+	// TaskTimeBudgetMinutes is the same gate on wall clock. Both ship off.
+	TaskTimeBudgetMinutes float64 `toml:"task_time_budget_minutes"`
+	// GoalTokenBudget bounds an unattended Goal loop by cumulative tokens.
+	// Off unless set: a Goal runs until it finishes or you stop it.
+	GoalTokenBudget int `toml:"goal_token_budget"`
+	// MaxSubagentConcurrency bounds how many sub-agents (task, fleet items,
+	// profile skills, nested children) may run at once in one session.
+	// 0 means the default (6). Values outside 1–32 are clamped on load.
+	MaxSubagentConcurrency int `toml:"max_subagent_concurrency"`
+	// MaxParallelWriters bounds concurrent writer-capable sub-agents that
+	// declare non-overlapping write_paths. 0 means the default (3). Must not
+	// exceed MaxSubagentConcurrency after normalization.
+	MaxParallelWriters int `toml:"max_parallel_writers"`
 	// OutputStyle selects a persona/tone block folded into the system prompt at
 	// startup (a built-in like "explanatory"/"learning"/"concise", or a custom
 	// .reasonix/output-styles/<name>.md). Empty = the unmodified prompt.
 	OutputStyle string `toml:"output_style"`
-	// AutoPlan controls whether interactive turns that look multi-step start in
-	// plan mode automatically: "off" keeps plan mode manual, "on" enables the
-	// approval gate. Legacy "ask" is treated as "on".
+	// Deprecated compatibility field. Automatic plan mode was retired in config
+	// version 5; old TOML remains readable, but loading normalizes it to "off"
+	// and rendering omits it. Plan mode remains available as an explicit user
+	// choice.
 	AutoPlan string `toml:"auto_plan"`
 	// ReasoningLanguage controls the preferred language for visible reasoning
 	// text. Empty/auto follows the conversation language. Applied as transient
 	// turn context, not the stable prompt.
 	ReasoningLanguage string `toml:"reasoning_language"`
-	// AutoPlanClassifier optionally names a provider/model used to classify
-	// borderline auto-plan decisions. Empty keeps the zero-cost heuristic path.
+	// Deprecated compatibility field paired with AutoPlan. Old TOML remains
+	// readable, but loading clears it and rendering omits it.
 	AutoPlanClassifier string `toml:"auto_plan_classifier"`
-	// Compaction window fractions: soft = notice only, compact = trigger, force = hard ceiling.
+	// Soft/snip/force are retired compatibility keys; only CompactRatio is active.
 	SoftCompactRatio    float64 `toml:"soft_compact_ratio"`
 	ToolResultSnipRatio float64 `toml:"tool_result_snip_ratio"`
 	CompactRatio        float64 `toml:"compact_ratio"`
 	CompactForceRatio   float64 `toml:"compact_force_ratio"`
-	// Keep controls which compactable messages stay verbatim beyond the current
-	// user-fact/digest floor and recent tail. Empty uses the conservative default
-	// of keeping error tool results.
+	// ContextEditing is retired; native tool clearing is no longer an auto path.
+	ContextEditing string `toml:"context_editing"`
+	// Keep and RecentKeep are deprecated compatibility fields. They remain
+	// readable and writable but Harness-style compaction ignores them.
 	Keep       []string `toml:"keep"`
 	RecentKeep int      `toml:"recent_keep"`
 	// ColdResumePrune elides stale tool results when a session reopens past the
 	// provider cache window. nil = default enabled.
 	ColdResumePrune *bool `toml:"cold_resume_prune"`
-	// PlanModeAllowedTools names extra custom tools the plan-mode policy may treat
-	// as read-only. It cannot unlock known blocked tools or unsafe bash commands.
-	PlanModeAllowedTools []string `toml:"plan_mode_allowed_tools"`
-	// PlanModeReadOnlyCommands names concrete shell command prefixes that plan mode
-	// may treat as read-only. Shell operators, background execution, and shell
-	// interpreter prefixes remain blocked.
+	// PlanModeReadOnlyCommands is retained for old config/session round trips. Main
+	// Plan bash calls now use the ordinary Permissions classifier and Sandbox.
 	PlanModeReadOnlyCommands []string `toml:"plan_mode_read_only_commands"`
-	// MemoryCompiler controls the v5 execution-memory compiler. Missing configs
-	// default to enabled so users get the self-improving planner unless they opt
-	// out explicitly.
-	MemoryCompiler MemoryCompilerConfig `toml:"memory_compiler"`
-}
-
-// MemoryCompilerConfig controls the v5 execution-memory compiler.
-type MemoryCompilerConfig struct {
-	Enabled   *bool  `toml:"enabled"`
-	Verbosity string `toml:"verbosity"`
-}
-
-const (
-	MemoryCompilerVerbosityObserve = "observe"
-	MemoryCompilerVerbosityCompact = "compact"
-)
-
-// MemoryCompilerEnabled reports whether the v5 execution-memory compiler should
-// participate in future turns. Missing config defaults to true.
-func (c *Config) MemoryCompilerEnabled() bool {
-	if c == nil || c.Agent.MemoryCompiler.Enabled == nil {
-		return true
-	}
-	return *c.Agent.MemoryCompiler.Enabled
-}
-
-// MemoryCompilerVerbosity reports how much Memory v5 state should be injected
-// into model-facing turns. The default observes and learns without prompt
-// injection, so Memory v5 IR is not provider-visible unless opted in.
-func (c *Config) MemoryCompilerVerbosity() string {
-	if c == nil {
-		return MemoryCompilerVerbosityObserve
-	}
-	return NormalizeMemoryCompilerVerbosity(c.Agent.MemoryCompiler.Verbosity)
-}
-
-// NormalizeMemoryCompilerVerbosity accepts current and legacy spellings for the
-// Memory v5 injection mode.
-func NormalizeMemoryCompilerVerbosity(v string) string {
-	switch strings.ToLower(strings.TrimSpace(v)) {
-	case "", "observe", "observed", "silent", "minimal", "none":
-		return MemoryCompilerVerbosityObserve
-	case "compact", "inject", "injected", "contract", "on":
-		return MemoryCompilerVerbosityCompact
-	default:
-		return MemoryCompilerVerbosityObserve
-	}
+	LegacyAnchorSafetyGate   bool     `toml:"legacy_anchor_safety_gate"`  // retired; decoded for compatibility and ignored
+	CompletionValidation     string   `toml:"completion_validation"`      // retired; retained for old config reads
+	CompletionEvaluatorModel string   `toml:"completion_evaluator_model"` // retired; ignored
 }
 
 // ProviderEntry declares a model provider instance. ContextWindow is the model's
 // token budget; the harness compacts older history as a turn's prompt approaches
 // it (see agent compaction). 0 disables compaction for the instance.
 type ProviderEntry struct {
-	Name           string            `toml:"name"`
-	Kind           string            `toml:"kind"`
-	BaseURL        string            `toml:"base_url"`
-	ChatURL        string            `toml:"chat_url"`
-	Model          string            `toml:"model"`      // a single model (back-compat)
-	Models         []string          `toml:"models"`     // a vendor's model list (one base_url/key, many models)
-	ModelsURL      string            `toml:"models_url"` // auto-fetch models from this URL on startup
-	Default        string            `toml:"default"`    // default model when Models is set (else Models[0])
-	APIKeyEnv      string            `toml:"api_key_env"`
-	PresetID       string            `toml:"preset_id"`      // curated preset identity; UI-only metadata, not sent to model providers.
-	PresetVersion  int               `toml:"preset_version"` // curated preset schema version for future migrations.
-	Headers        map[string]string `toml:"headers"`        // optional extra HTTP headers for compatible gateways; secrets should stay in api_key_env.
-	ExtraBody      map[string]any    `toml:"extra_body"`     // optional extra top-level JSON request body fields for OpenAI-compatible gateways.
-	AuthHeader     bool              `toml:"auth_header"`    // for Anthropic-compatible gateways that expect Authorization: Bearer instead of x-api-key.
-	resolvedAPIKey string
-	resolvedSource CredentialSource
-	BalanceURL     string                       `toml:"balance_url"` // optional; a provider-specific wallet-balance endpoint (DeepSeek: https://api.deepseek.com/user/balance). Empty = no balance readout.
-	ContextWindow  int                          `toml:"context_window"`
-	Price          *provider.Pricing            `toml:"price"`  // legacy/provider-wide fallback
-	Prices         map[string]*provider.Pricing `toml:"prices"` // optional per-model prices; keys are model ids
+	DisplayName   string            `toml:"display_name,omitempty"` // UI label; Name remains the stable routing identity.
+	Name          string            `toml:"name"`
+	Kind          string            `toml:"kind"`
+	BaseURL       string            `toml:"base_url"`
+	ChatURL       string            `toml:"chat_url"`    // legacy OpenAI chat endpoint override; retained with its historical semantics
+	RequestURL    string            `toml:"request_url"` // exact provider request URL written by current settings UI
+	Model         string            `toml:"model"`       // a single model (back-compat)
+	Models        []string          `toml:"models"`      // a vendor's model list (one base_url/key, many models)
+	ModelsURL     string            `toml:"models_url"`  // auto-fetch models from this URL on startup
+	Default       string            `toml:"default"`     // default model when Models is set (else Models[0])
+	APIKeyEnv     string            `toml:"api_key_env"`
+	PresetID      string            `toml:"preset_id"`      // curated preset identity; UI-only metadata, not sent to model providers.
+	PresetVersion int               `toml:"preset_version"` // curated preset schema version for future migrations.
+	Headers       map[string]string `toml:"headers"`        // optional extra HTTP headers for compatible gateways; secrets should stay in api_key_env.
+	ExtraBody     map[string]any    `toml:"extra_body"`     // optional extra top-level JSON request body fields for OpenAI-compatible gateways.
+	AuthHeader    bool              `toml:"auth_header"`    // for Anthropic-compatible gateways that expect Authorization: Bearer instead of x-api-key.
+	// ResponsesMode selects the Responses API context strategy. Empty preserves
+	// vendor detection; DeepSeek is stateless while compatible endpoints may use
+	// stateful previous_response_id continuation.
+	ResponsesMode string `toml:"responses_mode"`
+	// ResponsesStateful is the legacy boolean form retained for config
+	// compatibility. ResponsesMode wins when both are present.
+	ResponsesStateful  *bool `toml:"responses_stateful"`
+	resolvedAPIKey     string
+	credentialsFrozen  bool
+	credentialProxyURL string // runtime-only loopback transport, never persisted
+	resolvedSource     CredentialSource
+	BalanceURL         string `toml:"balance_url"` // optional; a provider-specific wallet-balance endpoint (DeepSeek: https://api.deepseek.com/user/balance). Empty = no balance readout.
+	ContextWindow      int    `toml:"context_window"`
+	// MaxOutputTokens is a protocol-neutral total output budget for one turn.
+	// Zero means official DeepSeek omits the field (server 384K ceiling) and
+	// other vendors keep their own defaults. Effort selects thinking depth only.
+	// A positive value is an explicit cost cap. A negative value omits optional
+	// wire limits when the protocol allows; official DeepSeek Anthropic still
+	// sends 384K because max_tokens is mandatory. Never feeds compact_ratio.
+	MaxOutputTokens int                          `toml:"max_output_tokens"`
+	Price           *provider.Pricing            `toml:"price"`  // legacy/provider-wide fallback
+	Prices          map[string]*provider.Pricing `toml:"prices"` // optional per-model prices; keys are model ids
+	// BillingCurrency is the frozen list-price currency (ISO-4217). Independent
+	// of [billing].display_currency; switching display never rewrites this.
+	BillingCurrency string `toml:"billing_currency"`
+	// BillingMode is payg (default) or subscription_equivalent (e.g. MiMo Token Plan).
+	BillingMode string `toml:"billing_mode"`
+
+	persistedOfficialCurrency string
+
 	// Thinking / Effort are provider-kind-specific knobs forwarded to the provider
 	// via Config.Extra. The anthropic provider reads Thinking="adaptive" to enable
 	// extended thinking and Effort ("low".."max") to tune depth. The
 	// openai-compatible provider forwards Effort as reasoning_effort for
-	// thinking-capable models; DeepSeek accepts high|max.
+	// thinking-capable models; DeepSeek V4 Flash accepts low|high|max while
+	// other DeepSeek models retain their model-specific capability mapping.
 	// Empty = provider default.
 	Thinking string `toml:"thinking"`
 	Effort   string `toml:"effort"`
@@ -1089,27 +1394,35 @@ type ProviderEntry struct {
 	// and image tokens are heavy — gating keeps text-only flows cheap (the prompt
 	// prefix is byte-identical with no image, so the cache is unaffected either way).
 	Vision bool `toml:"vision"`
-	// VisionModels narrows image input support to specific models in a multi-model
-	// provider. This lets one provider expose both text-only and multimodal chat
-	// models without enabling image payloads for every model.
+	// VisionModels is legacy; new settings use model-level ModelOverrides.Vision.
+	// Keep this field readable for existing configurations.
 	VisionModels []string `toml:"vision_models"`
 	// VisionDetail sets the openai image_url detail hint (low|high); empty = auto
 	// (the field is omitted). "low" caps an image to a fixed ~85 tokens for cheap
 	// coarse reads; ignored by providers without the knob (e.g. anthropic).
 	VisionDetail string `toml:"vision_detail"`
+	// WebSearch enables independent search with this account. Nil uses the
+	// official DeepSeek default; explicit values and legacy native search
+	// history survive config rewrites.
+	WebSearch *bool `toml:"web_search"`
 	// ReasoningProtocol selects the request shape for OpenAI-compatible reasoning
 	// models. Empty/auto uses the model capability registry plus endpoint
-	// heuristics; none disables automatic reasoning controls for this provider.
+	// heuristics. Explicit values select DeepSeek, GLM, Kimi K3, or standard
+	// OpenAI reasoning contracts; none disables automatic reasoning controls.
 	ReasoningProtocol string `toml:"reasoning_protocol"`
 	// SupportedEfforts lists the /effort levels this provider/model exposes.
-	// When non-empty, it overrides the built-in defaults derived from
-	// Kind/BaseURL and makes /effort configurable. "auto" is the implicit
-	// prefix — always accepted. DefaultEffort resolves it; omit DefaultEffort
-	// (or set one outside this list) to fall back to SupportedEfforts[0].
+	// Non-empty values override built-in Kind/BaseURL defaults except for fixed
+	// Kimi K3 reasoning. "auto" is the implicit prefix — always accepted.
+	// DefaultEffort resolves it; omit DefaultEffort (or set one outside this
+	// list) to fall back to SupportedEfforts[0].
 	SupportedEfforts []string `toml:"supported_efforts"`
 	// DefaultEffort is the /effort level used when the user picks "auto" or
-	// has not set Effort. Ignored when SupportedEfforts is empty.
-	DefaultEffort string `toml:"default_effort"`
+	// has not set Effort. Ignored for empty SupportedEfforts or fixed Kimi K3.
+	DefaultEffort              string `toml:"default_effort"`
+	reasoningAutomatic         bool   // runtime-only vocabulary provenance; never persisted
+	reasoningProtocolAutomatic bool
+	reasoningDefaultAutomatic  bool
+	ReasoningMetadataUnknown   bool `toml:"-" json:"-"` // resolver-backed metadata only
 	// ModelOverrides customizes capability metadata after ResolveModel selects a
 	// concrete model from a multi-model provider. Use it when a gateway exposes
 	// mixed DeepSeek/OpenAI/no-reasoning or mixed vision/text models under one
@@ -1119,13 +1432,9 @@ type ProviderEntry struct {
 	// NoProxy reaches this provider's base_url directly, never through the proxy.
 	// For China-only endpoints a foreign-exit proxy resets the TLS handshake (#2803).
 	NoProxy bool `toml:"no_proxy"`
-}
-
-type ProviderModelOverride struct {
-	ReasoningProtocol string   `toml:"reasoning_protocol"`
-	SupportedEfforts  []string `toml:"supported_efforts"`
-	DefaultEffort     string   `toml:"default_effort"`
-	Vision            *bool    `toml:"vision"`
+	// CacheTTLMinutes overrides the vendor-default prefix-cache retention used by
+	// cold-resume prune. Zero uses the vendor default (DeepSeek/unknown 24h, DashScope/Anthropic 5m).
+	CacheTTLMinutes int `toml:"cache_ttl_minutes"`
 }
 
 // ModelList returns the models this provider exposes: the explicit `models` list,
@@ -1222,12 +1531,7 @@ func (e *ProviderEntry) DefaultModel() string {
 
 // HasModel reports whether m is one of the provider's models.
 func (e *ProviderEntry) HasModel(m string) bool {
-	for _, x := range e.ModelList() {
-		if x == m {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(e.ModelList(), m)
 }
 
 // PriceForModel returns the configured per-1M-token price for model. Per-model
@@ -1260,16 +1564,25 @@ func (e *ProviderEntry) applyModelOverride() {
 		return
 	}
 	if ov.ReasoningProtocol != "" {
+		e.reasoningProtocolAutomatic = false
 		e.ReasoningProtocol = ov.ReasoningProtocol
 	}
 	if ov.SupportedEfforts != nil {
+		e.reasoningAutomatic = false
 		e.SupportedEfforts = append([]string(nil), ov.SupportedEfforts...)
 	}
 	if ov.DefaultEffort != "" || ov.SupportedEfforts != nil {
+		e.reasoningDefaultAutomatic = false
 		e.DefaultEffort = ov.DefaultEffort
 	}
 	if ov.Vision != nil {
 		e.visionOverride = ov.Vision
+	}
+	if ov.ContextWindow > 0 {
+		e.ContextWindow = ov.ContextWindow
+	}
+	if ov.MaxOutputTokens != 0 {
+		e.MaxOutputTokens = ov.MaxOutputTokens
 	}
 }
 
@@ -1279,12 +1592,7 @@ func (e *ProviderEntry) modelOverrideForModel(model string) (ProviderModelOverri
 		return ProviderModelOverride{}, false
 	}
 	if ov, ok := e.ModelOverrides[model]; ok {
-		return ov, true
-	}
-	for k, ov := range e.ModelOverrides {
-		if strings.EqualFold(strings.TrimSpace(k), model) {
-			return ov, true
-		}
+		return explicitModelReasoning(ov), true
 	}
 	return ProviderModelOverride{}, false
 }
@@ -1299,16 +1607,18 @@ func clonePricing(p *provider.Pricing) *provider.Pricing {
 
 // ToolsConfig selects which built-in tools are enabled. Empty means all of them.
 type ToolsConfig struct {
-	Enabled               []string             `toml:"enabled"`
-	BashTimeoutSeconds    *int                 `toml:"bash_timeout_seconds"`
-	MCPCallTimeoutSeconds *int                 `toml:"mcp_call_timeout_seconds"`
-	BackgroundJobs        BackgroundJobsConfig `toml:"background_jobs"`
-	Search                SearchConfig         `toml:"search"`
-	Shell                 ShellConfig          `toml:"shell"`
+	Enabled                  []string             `toml:"enabled"`
+	BashTimeoutSeconds       *int                 `toml:"bash_timeout_seconds"`
+	MCPStartupTimeoutSeconds *int                 `toml:"mcp_startup_timeout_seconds"`
+	MCPCallTimeoutSeconds    *int                 `toml:"mcp_call_timeout_seconds"`
+	BackgroundJobs           BackgroundJobsConfig `toml:"background_jobs"`
+	Search                   SearchConfig         `toml:"search"`
+	Shell                    ShellConfig          `toml:"shell"`
 }
 
 const (
 	defaultBashTimeoutSeconds             = 120
+	defaultMCPStartupTimeoutSeconds       = 30
 	defaultMCPCallTimeoutSeconds          = 300
 	defaultBackgroundJobStalledWarningSec = 900
 	maxBackgroundJobStalledWarningSec     = 86400
@@ -1333,6 +1643,17 @@ func (c *Config) MCPCallTimeoutSeconds() int {
 		return defaultMCPCallTimeoutSeconds
 	}
 	return *c.Tools.MCPCallTimeoutSeconds
+}
+
+// MCPStartupTimeoutSeconds returns the background initialize + tools/list
+// safety cap. Omitted, zero, and negative values keep the built-in default so
+// a slow but healthy MCP can outlive the short interactive wait without running
+// indefinitely.
+func (c *Config) MCPStartupTimeoutSeconds() int {
+	if c.Tools.MCPStartupTimeoutSeconds == nil || *c.Tools.MCPStartupTimeoutSeconds <= 0 {
+		return defaultMCPStartupTimeoutSeconds
+	}
+	return *c.Tools.MCPStartupTimeoutSeconds
 }
 
 // BackgroundJobsConfig tunes parent-created background jobs.
@@ -1378,53 +1699,41 @@ type ShellConfig struct {
 // fall back to allow. Allow/Ask/Deny are rule lists of the form "ToolName" or
 // "ToolName(glob)". Precedence: deny > ask > allow > fallback.
 type PermissionsConfig struct {
-	Mode  string   `toml:"mode"`
-	Allow []string `toml:"allow"`
-	Ask   []string `toml:"ask"`
-	Deny  []string `toml:"deny"`
+	Mode             string   `toml:"mode"`
+	Allow            []string `toml:"allow"`
+	Ask              []string `toml:"ask"`
+	Deny             []string `toml:"deny"`
+	AllowDynamicBash bool     `toml:"allow_dynamic_bash"`
 }
 
-// PluginEntry declares an external MCP server. Type selects the transport:
-// "stdio" (default) launches Command/Args/Env as a subprocess; "http"
-// (a.k.a. streamable-http) and "sse" connect to a remote URL with optional
-// static Headers. String fields support ${VAR} / ${VAR:-default} expansion so
-// secrets (bearer tokens, keys) come from the environment, not the file. The
-// fields mirror Claude Code's mcpServers spec, so entries can come from either
-// reasonix.toml's [[plugins]] or a project-root .mcp.json (see loadMCPJSON).
-type PluginEntry struct {
-	Name    string            `toml:"name"`
-	Type    string            `toml:"type"` // "stdio" (default) | "http" | "sse"
-	Command string            `toml:"command"`
-	Args    []string          `toml:"args"`
-	Env     map[string]string `toml:"env"`
-	URL     string            `toml:"url"`
-	Headers map[string]string `toml:"headers"`
-	// CallTimeoutSeconds overrides the default per-call deadline for this MCP
-	// server. Zero falls back to [tools].mcp_call_timeout_seconds.
-	CallTimeoutSeconds int `toml:"call_timeout_seconds"`
-	// ToolTimeoutSeconds overrides the per-call deadline for raw MCP tool names
-	// from this server. Keys are server-local tool names, not model-visible
-	// mcp__server__tool names.
-	ToolTimeoutSeconds map[string]int `toml:"tool_timeout_seconds"`
-	// TrustedReadOnlyTools names raw MCP tool names that Reasonix should treat as
-	// trusted read-only for planner / plan-mode / read-only research surfaces.
-	// Use this only for tools whose semantics are known to be side-effect free.
-	TrustedReadOnlyTools []string `toml:"trusted_read_only_tools"`
-	// AutoStart controls whether the server connects during session startup.
-	// Nil preserves historical behavior: configured servers start automatically.
-	AutoStart *bool `toml:"auto_start"`
-	// Tier is a legacy compatibility field. New config rendering omits it; enabled
-	// MCP servers connect automatically in the background unless auto_start=false.
-	// Historical values are accepted for old files:
-	//   "eager"      — blocks startup until the handshake completes; required for
-	//                  servers whose tools the system prompt depends on.
-	//   "lazy"       — legacy alias for background.
-	//   "background" — placeholder + spawn fired at boot but not waited on;
-	//                  swap happens once the spawn finishes.
-	// Empty defaults to "background" so enabled MCPs connect automatically
-	// without blocking chat. Unknown non-empty values fall back to "background".
-	Tier         string `toml:"tier"`
-	expansionEnv map[string]string
+// MCPConfigSource records where a merged MCP entry came from. It is runtime
+// provenance only and is never serialized back into TOML or .mcp.json.
+type MCPConfigSource string
+
+const (
+	MCPSourceUnknown        MCPConfigSource = ""
+	MCPSourceUserConfig     MCPConfigSource = "user_config"
+	MCPSourceProjectConfig  MCPConfigSource = "project_config"
+	MCPSourceProjectMCPJSON MCPConfigSource = "project_mcp_json"
+	MCPSourceLegacyUser     MCPConfigSource = "legacy_user_config"
+	MCPSourcePluginPackage  MCPConfigSource = "plugin_package"
+)
+
+func (s MCPConfigSource) UserAuthorized() bool {
+	switch s {
+	case MCPSourceUserConfig, MCPSourceLegacyUser, MCPSourcePluginPackage,
+		MCPSourceProjectConfig, MCPSourceProjectMCPJSON:
+		return true
+	default:
+		return false
+	}
+}
+
+// ProjectScoped reports whether an MCP entry belongs to one workspace. Its
+// activation is keyed per workspace, and it stays disabled until the user
+// records a decision there.
+func (s MCPConfigSource) ProjectScoped() bool {
+	return s == MCPSourceProjectConfig || s == MCPSourceProjectMCPJSON
 }
 
 func (e PluginEntry) ShouldAutoStart() bool {
@@ -1434,6 +1743,9 @@ func (e PluginEntry) ShouldAutoStart() bool {
 // ResolvedTier returns the normalized tier ("eager"|"background") with the
 // project default applied. Legacy lazy and unknown values fall back to
 // background so enabled MCPs are available without manual connection.
+//
+// Tier no longer changes runtime process start timing; it remains for config
+// compatibility and diagnostics only.
 func (e PluginEntry) ResolvedTier() string {
 	return resolvedMCPTier(e.Tier)
 }
@@ -1451,10 +1763,29 @@ func resolvedMCPTier(tier string) string {
 	}
 }
 
+// AutoStartPlugins returns enabled MCP entries for the catalog. Durable
+// overrides in mcp-activation.json win over auto_start; without one a
+// project-declared server is disabled. Enabled servers register cached tools
+// and start on the first real tool call, not at session boot.
 func (c *Config) AutoStartPlugins() []PluginEntry {
+	return c.EnabledPlugins("", DefaultMCPActivationStore())
+}
+
+// EnabledPlugins returns catalog-enabled MCP entries for workspace, consulting
+// the activation store when provided.
+func (c *Config) EnabledPlugins(workspace string, activation *MCPActivationStore) []PluginEntry {
+	if c == nil {
+		return nil
+	}
 	out := make([]PluginEntry, 0, len(c.Plugins))
 	for _, p := range c.Plugins {
-		if p.ShouldAutoStart() {
+		enabled := DeclaredDefaultOn(p)
+		if activation != nil {
+			if resolved, err := activation.IsEnabled(p, workspace); err == nil {
+				enabled = resolved
+			}
+		}
+		if enabled {
 			out = append(out, p)
 		}
 	}
@@ -1462,20 +1793,13 @@ func (c *Config) AutoStartPlugins() []PluginEntry {
 }
 
 // DefaultSystemPrompt is used when config provides none.
-const DefaultSystemPrompt = `You are Reasonix, a coding agent focused on executing code tasks.
-Use the provided tools to read and write files and run shell commands.
-Principles: understand the request before acting; verify with tools instead of
-guessing; keep changes minimal and correct; briefly summarize what you did.
-For multi-step work, track progress with the todo_write tool: lay out the steps,
-keep exactly one in_progress, and flip each to completed as you finish it — update
-the list as you go, not just at the end.
-In plan mode the harness blocks writer tools: do read-only research, then write a
-concise plan as your reply and stop. The user is asked to approve before anything
-is changed; once approved, work through the steps, updating the task list as you go.`
+const DefaultSystemPrompt = `You are Reasonix, a coding agent.
+Use the available tools when they help you complete the user's request.
+Keep changes focused and responses concise.`
 
 // UserDecisionPolicy is appended to every system prompt, including user-custom
 // prompts, so custom personas cannot accidentally remove the `ask` UI contract.
-const UserDecisionPolicy = `User-owned choices: when a real decision belongs to the user — scope, approach, library, risk, manual validation, or any ambiguous or consequential path — and there is no obvious safe default, call the ask tool with 2-4 concrete options so the UI shows a choice. Do not ask in prose, infer a choice from silence, or continue by choosing for the user; do not choose for the user. Tool-approval bypass modes do not answer ask questions or approve plans. If no interactive user is available, the ask tool returns a model-assumption fallback; state that assumption and choose the safest reversible path.`
+const UserDecisionPolicy = `User-owned choices: when a consequential decision has no safe, obvious default, call the ask tool so the user can choose. Otherwise proceed with a sensible reversible default. Do not ask in prose when ask is available. In non-interactive runs, state the assumption and take the safest reversible path.`
 
 // LanguagePolicy is the auto fallback appended to the system prompt when no
 // concrete UI language is resolved. It is static English text, so it stays part
@@ -1488,10 +1812,12 @@ const LanguagePolicy = `Reply in the same language the user is using in their mo
 // Default returns the built-in default configuration.
 func Default() *Config {
 	return &Config{
-		ConfigVersion:    4,
+		ConfigVersion:    openCodeGoInferenceUpgradeVersion,
 		DefaultModel:     "deepseek-flash",
 		CredentialsStore: CredentialsStoreAuto,
-		UI:               UIConfig{Theme: "auto"},
+		UI:               UIConfig{Theme: "auto", ShowTurnUsage: true},
+		Desktop:          DesktopConfig{DefaultToolApprovalMode: "workspace-write", ConversationWidth: "standard"},
+		Billing:          BillingConfig{},
 		Notifications: NotificationsConfig{
 			Enabled:         false,
 			TurnDone:        true,
@@ -1500,36 +1826,36 @@ func Default() *Config {
 		},
 		Agent: AgentConfig{
 			SystemPrompt: DefaultSystemPrompt,
-			// 0 = no step cap: the agent loops until the model gives a final answer,
-			// the user cancels, or the provider errors. Context stays bounded by
-			// compaction, not by a round count. Set a positive agent.max_steps only
-			// if you want a hard guard against runaway.
-			MaxSteps:            0,
-			PlannerMaxSteps:     0,
-			AutoPlan:            "off",
-			SoftCompactRatio:    0.5,
-			ToolResultSnipRatio: 0.6,
-			CompactRatio:        0.8,
-			CompactForceRatio:   0.9,
-			MaxSubagentDepth:    2,
+			// Normal interactive execution has no configurable total round cap. It
+			// is bounded by adaptive progress guards and context compaction instead.
+			MaxSteps:        0,
+			PlannerMaxSteps: 0,
+			AutoPlan:        "off",
+			// Soft/snip/force are load-only compatibility; CompactRatio alone drives maintenance.
+			SoftCompactRatio:       0,
+			ToolResultSnipRatio:    0,
+			CompactRatio:           0.80,
+			CompactForceRatio:      0,
+			ContextEditing:         "",
+			MaxSubagentDepth:       2,
+			MaxSubagentConcurrency: 6,
+			MaxParallelWriters:     3,
 		},
-		// Mode "ask" with no rules keeps `reasonix run` autonomous (no TTY → ask
-		// resolves to allow) while `reasonix` prompts before writers. Users add
-		// deny/allow rules to harden or quiet specific tools.
+		// The policy fallback remains an internal rule-engine input. The active
+		// PermissionPreset supplies the user-facing execution posture, while
+		// explicit deny/ask/allow rules remain authoritative refinements.
 		Permissions: PermissionsConfig{Mode: "ask"},
-		// Sandbox uses platform defaults: macOS/Linux jail bash by default;
-		// Windows defaults bash to off because AppContainer behavior varies by
-		// host, while an explicit bash = "enforce" still enables it. Network=true
-		// here so an absent [sandbox] in a user's file keeps egress (zero value
-		// would wrongly deny it).
+		// Restricted permission presets select the platform sandbox at runtime:
+		// Seatbelt on macOS, bubblewrap on Linux, and the restricted-token helper
+		// on Windows. Network=true preserves normal egress inside that boundary.
 		Sandbox: SandboxConfig{Network: true},
 		// LSP tools on by default, but dormant until a language server is on PATH;
 		// a missing server yields an install hint rather than an error.
 		LSP:     LSPConfig{Enabled: true},
 		Network: NetworkConfig{ProxyMode: netclient.ModeAuto},
 		Bot: BotConfig{
-			ToolApprovalMode:   "ask",
-			MaxSteps:           25,
+			ToolApprovalMode:   "workspace-write",
+			MaxSteps:           0,
 			DebounceMs:         1500,
 			QueueMode:          "steer",
 			QueueCap:           20,
@@ -1540,11 +1866,28 @@ func Default() *Config {
 			Allowlist:          BotAllowlist{Enabled: true},
 			QQ:                 QQBotConfig{AppSecretEnv: "QQ_BOT_APP_SECRET"},
 			Feishu:             FeishuBotConfig{Domain: "feishu", AppSecretEnv: "FEISHU_BOT_APP_SECRET", Mode: "webhook", WebhookPort: 8080, RequireMention: true},
+			Dingtalk:           DingtalkBotConfig{RequireMention: true},
 			Weixin:             WeixinBotConfig{AccountID: "default", TokenEnv: "WEIXIN_BOT_TOKEN", APIBase: "https://ilinkai.weixin.qq.com"},
 		},
+		// Main conversations use Chat Completions; independent web_search uses
+		// the official Messages endpoint with the same account.
 		Providers: []ProviderEntry{
-			{Name: "deepseek-flash", Kind: "openai", BaseURL: "https://api.deepseek.com", Model: "deepseek-v4-flash", APIKeyEnv: "DEEPSEEK_API_KEY", BalanceURL: "https://api.deepseek.com/user/balance", ContextWindow: 1_000_000, Price: deepSeekV4FlashPrice()},
-			{Name: "deepseek-pro", Kind: "openai", BaseURL: "https://api.deepseek.com", Model: "deepseek-v4-pro", APIKeyEnv: "DEEPSEEK_API_KEY", BalanceURL: "https://api.deepseek.com/user/balance", ContextWindow: 1_000_000, Price: deepSeekV4ProPrice()},
+			{
+				Name: "deepseek-flash", Kind: "openai", BaseURL: "https://api.deepseek.com",
+				Model: "deepseek-flash", APIKeyEnv: "DEEPSEEK_API_KEY",
+				BalanceURL: "https://api.deepseek.com/user/balance", Thinking: "enabled",
+				WebSearch: boolPointer(true), SupportedEfforts: []string{"disabled", "low", "high", "max"}, DefaultEffort: "high",
+				ContextWindow: 1_000_000, Price: deepSeekV4FlashPriceUSD(),
+				BillingCurrency: "USD", BillingMode: "payg",
+			},
+			{
+				Name: "deepseek-pro", Kind: "openai", BaseURL: "https://api.deepseek.com",
+				Model: "deepseek-v4-pro", APIKeyEnv: "DEEPSEEK_API_KEY",
+				BalanceURL: "https://api.deepseek.com/user/balance", Thinking: "enabled",
+				WebSearch: boolPointer(true), SupportedEfforts: []string{"disabled", "low", "high", "max"}, DefaultEffort: "high",
+				ContextWindow: 1_000_000, Price: deepSeekV4ProPriceUSD(),
+				BillingCurrency: "USD", BillingMode: "payg",
+			},
 		},
 	}
 }
@@ -1554,7 +1897,7 @@ func Default() *Config {
 // main config into an unparseable state that leaves the app with no usable
 // models (#4615, #4708).
 func (c *Config) WriteFile(path string) error {
-	return fileutil.AtomicWriteFile(path, []byte(RenderTOMLForScope(c, renderScopeForPath(path))), configFilePerm(path))
+	return atomicWriteToConfigFile(path, RenderTOMLForScope(c, renderScopeForPath(path)), configFilePerm(path))
 }
 
 // Provider returns the named provider entry.
@@ -1578,20 +1921,34 @@ func (c *Config) Provider(name string) (*ProviderEntry, bool) {
 // without duplicating base_url/api_key_env. Single-`model` entries still resolve
 // by provider name, keeping older configs working unchanged.
 func (c *Config) ResolveModel(ref string) (*ProviderEntry, bool) {
+	if entry, ok := c.resolveCurrentModel(ref); ok {
+		return entry, true
+	}
+	target, err := c.resolveOpenCodeGoAlias(ref, false)
+	if err != nil || target == ref {
+		return nil, false
+	}
+	return c.resolveCurrentModel(target)
+}
+
+func (c *Config) resolveCurrentModel(ref string) (*ProviderEntry, bool) {
 	if ref == "" {
 		return nil, false
 	}
 	if access := desktopProviderAccessMap(c.Desktop.ProviderAccess); len(access) > 0 {
+		if access["deepseek"] && !canCanonicalizeLegacyDeepSeekProviders(c) {
+			delete(access, "deepseek")
+		}
 		ref = retargetDesktopOfficialRef(ref, access)
 	}
 	// "provider/model"
 	if prov, model, ok := strings.Cut(ref, "/"); ok {
-		if e, found := c.Provider(prov); found && e.HasModel(model) {
+		if e, found := c.Provider(prov); found && acceptsDeepSeekModelReference(e, model) {
 			cp := *e
 			cp.Model = model
 			cp.applyModelPrice()
 			cp.applyModelOverride()
-			return &cp, true
+			return ResolveReasoningEntry(&cp), true
 		}
 	}
 	// a provider name → its default model
@@ -1600,16 +1957,16 @@ func (c *Config) ResolveModel(ref string) (*ProviderEntry, bool) {
 		cp.Model = e.DefaultModel()
 		cp.applyModelPrice()
 		cp.applyModelOverride()
-		return &cp, true
+		return ResolveReasoningEntry(&cp), true
 	}
 	// a bare model name → the provider that lists it
 	for i := range c.Providers {
-		if c.Providers[i].HasModel(ref) {
+		if acceptsDeepSeekModelReference(&c.Providers[i], ref) {
 			cp := c.Providers[i]
 			cp.Model = ref
 			cp.applyModelPrice()
 			cp.applyModelOverride()
-			return &cp, true
+			return ResolveReasoningEntry(&cp), true
 		}
 	}
 	return nil, false
@@ -1621,6 +1978,9 @@ func (c *Config) ResolveModel(ref string) (*ProviderEntry, bool) {
 // configured provider — so preference isn't overwritten by iteration order.
 func (c *Config) ResolveModelWithFallback(ref string) (resolvedRef string, fallback bool, ok bool) {
 	ref = strings.TrimSpace(ref)
+	if c.ModelReferenceError(ref) != nil {
+		return "", false, false
+	}
 	if ref != "" {
 		if e, found := c.ResolveModel(ref); found {
 			return e.Name + "/" + e.Model, false, true
@@ -1648,12 +2008,94 @@ func (c *Config) ResolveModelWithFallback(ref string) (resolvedRef string, fallb
 	return "", false, false
 }
 
+// ResolveNewSessionChatModel selects the model for a newly-created chat
+// session. Configured candidates win; if every chat candidate is keyless, the
+// valid default (or first chat model) is preserved so callers can surface their
+// existing missing-key recovery UI. An unknown default is also preserved for
+// the CLI's actionable configuration error. Provider order is otherwise stable.
+func (c *Config) ResolveNewSessionChatModel() (resolvedRef string, fallback bool, ok bool) {
+	return c.resolveNewSessionChatModel(nil, true)
+}
+
+func (c *Config) resolveNewSessionChatModel(providerAllowed func(string) bool, preserveUnknownDefault bool) (resolvedRef string, fallback bool, ok bool) {
+	if c == nil {
+		return "", false, false
+	}
+	if providerAllowed == nil {
+		providerAllowed = func(string) bool { return true }
+	}
+
+	def := strings.TrimSpace(c.DefaultModel)
+	keylessDefault := ""
+	if def != "" {
+		if entry, found := c.ResolveModel(def); found {
+			if providerAllowed(entry.Name) && IsLikelyChatModel(entry.Model) {
+				if entry.Configured() {
+					return def, false, true
+				}
+				keylessDefault = def
+			}
+		} else if preserveUnknownDefault {
+			// CLI/boot callers need the stale value intact so their existing
+			// unknown-model error can name it and explain the providers that
+			// replaced it. Desktop uses its recovery UI and does not preserve it.
+			return def, false, true
+		}
+	}
+
+	keylessFallback := ""
+	for i := range c.Providers {
+		p := &c.Providers[i]
+		if !providerAllowed(p.Name) {
+			continue
+		}
+		chatModels := p.ChatModelList()
+		if len(chatModels) == 0 {
+			continue
+		}
+		model := chatModels[0]
+		for _, candidate := range chatModels {
+			if candidate == p.DefaultModel() {
+				model = candidate
+				break
+			}
+		}
+		resolved := p.Name + "/" + model
+		if p.Configured() {
+			return resolved, true, true
+		}
+		if keylessFallback == "" {
+			keylessFallback = resolved
+		}
+	}
+	if keylessDefault != "" {
+		return keylessDefault, false, true
+	}
+	if keylessFallback != "" {
+		return keylessFallback, true, true
+	}
+	return "", false, false
+}
+
+// ResolveDesktopNewSessionModel selects the model for a newly-created desktop
+// session. It shares the chat-model fallback policy with other frontends while
+// limiting candidates to providers exposed by the desktop access catalog.
+func (c *Config) ResolveDesktopNewSessionModel() (resolvedRef string, fallback bool, ok bool) {
+	if c == nil {
+		return "", false, false
+	}
+	access := desktopProviderAccessMap(c.Desktop.ProviderAccess)
+	return c.resolveNewSessionChatModel(func(name string) bool {
+		return c.Desktop.ProviderAccess == nil || access[strings.TrimSpace(name)]
+	}, false)
+}
+
 // APIKey resolves the entry's API key from its api_key_env.
 func (e *ProviderEntry) APIKey() string {
 	if e == nil {
 		return ""
 	}
-	if e.resolvedAPIKey != "" {
+	if e.credentialsFrozen || e.resolvedAPIKey != "" {
 		return e.resolvedAPIKey
 	}
 	if e.APIKeyEnv == "" {
@@ -1750,23 +2192,98 @@ func (c *Config) ResolveSystemPrompt() (string, error) {
 
 // ResolveSystemPromptForRoot is like ResolveSystemPrompt but resolves a relative
 // system_prompt_file against root. Desktop tabs pass their workspace root here so
-// prompt files are project-scoped even when the process cwd is elsewhere.
+// prompt files are project-scoped even when the process cwd is elsewhere. A path
+// inherited from user config may fall back to Reasonix home, while a path chosen
+// by project config is confined to the workspace and never probes user files.
 func (c *Config) ResolveSystemPromptForRoot(root string) (string, error) {
-	if c.Agent.SystemPromptFile != "" {
-		path := c.Agent.SystemPromptFile
-		if !filepath.IsAbs(path) {
-			path = filepath.Join(resolveRoot(root), path)
+	path := c.Agent.SystemPromptFile
+	if path == "" {
+		return c.InlineSystemPrompt(), nil
+	}
+
+	if c.systemPromptFileSource == promptFileSourceProject {
+		if filepath.IsAbs(path) || !filepath.IsLocal(filepath.Clean(path)) {
+			return "", fmt.Errorf("project system_prompt_file %q must be a relative path within the workspace", path)
 		}
-		b, err := os.ReadFile(path)
+		candidate := filepath.Join(resolveRoot(root), path)
+		b, err := readProjectSystemPromptFile(root, path)
 		if err != nil {
-			return "", fmt.Errorf("system_prompt_file: %w", err)
+			return "", newSystemPromptFileError(path, []string{candidate}, []error{err})
 		}
 		return strings.TrimSpace(string(b)), nil
 	}
-	if strings.TrimSpace(c.Agent.SystemPrompt) == "" {
-		return DefaultSystemPrompt, nil
+
+	if filepath.IsAbs(path) {
+		b, err := fileencoding.ReadFileUTF8(path)
+		if err != nil {
+			return "", newSystemPromptFileError(path, []string{path}, []error{err})
+		}
+		return strings.TrimSpace(string(b)), nil
 	}
-	return c.Agent.SystemPrompt, nil
+
+	candidates := []string{filepath.Join(resolveRoot(root), path)}
+	if home := ReasonixHomeDir(); home != "" {
+		homeCandidate := filepath.Join(home, path)
+		if filepath.Clean(homeCandidate) != filepath.Clean(candidates[0]) {
+			candidates = append(candidates, homeCandidate)
+		}
+	}
+	readErrors := make([]error, 0, len(candidates))
+	for _, candidate := range candidates {
+		b, err := fileencoding.ReadFileUTF8(candidate)
+		if err == nil {
+			return strings.TrimSpace(string(b)), nil
+		}
+		readErrors = append(readErrors, fmt.Errorf("%s: %w", candidate, err))
+	}
+	return "", newSystemPromptFileError(path, candidates, readErrors)
+}
+
+func readProjectSystemPromptFile(root, path string) ([]byte, error) {
+	workspace, err := filepath.Abs(resolveRoot(root))
+	if err != nil {
+		return nil, fmt.Errorf("resolve workspace root: %w", err)
+	}
+	rootHandle, err := os.OpenRoot(workspace)
+	if err != nil {
+		return nil, fmt.Errorf("open workspace root %q: %w", workspace, err)
+	}
+	defer rootHandle.Close()
+	f, err := rootHandle.Open(filepath.Clean(path))
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	b, err := io.ReadAll(f)
+	if err != nil {
+		return nil, err
+	}
+	return fileencoding.DecodeToUTF8(b), nil
+}
+
+func newSystemPromptFileError(configured string, candidates []string, readErrors []error) error {
+	allMissing := len(readErrors) > 0
+	for _, err := range readErrors {
+		if !errors.Is(err, fs.ErrNotExist) {
+			allMissing = false
+			break
+		}
+	}
+	return &systemPromptFileError{
+		configured: configured,
+		candidates: append([]string(nil), candidates...),
+		errors:     append([]error(nil), readErrors...),
+		allMissing: allMissing,
+	}
+}
+
+// InlineSystemPrompt returns the configured system_prompt, or DefaultSystemPrompt
+// when unset. It is the fallback when system_prompt_file cannot be read.
+func (c *Config) InlineSystemPrompt() string {
+	if strings.TrimSpace(c.Agent.SystemPrompt) == "" {
+		return DefaultSystemPrompt
+	}
+	return c.Agent.SystemPrompt
 }
 
 // Validate checks that the selected model's provider is usable.
@@ -1780,6 +2297,9 @@ func (c *Config) Validate(model string) error {
 	}
 	if e.BaseURL == "" {
 		return fmt.Errorf("provider %q: base_url is required", model)
+	}
+	if strings.TrimSpace(e.APIKeyEnv) != "" && !IsValidCredentialKey(e.APIKeyEnv) {
+		return fmt.Errorf("provider %q: api_key_env %q is invalid; use letters, numbers, and underscores, not a model name", model, e.APIKeyEnv)
 	}
 	if e.RequiresAPIKey() && e.APIKey() == "" {
 		return fmt.Errorf("provider %q: missing env %s", model, e.APIKeyEnv)

@@ -3,6 +3,7 @@ package control
 import (
 	"context"
 	"fmt"
+	"slices"
 	"sync"
 	"time"
 
@@ -27,11 +28,40 @@ type mcpManager struct {
 	host      *plugin.Host
 	reg       *tool.Registry
 	pluginCtx context.Context
+	// hostProfile is the fallback surface for lazily created hosts (controllers
+	// built without an injected one). An injected host's own profile wins.
+	hostProfile plugin.HostProfile
 }
 
-func newMcpManager(host *plugin.Host, reg *tool.Registry, pluginCtx context.Context) mcpManager {
-	return mcpManager{host: host, reg: reg, pluginCtx: pluginCtx}
+func newMcpManager(host *plugin.Host, reg *tool.Registry, pluginCtx context.Context, profile plugin.HostProfile) mcpManager {
+	return mcpManager{host: host, reg: reg, pluginCtx: pluginCtx, hostProfile: profile.Normalize()}
 }
+
+// hostProfileOf returns the live host's profile, or the configured fallback
+// when no host exists yet.
+func (m *mcpManager) hostProfileOf() plugin.HostProfile {
+	m.mu.Lock()
+	host := m.host
+	profile := m.hostProfile
+	m.mu.Unlock()
+	if host != nil {
+		return host.Profile()
+	}
+	return profile.Normalize()
+}
+
+// MCPCapabilityViews returns the host's four-layer capability matrix for MCP
+// status surfaces.
+func (c *Controller) MCPCapabilityViews() []plugin.CapabilityView {
+	if host := c.mcp.hostRef(); host != nil {
+		return host.CapabilityViews()
+	}
+	return plugin.NewHostWithProfile(c.mcp.hostProfileOf()).CapabilityViews()
+}
+
+// mcpHostProfile reports the session's MCP capability profile for cache
+// identity selection.
+func (c *Controller) mcpHostProfile() plugin.HostProfile { return c.mcp.hostProfileOf() }
 
 // hostRef returns the live plugin host (nil until one is injected or lazily
 // created), for the SessionAPI Host() accessor and the nil-safe read wrappers.
@@ -47,7 +77,7 @@ func (m *mcpManager) hostRef() *plugin.Host {
 func (m *mcpManager) connectSpec(s plugin.Spec) (int, error) {
 	m.mu.Lock()
 	if m.host == nil {
-		m.host = plugin.NewHost()
+		m.host = plugin.NewHostWithProfile(m.hostProfile)
 	}
 	host, ctx, reg := m.host, m.pluginCtx, m.reg
 	m.mu.Unlock()
@@ -67,6 +97,42 @@ func (m *mcpManager) connectSpec(s plugin.Spec) (int, error) {
 	if reg != nil {
 		reg.ResumePrefix(plugin.ToolPrefix(s.Name))
 		reg.RemovePrefix(plugin.ToolPrefix(s.Name))
+		for _, t := range tools {
+			reg.Add(t)
+		}
+	}
+	return len(tools), nil
+}
+
+// registerSpecOnDemand restores one enabled server into this session's tool
+// registry without starting a disconnected process. A live shared-host client
+// is reused immediately; otherwise cached lazy tools (or one connect stub on a
+// cache miss) start the server only when the model makes the first real call.
+func (m *mcpManager) registerSpecOnDemand(s plugin.Spec) (int, error) {
+	m.mu.Lock()
+	if m.host == nil {
+		m.host = plugin.NewHostWithProfile(m.hostProfile)
+	}
+	host, ctx, reg := m.host, m.pluginCtx, m.reg
+	m.mu.Unlock()
+
+	var tools []tool.Tool
+	if host.HasClient(s.Name) {
+		toolsCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		defer cancel()
+		var err error
+		tools, err = host.ToolsFor(toolsCtx, s.Name)
+		if err != nil {
+			return 0, err
+		}
+	} else {
+		cached, _ := plugin.LoadCachedSchemaForSpecProfile(s, host.Profile())
+		tools = plugin.LazyToolset(s, cached, host, reg, ctx, false)
+	}
+	if reg != nil {
+		prefix := plugin.ToolPrefix(s.Name)
+		reg.ResumePrefix(prefix)
+		reg.RemovePrefix(prefix)
 		for _, t := range tools {
 			reg.Add(t)
 		}
@@ -137,12 +203,7 @@ func (m *mcpManager) serverNames() []string {
 
 // hasServer reports whether a server is live.
 func (m *mcpManager) hasServer(name string) bool {
-	for _, n := range m.serverNames() {
-		if n == name {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(m.serverNames(), name)
 }
 
 // prompts lists the live MCP prompts (nil when no host is connected).

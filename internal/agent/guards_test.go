@@ -6,12 +6,14 @@ import (
 	"errors"
 	"reflect"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 	"unicode/utf8"
 
 	"reasonix/internal/event"
+	"reasonix/internal/evidence"
 	"reasonix/internal/provider"
 	"reasonix/internal/tool"
 	_ "reasonix/internal/tool/builtin"
@@ -83,22 +85,27 @@ func TestFinishReasonMessage(t *testing.T) {
 	}
 }
 
-// TestEmptyFinalNotice carries the diagnostics that tell the three empty-answer
-// causes apart in reports: which provider, how it stopped, and whether the model
-// produced reasoning-only output.
+// TestEmptyFinalNotice keeps the user-facing line short while preserving the
+// diagnostics that tell empty-answer causes apart in expandable details.
 func TestEmptyFinalNotice(t *testing.T) {
-	msg := emptyFinalNotice("deepseek-flash", &provider.Usage{FinishReason: "stop"}, 512)
-	for _, want := range []string{"deepseek-flash", "finish=stop", "reasoning=512"} {
-		if !strings.Contains(msg, want) {
-			t.Errorf("notice %q missing %q", msg, want)
+	msg := emptyFinalNotice()
+	for _, hidden := range []string{"blocked", "finish=", "reasoning="} {
+		if strings.Contains(msg, hidden) {
+			t.Errorf("notice %q should not expose internal diagnostic %q", msg, hidden)
 		}
 	}
-	if got := emptyFinalNotice("p", nil, 0); !strings.Contains(got, "finish=unknown") {
+	detail := emptyFinalNoticeDetail("deepseek-flash", &provider.Usage{FinishReason: "stop"}, 512)
+	for _, want := range []string{"deepseek-flash", "finish=stop", "reasoning=512"} {
+		if !strings.Contains(detail, want) {
+			t.Errorf("notice detail %q missing %q", detail, want)
+		}
+	}
+	if got := emptyFinalNoticeDetail("p", nil, 0); !strings.Contains(got, "finish=unknown") {
 		t.Errorf("nil usage should report finish=unknown, got %q", got)
 	}
 }
 
-// --- parallel-dispatch tests ---
+// parallel-dispatch tests
 
 // fakeTool is a minimal Tool stand-in for dispatch tests; ReadOnly is
 // configurable and Execute sleeps a fixed duration so we can measure
@@ -109,6 +116,68 @@ type fakeTool struct {
 	delay    time.Duration
 	err      error
 	calls    *int32 // shared counter to assert all dispatched
+}
+
+type blockingTool struct {
+	name    string
+	started chan struct{}
+	release chan struct{}
+}
+
+func (b blockingTool) Name() string            { return b.name }
+func (b blockingTool) Description() string     { return "" }
+func (b blockingTool) Schema() json.RawMessage { return json.RawMessage(`{"type":"object"}`) }
+func (b blockingTool) ReadOnly() bool          { return true }
+func (b blockingTool) Execute(ctx context.Context, _ json.RawMessage) (string, error) {
+	close(b.started)
+	select {
+	case <-b.release:
+		return b.name + " done", nil
+	case <-ctx.Done():
+		return "", ctx.Err()
+	}
+}
+
+type workspaceSignalSink struct {
+	mu        sync.Mutex
+	events    []event.Event
+	mutations chan event.WorkspaceMutation
+}
+
+type failingToolDispatchSink struct{ err error }
+
+func (s failingToolDispatchSink) Emit(event.Event) {}
+func (s failingToolDispatchSink) EmitChecked(e event.Event) error {
+	if e.Kind == event.ToolDispatch {
+		return s.err
+	}
+	return nil
+}
+
+func newWorkspaceSignalSink() *workspaceSignalSink {
+	return &workspaceSignalSink{mutations: make(chan event.WorkspaceMutation, 8)}
+}
+
+func (s *workspaceSignalSink) Emit(e event.Event) {
+	s.mu.Lock()
+	s.events = append(s.events, e)
+	s.mu.Unlock()
+}
+
+func (s *workspaceSignalSink) RecordWorkspaceMutation(m event.WorkspaceMutation) {
+	s.mutations <- m
+}
+
+func (s *workspaceSignalSink) kinds(kind event.Kind) []event.Event {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var out []event.Event
+	for _, e := range s.events {
+		if e.Kind == kind {
+			out = append(out, e)
+		}
+	}
+	return out
 }
 
 func (f fakeTool) Name() string            { return f.name }
@@ -177,19 +246,32 @@ func TestPartitionToolCallsUnknownToolSerial(t *testing.T) {
 	}
 }
 
-// TestPartitionToolCallsCompleteStepSerial verifies complete_step never joins a
-// parallel read-only run: it reads the turn's receipts, so the prior reads must
-// finish (and record) in an earlier batch before it runs in its own serial one.
-func TestPartitionToolCallsCompleteStepSerial(t *testing.T) {
+// A retired tool accidentally present in an embedding registry carries no
+// active receipt semantics and does not change read-only partitioning.
+func TestPartitionToolCallsRetiredToolHasNoBarrier(t *testing.T) {
 	reg := tool.NewRegistry()
 	reg.Add(fakeTool{name: "read_file", readOnly: true})
 	reg.Add(fakeTool{name: "complete_step", readOnly: true})
 
 	calls := []provider.ToolCall{{Name: "read_file"}, {Name: "complete_step"}}
 	got := partitionToolCalls(reg, calls)
+	want := []toolCallBatch{{start: 0, end: 2, parallel: true}}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("partitionToolCalls = %+v, want %+v", got, want)
+	}
+}
+
+func TestPartitionToolCallsCompressSerial(t *testing.T) {
+	reg := tool.NewRegistry()
+	reg.Add(fakeTool{name: "read_file", readOnly: true})
+	reg.Add(fakeTool{name: "compress", readOnly: true})
+
+	calls := []provider.ToolCall{{Name: "read_file"}, {Name: "compress"}, {Name: "read_file"}}
+	got := partitionToolCalls(reg, calls)
 	want := []toolCallBatch{
 		{start: 0, end: 1, parallel: true},
 		{start: 1, end: 2},
+		{start: 2, end: 3, parallel: true},
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("partitionToolCalls = %+v, want %+v", got, want)
@@ -213,6 +295,25 @@ func TestPartitionToolCallsTodoWriteSerial(t *testing.T) {
 	}
 }
 
+func TestPartitionToolCallsBackgroundCollectorsSerial(t *testing.T) {
+	reg := tool.NewRegistry()
+	reg.Add(fakeTool{name: "read_file", readOnly: true})
+	reg.Add(fakeTool{name: "wait", readOnly: true})
+	reg.Add(fakeTool{name: "bash_output", readOnly: true})
+
+	calls := []provider.ToolCall{{Name: "read_file"}, {Name: "wait"}, {Name: "bash_output"}, {Name: "read_file"}}
+	got := partitionToolCalls(reg, calls)
+	want := []toolCallBatch{
+		{start: 0, end: 1, parallel: true},
+		{start: 1, end: 2},
+		{start: 2, end: 3},
+		{start: 3, end: 4, parallel: true},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("partitionToolCalls = %+v, want %+v", got, want)
+	}
+}
+
 // TestExecuteBatchParallelReadOnly checks that three 80ms read-only calls
 // complete in well under 3×80ms — the wall-clock proof of true parallelism.
 func TestExecuteBatchParallelReadOnly(t *testing.T) {
@@ -226,7 +327,8 @@ func TestExecuteBatchParallelReadOnly(t *testing.T) {
 	a := New(nil, reg, NewSession(""), Options{}, event.Discard)
 
 	start := time.Now()
-	results := a.executeBatch(context.Background(), []provider.ToolCall{{Name: "a"}, {Name: "b"}, {Name: "c"}})
+	batch := a.executeBatch(context.Background(), &a.turn, []provider.ToolCall{{Name: "a"}, {Name: "b"}, {Name: "c"}})
+	results := batch.results
 	elapsed := time.Since(start)
 
 	if calls != 3 {
@@ -241,6 +343,169 @@ func TestExecuteBatchParallelReadOnly(t *testing.T) {
 	}
 }
 
+func TestExecuteBatchDoesNotRunAnyToolWhenDispatchPersistenceFails(t *testing.T) {
+	wantErr := errors.New("ledger unavailable")
+	var calls int32
+	reg := tool.NewRegistry()
+	reg.Add(fakeTool{name: "read_file", readOnly: true, calls: &calls})
+	reg.Add(fakeTool{name: "write_file", calls: &calls})
+	a := New(nil, reg, NewSession(""), Options{}, failingToolDispatchSink{err: wantErr})
+	batch := a.executeBatch(context.Background(), &a.turn, []provider.ToolCall{
+		{ID: "read", Name: "read_file"},
+		{ID: "write", Name: "write_file"},
+	})
+	if !errors.Is(batch.err, wantErr) {
+		t.Fatalf("batch error = %v, want %v", batch.err, wantErr)
+	}
+	if got := atomic.LoadInt32(&calls); got != 0 {
+		t.Fatalf("executed %d tools after dispatch persistence failed", got)
+	}
+}
+
+func TestExecuteBatchStampsToolResultTimestamps(t *testing.T) {
+	const delay = 30 * time.Millisecond
+	reg := tool.NewRegistry()
+	reg.Add(fakeTool{name: "a", readOnly: true, delay: delay})
+
+	sink := &recordSink{}
+	a := New(nil, reg, NewSession(""), Options{}, sink)
+
+	before := time.Now().UnixMilli()
+	a.executeBatch(context.Background(), &a.turn, []provider.ToolCall{{Name: "a"}})
+	after := time.Now().UnixMilli()
+
+	results := sink.kinds(event.ToolResult)
+	if len(results) != 1 {
+		t.Fatalf("got %d tool results, want 1", len(results))
+	}
+	tr := results[0].Tool
+	if tr.StartedAt < before || tr.StartedAt > after {
+		t.Errorf("StartedAt = %d, want within [%d, %d]", tr.StartedAt, before, after)
+	}
+	if tr.EndedAt != tr.StartedAt+tr.DurationMs {
+		t.Errorf("EndedAt = %d, want StartedAt+DurationMs = %d", tr.EndedAt, tr.StartedAt+tr.DurationMs)
+	}
+	if tr.DurationMs < delay.Milliseconds() {
+		t.Errorf("DurationMs = %d, want >= %d", tr.DurationMs, delay.Milliseconds())
+	}
+}
+
+func TestExecuteBatchMarksOnlyExecutedWritersForWorkspaceRefresh(t *testing.T) {
+	reg := tool.NewRegistry()
+	reg.Add(fakeTool{name: "write_file"})
+	reg.Add(fakeTool{name: "read_file", readOnly: true})
+	sink := &recordSink{}
+	a := New(nil, reg, NewSession(""), Options{}, sink)
+	a.executeBatch(context.Background(), &a.turn, []provider.ToolCall{
+		{Name: "write_file", Arguments: `{"path":"pkg/main.go","content":"x"}`},
+		{Name: "read_file", Arguments: `{"path":"pkg/main.go"}`},
+	})
+	results := sink.kinds(event.ToolResult)
+	if len(results) != 2 {
+		t.Fatalf("got %d results, want 2", len(results))
+	}
+	if !results[0].Tool.WorkspaceMutation || len(results[0].Tool.WorkspacePaths) != 1 || results[0].Tool.WorkspacePaths[0] != "pkg/main.go" {
+		t.Fatalf("writer metadata = %+v", results[0].Tool)
+	}
+	if results[1].Tool.WorkspaceMutation {
+		t.Fatalf("read-only call was marked as mutation: %+v", results[1].Tool)
+	}
+}
+
+func TestExecuteBatchMarksFailedWriterForWorkspaceRefresh(t *testing.T) {
+	reg := tool.NewRegistry()
+	reg.Add(fakeTool{name: "write_file", err: errors.New("partial write")})
+	sink := &recordSink{}
+	a := New(nil, reg, NewSession(""), Options{}, sink)
+	a.executeBatch(context.Background(), &a.turn, []provider.ToolCall{{Name: "write_file", Arguments: `{"path":"partial.go"}`}})
+	results := sink.kinds(event.ToolResult)
+	if len(results) != 1 || !results[0].Tool.WorkspaceMutation {
+		t.Fatalf("failed writer did not invalidate workspace: %+v", results)
+	}
+}
+
+func TestExecuteBatchPublishesWorkspaceMutationBeforeLaterToolCompletes(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	reg := tool.NewRegistry()
+	reg.Add(fakeTool{name: "write_file"})
+	reg.Add(blockingTool{name: "slow_read", started: started, release: release})
+	sink := newWorkspaceSignalSink()
+	a := New(nil, reg, NewSession(""), Options{}, sink)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		a.executeBatch(context.Background(), &a.turn, []provider.ToolCall{
+			{Name: "write_file", Arguments: `{"path":"ready.go","content":"x"}`},
+			{Name: "slow_read", Arguments: `{}`},
+		})
+	}()
+
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("later tool did not start")
+	}
+	select {
+	case mutation := <-sink.mutations:
+		if mutation.ToolName != "write_file" || len(mutation.Paths) != 1 || mutation.Paths[0] != "ready.go" {
+			t.Fatalf("workspace mutation = %+v", mutation)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("writer completion did not publish before the later tool completed")
+	}
+	if results := sink.kinds(event.ToolResult); len(results) != 1 || results[0].Tool.Name != "write_file" {
+		t.Fatalf("completed writer must be checkpointed before the next tool: %+v", results)
+	}
+	close(release)
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("batch did not finish after releasing the later tool")
+	}
+}
+
+func TestWorkspaceMutationClassifierTreatsGitCommitAsGitMetadata(t *testing.T) {
+	mutation, ok := workspaceMutationForCall("call", "bash", json.RawMessage(`{"command":"git commit -m test"}`), false)
+	if !ok || !mutation.GitMeta || mutation.Content || mutation.WorkingTree || mutation.Tree || !mutation.AllPaths {
+		t.Fatalf("git commit workspace invalidation = %+v, ok=%v", mutation, ok)
+	}
+	mutation, ok = workspaceMutationForCall("call", "bash", json.RawMessage(`{"command":"git commit -am test"}`), false)
+	if !ok || !mutation.GitMeta || !mutation.Content || !mutation.WorkingTree || !mutation.Tree {
+		t.Fatalf("content-writing git commit invalidation = %+v, ok=%v", mutation, ok)
+	}
+	if mutation, ok = workspaceMutationForCall("call", "bash", json.RawMessage(`{"command":"go test ./..."}`), false); ok {
+		t.Fatalf("ordinary verifier invalidated durable workspace state: %+v", mutation)
+	}
+	if mutation, ok = workspaceMutationForCall("call", "bash", json.RawMessage(`{"command":"date --set tomorrow"}`), false); ok {
+		t.Fatalf("host-only state write invalidated the workspace: %+v", mutation)
+	}
+	if mutation, ok = workspaceMutationForCall("call", "remember", json.RawMessage(`{"name":"preference"}`), false); ok {
+		t.Fatalf("host-only memory write invalidated the workspace: %+v", mutation)
+	}
+}
+
+func TestExecuteBatchCancelledCallsCarryNoTimestamps(t *testing.T) {
+	reg := tool.NewRegistry()
+	reg.Add(fakeTool{name: "a", readOnly: true})
+
+	sink := &recordSink{}
+	a := New(nil, reg, NewSession(""), Options{}, sink)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	a.executeBatch(ctx, &a.turn, []provider.ToolCall{{Name: "a"}})
+
+	results := sink.kinds(event.ToolResult)
+	if len(results) != 1 {
+		t.Fatalf("got %d tool results, want 1", len(results))
+	}
+	tr := results[0].Tool
+	if tr.StartedAt != 0 || tr.EndedAt != 0 {
+		t.Errorf("never-ran call has StartedAt=%d EndedAt=%d, want both zero", tr.StartedAt, tr.EndedAt)
+	}
+}
+
 // TestExecuteBatchSegmentsAroundWrites ensures a write call only serializes its
 // own position in the provider-ordered batch: read-only runs before and after it
 // may still parallelise within their contiguous segments.
@@ -248,7 +513,7 @@ func TestExecuteBatchSegmentsAroundWrites(t *testing.T) {
 	// A larger per-call delay keeps fixed scheduler jitter on loaded CI a small
 	// fraction of the segment time, so the tight relative bound below stays
 	// reliable instead of being widened toward the serial floor.
-	const delay = 100 * time.Millisecond
+	const delay = 150 * time.Millisecond
 	reg := tool.NewRegistry()
 	reg.Add(fakeTool{name: "ro1", readOnly: true, delay: delay})
 	reg.Add(fakeTool{name: "ro2", readOnly: true, delay: delay})
@@ -259,13 +524,14 @@ func TestExecuteBatchSegmentsAroundWrites(t *testing.T) {
 	a := New(nil, reg, NewSession(""), Options{}, event.Discard)
 
 	start := time.Now()
-	results := a.executeBatch(context.Background(), []provider.ToolCall{
+	batch := a.executeBatch(context.Background(), &a.turn, []provider.ToolCall{
 		{Name: "ro1"},
 		{Name: "ro2"},
 		{Name: "rw"},
 		{Name: "ro3"},
 		{Name: "ro4"},
 	})
+	results := batch.results
 	elapsed := time.Since(start)
 
 	want := []string{"ro1 done", "ro2 done", "rw done", "ro3 done", "ro4 done"}
@@ -273,7 +539,7 @@ func TestExecuteBatchSegmentsAroundWrites(t *testing.T) {
 		t.Fatalf("got %d results, want %d: %v", len(results), len(want), results)
 	}
 	for i := range want {
-		if results[i] != want[i] {
+		if stripReceiptCitation(results[i]) != want[i] {
 			t.Fatalf("results out of order or wrong: got %v want %v", results, want)
 		}
 	}
@@ -287,17 +553,13 @@ func TestExecuteBatchSegmentsAroundWrites(t *testing.T) {
 	}
 }
 
-func TestExecuteBatchFeedsReceiptsToCompleteStep(t *testing.T) {
-	completeStep, ok := tool.LookupBuiltin("complete_step")
-	if !ok {
-		t.Fatal("complete_step builtin not registered")
-	}
+func TestExecuteBatchPairsRetiredCompleteStepWithoutBlockingPeers(t *testing.T) {
 	reg := tool.NewRegistry()
 	reg.Add(fakeTool{name: "bash", readOnly: false})
-	reg.Add(completeStep)
 	a := New(nil, reg, NewSession(""), Options{}, event.Discard)
 
-	results := a.executeBatch(context.Background(), []provider.ToolCall{
+	a.SeedTodoState([]evidence.TodoItem{{Content: "Run checks", Status: "pending"}})
+	batch := a.executeBatch(context.Background(), &a.turn, []provider.ToolCall{
 		{Name: "bash", Arguments: `{"command":"go test ./internal/..."}`},
 		{Name: "complete_step", Arguments: `{
 			"step":"Run checks",
@@ -305,12 +567,13 @@ func TestExecuteBatchFeedsReceiptsToCompleteStep(t *testing.T) {
 			"evidence":[{"kind":"verification","summary":"tests passed","command":"go test ./internal/..."}]
 		}`},
 	})
+	results := batch.results
 
 	if len(results) != 2 {
 		t.Fatalf("got %d results, want 2", len(results))
 	}
-	if !strings.Contains(results[1], "host-verified 1") {
-		t.Fatalf("complete_step did not see bash receipt: %q", results[1])
+	if !strings.Contains(results[1], "tool_retired") || !a.task.ledger.HasSuccessfulCommand("go test ./internal/...") {
+		t.Fatalf("retired result=%q bash receipt missing=%v", results[1], !a.task.ledger.HasSuccessfulCommand("go test ./internal/..."))
 	}
 }
 
@@ -319,11 +582,11 @@ func TestExecuteOneFailedReceiptDoesNotVerify(t *testing.T) {
 	reg.Add(fakeTool{name: "bash", readOnly: false, err: errors.New("boom")})
 	a := New(nil, reg, NewSession(""), Options{}, event.Discard)
 
-	out := a.executeOne(context.Background(), provider.ToolCall{Name: "bash", Arguments: `{"command":"go test ./..."}`})
+	out := a.executeOne(context.Background(), &a.turn, provider.ToolCall{Name: "bash", Arguments: `{"command":"go test ./..."}`})
 	if out.errMsg == "" {
 		t.Fatal("failing fake tool should return an error outcome")
 	}
-	if a.evidence.HasSuccessfulCommand("go test ./...") {
+	if a.task.ledger.HasSuccessfulCommand("go test ./...") {
 		t.Fatal("failed bash receipt must not verify")
 	}
 }
@@ -334,15 +597,15 @@ func TestRunResetsEvidenceLedger(t *testing.T) {
 	prov := &mockProvider{name: "p", chunks: []provider.Chunk{{Type: provider.ChunkText, Text: "done"}}}
 	a := New(prov, reg, NewSession(""), Options{}, event.Discard)
 
-	a.executeOne(context.Background(), provider.ToolCall{Name: "bash", Arguments: `{"command":"go test ./..."}`})
-	if !a.evidence.HasSuccessfulCommand("go test ./...") {
+	a.executeOne(context.Background(), &a.turn, provider.ToolCall{Name: "bash", Arguments: `{"command":"go test ./..."}`})
+	if !a.task.ledger.HasSuccessfulCommand("go test ./...") {
 		t.Fatal("setup failed to record evidence")
 	}
 
 	if err := a.Run(context.Background(), "next turn"); err != nil {
 		t.Fatalf("Run: %v", err)
 	}
-	if a.evidence.HasSuccessfulCommand("go test ./...") {
+	if a.task.ledger.HasSuccessfulCommand("go test ./...") {
 		t.Fatal("new user turn should not inherit previous receipts")
 	}
 }

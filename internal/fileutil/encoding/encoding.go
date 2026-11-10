@@ -1,15 +1,15 @@
 // Package encoding detects and converts file encodings for the built-in
-// file tools. The detection cascade (BOM → strict UTF-8 → GB18030 → lossy
-// UTF-8) mirrors v1's file-encoding.ts and keeps CJK Windows files editable
+// file tools. The detection cascade (BOM → strict UTF-8 → GB18030 → GBK →
+// lossy UTF-8) mirrors v1's file-encoding.ts and keeps CJK Windows files editable
 // without silently mangling their bytes.
 package encoding
 
 import (
 	"bytes"
 	"encoding/binary"
-	"unicode/utf8"
+	"os"
 
-	"golang.org/x/text/encoding/simplifiedchinese"
+	"golang.org/x/text/encoding/unicode"
 	"golang.org/x/text/transform"
 )
 
@@ -27,8 +27,8 @@ const (
 	UTF16BE
 	// GB18030 is the Chinese national standard charset (superset of GBK).
 	GB18030
-	// LossyUTF8 is not valid UTF-8 and not valid GB18030 — decoded lossily
-	// as UTF-8 with replacement characters so the model sees something.
+	// LossyUTF8 is not valid UTF-8 and no charset restores it byte for byte.
+	// Its bytes pass through untouched, so a rewrite keeps what it did not edit.
 	LossyUTF8
 	// UTF16LENoBOM is UTF-16 Little-Endian without a BOM — common for source
 	// files saved by Windows tools. Detected heuristically from the NUL-byte
@@ -36,6 +36,9 @@ const (
 	UTF16LENoBOM
 	// UTF16BENoBOM is UTF-16 Big-Endian without a BOM.
 	UTF16BENoBOM
+	// GBK is CP936 where GB18030 cannot restore the bytes, such as its 0x80 euro.
+	// Appended: checkpoints persist a Kind by value.
+	GBK
 )
 
 var utf8BOM = []byte{0xEF, 0xBB, 0xBF}
@@ -43,30 +46,8 @@ var utf8BOM = []byte{0xEF, 0xBB, 0xBF}
 // Detect returns the encoding kind for the given raw file bytes. The same
 // bytes should then be passed to Decode for conversion to UTF-8.
 func Detect(data []byte) (Kind, []byte) {
-	switch {
-	case len(data) >= 3 && data[0] == 0xEF && data[1] == 0xBB && data[2] == 0xBF:
-		return UTF8BOM, data
-	case len(data) >= 2 && data[0] == 0xFF && data[1] == 0xFE:
-		return UTF16LE, data
-	case len(data) >= 2 && data[0] == 0xFE && data[1] == 0xFF:
-		return UTF16BE, data
-	}
-	// BOM-less UTF-16 must be tried before utf8.Valid: its low bytes plus 0x00
-	// high bytes are all valid UTF-8 code units, so a naive check would tag a
-	// UTF-16 source file as UTF-8 and surface the embedded NULs as garbage.
-	if k, ok := DetectUTF16NoBOM(data); ok {
-		return k, data
-	}
-	if utf8.Valid(data) {
-		return UTF8, data
-	}
-	// Try GB18030 — it is a strict superset of GBK and rejects truly
-	// invalid byte sequences, so a successful decode is a reliable signal.
-	dec := simplifiedchinese.GB18030.NewDecoder()
-	if _, _, err := transform.Bytes(dec, data); err == nil {
-		return GB18030, data
-	}
-	return LossyUTF8, data
+	k, _, _ := sniff(data, true)
+	return k, data
 }
 
 // DetectQuick checks only for BOM prefixes in the first few bytes. This is
@@ -98,7 +79,7 @@ func DetectUTF16NoBOM(b []byte) (Kind, bool) {
 	}
 	n &^= 1 // examine an even-length window so parity counts are comparable
 	var evenNUL, oddNUL int
-	for i := 0; i < n; i++ {
+	for i := range n {
 		if b[i] != 0 {
 			continue
 		}
@@ -131,8 +112,8 @@ func Decode(data []byte, enc Kind) []byte {
 		return decodeUTF16(data, binary.LittleEndian)
 	case UTF16BENoBOM:
 		return decodeUTF16(data, binary.BigEndian)
-	case GB18030:
-		out, _, err := transform.Bytes(simplifiedchinese.GB18030.NewDecoder(), data)
+	case GB18030, GBK:
+		out, _, err := transform.Bytes(charsetOf(enc).NewDecoder(), data)
 		if err != nil {
 			return data // should not happen after Detect, but be safe
 		}
@@ -141,6 +122,23 @@ func Decode(data []byte, enc Kind) []byte {
 	// UTF8 and LossyUTF8 both pass through — LossyUTF8 is already
 	// "best effort" and Go strings can hold arbitrary bytes.
 	return data
+}
+
+// DecodeToUTF8 converts raw text-like file bytes to UTF-8 using Reasonix's
+// shared detection cascade. It is intended for user-editable structured files
+// (TOML, JSON, dotenv, Markdown) before handing the content to strict parsers.
+func DecodeToUTF8(data []byte) []byte {
+	_, out := DetectAndDecode(data)
+	return out
+}
+
+// ReadFileUTF8 reads path and decodes text-like content to UTF-8.
+func ReadFileUTF8(path string) ([]byte, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	return DecodeToUTF8(data), nil
 }
 
 // Decoder returns a streaming transform.Transformer for the given encoding,
@@ -152,37 +150,49 @@ func Decoder(enc Kind) transform.Transformer {
 		// UTF-8 BOM just needs the 3-byte prefix stripped; the content is
 		// already valid UTF-8. Callers handle BOM stripping via Decode.
 		return nil
-	case GB18030:
-		return simplifiedchinese.GB18030.NewDecoder()
+	case GB18030, GBK:
+		return charsetOf(enc).NewDecoder()
+	case UTF16LE:
+		return unicode.UTF16(unicode.LittleEndian, unicode.ExpectBOM).NewDecoder()
+	case UTF16BE:
+		return unicode.UTF16(unicode.BigEndian, unicode.ExpectBOM).NewDecoder()
+	case UTF16LENoBOM:
+		return unicode.UTF16(unicode.LittleEndian, unicode.IgnoreBOM).NewDecoder()
+	case UTF16BENoBOM:
+		return unicode.UTF16(unicode.BigEndian, unicode.IgnoreBOM).NewDecoder()
 	}
-	// UTF16LE/BE are not self-synchronising and cannot be streamed
-	// line-by-line without full-file buffering. Callers must handle
-	// them separately. UTF8 and LossyUTF8 need no transformation.
+	// UTF8 and LossyUTF8 need no transformation.
 	return nil
 }
 
-// Encode converts a UTF-8 string back to the given file encoding.
-// UTF8 and LossyUTF8 produce plain UTF-8 bytes.
-func Encode(text string, enc Kind) []byte {
+// Encode converts a UTF-8 string back to the given file encoding. UTF8 and
+// LossyUTF8 produce plain UTF-8 bytes. A legacy charset that cannot represent a
+// character answers ErrUnencodable rather than switching the file to UTF-8.
+func Encode(text string, enc Kind) ([]byte, error) {
 	switch enc {
 	case UTF8BOM:
-		return append(utf8BOM, []byte(text)...)
+		return append(utf8BOM, []byte(text)...), nil
 	case UTF16LE:
-		return encodeUTF16(text, binary.LittleEndian, true)
+		return encodeUTF16(text, binary.LittleEndian, true), nil
 	case UTF16BE:
-		return encodeUTF16(text, binary.BigEndian, true)
+		return encodeUTF16(text, binary.BigEndian, true), nil
 	case UTF16LENoBOM:
-		return encodeUTF16(text, binary.LittleEndian, false)
+		return encodeUTF16(text, binary.LittleEndian, false), nil
 	case UTF16BENoBOM:
-		return encodeUTF16(text, binary.BigEndian, false)
-	case GB18030:
-		out, _, err := transform.Bytes(simplifiedchinese.GB18030.NewEncoder(), []byte(text))
-		if err != nil {
-			return []byte(text)
-		}
-		return out
+		return encodeUTF16(text, binary.BigEndian, false), nil
+	case GB18030, GBK:
+		return encodeCharset(text, enc)
 	}
-	return []byte(text)
+	return []byte(text), nil
+}
+
+// MustEncode is Encode for text known to be representable, such as a fixture.
+func MustEncode(text string, enc Kind) []byte {
+	out, err := Encode(text, enc)
+	if err != nil {
+		panic(err)
+	}
+	return out
 }
 
 // decodeUTF16 converts UTF-16 bytes (BOM already stripped) to UTF-8.

@@ -3,13 +3,15 @@ package hook
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
 
-// --- Runner construction ---
+// Runner construction
 
 func TestNewRunnerNil(t *testing.T) {
 	var r *Runner
@@ -41,7 +43,71 @@ func TestNewRunnerWithHooks(t *testing.T) {
 	}
 }
 
-// --- Runner.PreToolUse ---
+func TestForRoleDerivesSessionFromParentAtFireTime(t *testing.T) {
+	parent := NewRunner(nil, "/tmp", nil, nil)
+	planner := parent.ForRole("planner")
+	if got := planner.payload(PreToolUse).SessionID; got != "planner" {
+		t.Fatalf("role session with no parent session = %q, want planner", got)
+	}
+	parent.SetSessionID("first")
+	if got := planner.payload(PreToolUse).SessionID; got != "first:planner" {
+		t.Fatalf("role session = %q, want first:planner", got)
+	}
+	parent.SetSessionID("second")
+	if got := planner.payload(PreToolUse).SessionID; got != "second:planner" {
+		t.Fatalf("role session after rotation = %q, want second:planner", got)
+	}
+}
+
+func TestWithoutCwdCommandSearchReachesEverySpawnOfItsChildren(t *testing.T) {
+	var got []SpawnInput
+	record := func(_ context.Context, in SpawnInput) SpawnResult {
+		got = append(got, in)
+		return SpawnResult{}
+	}
+	hooks := []ResolvedHook{{
+		HookConfig: HookConfig{Command: "python guard.py", Env: map[string]string{NoCwdCommandSearchEnv: "", "KEEP": "yes"}},
+		Event:      PreToolUse, Scope: ScopeGlobal,
+	}}
+	guarded := NewRunner(hooks, "/checkout", record, nil).WithoutCwdCommandSearch()
+	for _, r := range []*Runner{guarded, guarded.ForSession("s"), guarded.ForRole("planner")} {
+		r.PreToolUse(context.Background(), "read_file", json.RawMessage(`{}`))
+	}
+	if len(got) != 3 {
+		t.Fatalf("spawned %d hooks, want 3", len(got))
+	}
+	for _, in := range got {
+		if in.Env[NoCwdCommandSearchEnv] != "1" || in.Env["KEEP"] != "yes" || in.Cwd != "/checkout" {
+			t.Fatalf("spawn input = %+v, want the checkout cwd, the hook env and %s=1", in, NoCwdCommandSearchEnv)
+		}
+	}
+	if _, set := hooks[0].Env[NoCwdCommandSearchEnv]; !set || hooks[0].Env[NoCwdCommandSearchEnv] != "" {
+		t.Fatal("WithoutCwdCommandSearch mutated the configured hook env")
+	}
+}
+
+func TestToolMutationHooksEnabled(t *testing.T) {
+	tests := []struct {
+		name  string
+		event Event
+		want  bool
+	}{
+		{name: "session hook", event: SessionStart, want: false},
+		{name: "pre tool", event: PreToolUse, want: true},
+		{name: "post tool", event: PostToolUse, want: true},
+		{name: "post tool failure", event: PostToolUseFailure, want: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			r := NewRunner([]ResolvedHook{{Event: tt.event}}, "/tmp", nil, nil)
+			if got := r.ToolMutationHooksEnabled(); got != tt.want {
+				t.Fatalf("ToolMutationHooksEnabled() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+// Runner.PreToolUse
 
 func TestRunnerPreToolUseNoHooks(t *testing.T) {
 	r := NewRunner(nil, "/tmp", nil, nil)
@@ -87,7 +153,7 @@ func TestRunnerPreToolUseBlock(t *testing.T) {
 	}
 }
 
-// --- Runner.PostToolUse ---
+// Runner.PostToolUse
 
 func TestRunnerPostToolUseNoHooks(t *testing.T) {
 	r := NewRunner(nil, "/tmp", nil, nil)
@@ -111,7 +177,23 @@ func TestRunnerPostToolUseWarn(t *testing.T) {
 	}
 }
 
-// --- Runner.PermissionRequest ---
+func TestRunnerPostToolUseFailurePreservesNativeObserver(t *testing.T) {
+	hooks := []ResolvedHook{
+		{HookConfig: HookConfig{Command: "claude-failure", PayloadFormat: "claude"}, Event: PostToolUseFailure},
+		{HookConfig: HookConfig{Command: "native-post"}, Event: PostToolUse},
+	}
+	var commands []string
+	r := NewRunner(hooks, "/tmp", func(_ context.Context, in SpawnInput) SpawnResult {
+		commands = append(commands, in.Command)
+		return SpawnResult{ExitCode: 0}
+	}, nil)
+	r.PostToolUseFailure(context.Background(), "bash", json.RawMessage(`{}`), "failed", errors.New("exit 1"))
+	if got := strings.Join(commands, ","); got != "claude-failure,native-post" {
+		t.Fatalf("failure observers = %q", got)
+	}
+}
+
+// Runner.PermissionRequest
 
 func TestRunnerPermissionRequestPayload(t *testing.T) {
 	hooks := []ResolvedHook{
@@ -151,13 +233,43 @@ func TestRunnerPermissionRequestWarnOnly(t *testing.T) {
 	}
 	var notified string
 	r := NewRunner(hooks, "/tmp", spawner, func(msg string) { notified = msg })
-	r.PermissionRequest(context.Background(), "bash", "go test", nil)
+	decision, _ := r.PermissionRequest(context.Background(), "bash", "go test", nil)
+	if decision != nil {
+		t.Errorf("native PermissionRequest hook must stay advisory-only, got decision=%v", *decision)
+	}
 	if notified == "" {
 		t.Error("PermissionRequest warn should notify")
 	}
 }
 
-// --- Runner.PromptSubmit ---
+func TestRunnerPermissionRequestClaudeDecisions(t *testing.T) {
+	claudeHooks := []ResolvedHook{{HookConfig: HookConfig{Command: "guard", PayloadFormat: "claude"}, Event: PermissionRequest}}
+	spawnerReturning := func(stdout string) Spawner {
+		return func(_ context.Context, in SpawnInput) SpawnResult { return SpawnResult{ExitCode: 0, Stdout: stdout} }
+	}
+
+	denyJSON := `{"hookSpecificOutput":{"hookEventName":"PermissionRequest","decision":{"behavior":"deny"}}}`
+	r := NewRunner(claudeHooks, "/tmp", spawnerReturning(denyJSON), nil)
+	decision, _ := r.PermissionRequest(context.Background(), "bash", "rm -rf /", nil)
+	if decision == nil || *decision != false {
+		t.Fatalf("Claude deny decision = %v, want false", decision)
+	}
+
+	allowJSON := `{"hookSpecificOutput":{"hookEventName":"PermissionRequest","decision":{"behavior":"allow"}}}`
+	r = NewRunner(claudeHooks, "/tmp", spawnerReturning(allowJSON), nil)
+	decision, _ = r.PermissionRequest(context.Background(), "bash", "go test", nil)
+	if decision == nil || *decision != true {
+		t.Fatalf("Claude allow decision = %v, want true", decision)
+	}
+
+	r = NewRunner(claudeHooks, "/tmp", spawnerReturning(""), nil)
+	decision, _ = r.PermissionRequest(context.Background(), "bash", "go test", nil)
+	if decision != nil {
+		t.Fatalf("no opinion from the hook should return a nil decision, got %v", *decision)
+	}
+}
+
+// Runner.PromptSubmit
 
 func TestRunnerPromptSubmitBlock(t *testing.T) {
 	hooks := []ResolvedHook{
@@ -173,7 +285,7 @@ func TestRunnerPromptSubmitBlock(t *testing.T) {
 	}
 }
 
-// --- Runner.Stop ---
+// Runner.Stop
 
 func TestRunnerStopNoHooks(t *testing.T) {
 	r := NewRunner(nil, "/tmp", nil, nil)
@@ -190,6 +302,22 @@ func TestRunnerStopWithHooks(t *testing.T) {
 	}
 	r := NewRunner(hooks, "/tmp", spawner, nil)
 	r.Stop(context.Background(), "done", 1)
+}
+
+func TestRunnerStopResultPreservesNativeStopObserver(t *testing.T) {
+	hooks := []ResolvedHook{
+		{HookConfig: HookConfig{Command: "claude-stop-failure", PayloadFormat: "claude"}, Event: StopFailure},
+		{HookConfig: HookConfig{Command: "native-stop"}, Event: Stop},
+	}
+	var commands []string
+	r := NewRunner(hooks, "/tmp", func(_ context.Context, in SpawnInput) SpawnResult {
+		commands = append(commands, in.Command)
+		return SpawnResult{ExitCode: 0}
+	}, nil)
+	r.StopResult(context.Background(), "partial", 1, errors.New("turn failed"))
+	if got := strings.Join(commands, ","); got != "claude-stop-failure,native-stop" {
+		t.Fatalf("stop failure observers = %q", got)
+	}
 }
 
 func TestRunnerSessionStartReturnsAdditionalContexts(t *testing.T) {
@@ -254,7 +382,48 @@ func TestRunnerSessionStartWarnsOnInvalidJSON(t *testing.T) {
 	}
 }
 
-// --- Runner.PostLLMCall ---
+func TestRunnerClaudeLifecyclePayloadsShareSessionID(t *testing.T) {
+	events := []Event{SessionStart, PreCompact, Notification, SessionEnd}
+	hooks := make([]ResolvedHook, 0, len(events))
+	for _, event := range events {
+		hooks = append(hooks, ResolvedHook{
+			HookConfig: HookConfig{Command: string(event), PayloadFormat: "claude"},
+			Event:      event,
+		})
+	}
+	seen := map[Event]map[string]any{}
+	spawner := func(_ context.Context, in SpawnInput) SpawnResult {
+		var payload map[string]any
+		if err := json.Unmarshal([]byte(in.Stdin), &payload); err != nil {
+			t.Fatalf("payload JSON: %v", err)
+		}
+		seen[Event(payload["hook_event_name"].(string))] = payload
+		return SpawnResult{ExitCode: 0}
+	}
+	r := NewRunner(hooks, "/workspace", spawner, nil)
+	r.SetSessionID("session-42")
+	r.SessionStart(context.Background(), "resume")
+	r.PreCompact(context.Background(), "manual")
+	r.Notification(context.Background(), "approval needed", "permission_prompt")
+	r.SessionEnd(context.Background(), "clear")
+
+	for _, event := range events {
+		if seen[event]["session_id"] != "session-42" {
+			t.Fatalf("%s session_id = %#v", event, seen[event]["session_id"])
+		}
+	}
+	if seen[SessionStart]["source"] != "resume" || seen[PreCompact]["trigger"] != "manual" {
+		t.Fatalf("lifecycle details = %#v / %#v", seen[SessionStart], seen[PreCompact])
+	}
+	if seen[Notification]["notification_type"] != "permission_prompt" || seen[Notification]["message"] != "approval needed" {
+		t.Fatalf("notification payload = %#v", seen[Notification])
+	}
+	if seen[SessionEnd]["reason"] != "clear" {
+		t.Fatalf("session end payload = %#v", seen[SessionEnd])
+	}
+}
+
+// Runner.PostLLMCall
 
 func TestRunnerHasPostLLMCall(t *testing.T) {
 	with := NewRunner([]ResolvedHook{{HookConfig: HookConfig{Command: "x"}, Event: PostLLMCall}}, "/tmp", nil, nil)
@@ -301,7 +470,7 @@ func TestRunnerPostLLMCallKeepsOriginal(t *testing.T) {
 	}
 }
 
-// --- FormatOutcome ---
+// FormatOutcome
 
 func TestFormatOutcomePass(t *testing.T) {
 	o := Outcome{
@@ -330,7 +499,7 @@ func TestFormatOutcomeWithDetail(t *testing.T) {
 	}
 }
 
-// --- clipRunes ---
+// clipRunes
 
 func TestClipRunes(t *testing.T) {
 	if got := clipRunes("short", 10); got != "short" {
@@ -347,7 +516,7 @@ func TestClipRunes(t *testing.T) {
 	}
 }
 
-// --- payload JSON ---
+// payload JSON
 
 func TestPayloadJSON(t *testing.T) {
 	args := json.RawMessage(`{"command":"echo hi"}`)
@@ -377,7 +546,7 @@ func TestPayloadJSON(t *testing.T) {
 	}
 }
 
-// --- capping behavior ---
+// capping behavior
 
 func TestCappedBuffer(t *testing.T) {
 	var cb cappedBuffer
@@ -407,7 +576,7 @@ func TestCappedBuffer(t *testing.T) {
 	}
 }
 
-// --- IsBlocking ---
+// IsBlocking
 
 func TestIsBlocking(t *testing.T) {
 	if !IsBlocking(PreToolUse) {
@@ -424,7 +593,7 @@ func TestIsBlocking(t *testing.T) {
 	}
 }
 
-// --- defaultTimeout ---
+// defaultTimeout
 
 func TestDefaultTimeout(t *testing.T) {
 	if defaultTimeout(PreToolUse) != 5*time.Second {

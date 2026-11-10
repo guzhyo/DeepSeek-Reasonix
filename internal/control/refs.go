@@ -4,8 +4,8 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
-	"encoding/base64"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -18,7 +18,9 @@ import (
 	"time"
 
 	"reasonix/internal/fileref"
+	"reasonix/internal/instruction"
 	"reasonix/internal/proc"
+	"reasonix/internal/secrets"
 )
 
 // maxFileRefBytes caps how much of an @-referenced file is injected into a
@@ -41,9 +43,11 @@ type pdfExtractResult struct {
 type refKind int
 
 const (
-	refResource refKind = iota // an MCP resource: @<server>:<uri>
-	refFile                    // a local file or directory: @<path>
-	refImage                   // a local image attachment: @.reasonix/attachments/<file>
+	refResource    refKind = iota // an MCP resource: @<server>:<uri>
+	refFile                       // a local file or directory: @<path>
+	refImage                      // a local image attachment: @.reasonix/attachments/<file>
+	refRemoteImage                // an http(s) image URL
+	refFileID                     // a Files API file-api- id
 )
 
 // ref is a resolved @reference found in a submitted line.
@@ -68,19 +72,41 @@ type ExternalFolderRefEntry struct {
 	IsDir       bool
 }
 
-// refTokenRe matches an @reference token: '@' then a run of non-space chars.
-var refTokenRe = regexp.MustCompile(`@([^\s]+)`)
 var pathLocationSuffixRe = regexp.MustCompile(`:\d+(?::\d+)?:?$`)
 
 const externalFolderRefPrefix = "__reasonix_external_folder"
 
 // parseRefTokens extracts the deduped, punctuation-trimmed tokens following '@'
-// in a line. Pure: classification (server? file?) happens in classifyRef.
+// in a line. A token is a run of non-whitespace bytes, except that a
+// backslash-escaped space or tab is part of the token with the backslash
+// dropped — that is how a path containing spaces survives the
+// whitespace-delimited grammar (EscapeRefPath produces that form). Any other
+// backslash stays literal so Windows separators keep their meaning. Pure:
+// classification (server? file?) happens in classifyRef.
 func parseRefTokens(line string) []string {
 	var toks []string
 	seen := map[string]bool{}
-	for _, g := range refTokenRe.FindAllStringSubmatch(line, -1) {
-		t := strings.TrimRight(g[1], ".,;!?)]}")
+	for i := 0; i < len(line); i++ {
+		if line[i] != '@' {
+			continue
+		}
+		var b strings.Builder
+		j := i + 1
+		for j < len(line) {
+			ch := line[j]
+			if ch == '\\' && j+1 < len(line) && (line[j+1] == ' ' || line[j+1] == '\t') {
+				b.WriteByte(line[j+1])
+				j += 2
+				continue
+			}
+			if isRefTokenBoundary(ch) {
+				break
+			}
+			b.WriteByte(ch)
+			j++
+		}
+		i = j - 1
+		t := strings.TrimRight(b.String(), ".,;!?)]}")
 		if t == "" || seen[t] {
 			continue
 		}
@@ -88,6 +114,53 @@ func parseRefTokens(line string) []string {
 		toks = append(toks, t)
 	}
 	return toks
+}
+
+// isRefTokenBoundary matches the whitespace class the old `@([^\s]+)` token
+// regexp stopped at.
+func isRefTokenBoundary(ch byte) bool {
+	switch ch {
+	case ' ', '\t', '\n', '\r', '\f':
+		return true
+	default:
+		return false
+	}
+}
+
+// EscapeRefPath returns path with spaces and tabs backslash-escaped so the
+// result survives whitespace-delimited @-token parsing (parseRefTokens
+// reverses it). Every other byte, including backslashes, passes through
+// unchanged so Windows separators keep their meaning.
+func EscapeRefPath(path string) string {
+	if !strings.ContainsAny(path, " \t") {
+		return path
+	}
+	var b strings.Builder
+	b.Grow(len(path) + 8)
+	for i := range len(path) {
+		if path[i] == ' ' || path[i] == '\t' {
+			b.WriteByte('\\')
+		}
+		b.WriteByte(path[i])
+	}
+	return b.String()
+}
+
+// UnescapeRefPath reverses EscapeRefPath: a backslash before a space or tab is
+// dropped; any other backslash stays literal.
+func UnescapeRefPath(path string) string {
+	if !strings.Contains(path, `\`) {
+		return path
+	}
+	var b strings.Builder
+	b.Grow(len(path))
+	for i := range len(path) {
+		if path[i] == '\\' && i+1 < len(path) && (path[i+1] == ' ' || path[i+1] == '\t') {
+			continue
+		}
+		b.WriteByte(path[i])
+	}
+	return b.String()
 }
 
 // classifyRef decides what a token refers to. A "server:uri" token whose server
@@ -108,18 +181,6 @@ func classifyRef(token string, known map[string]bool, exists func(string) bool) 
 		return ref{kind: refFile, path: token, raw: token}, true
 	}
 	return ref{}, false
-}
-
-func isAttachmentRef(token string) bool {
-	return strings.HasPrefix(filepath.ToSlash(token), ".reasonix/attachments/")
-}
-
-func isImageAttachmentRef(token string) bool {
-	switch strings.ToLower(filepath.Ext(token)) {
-	case ".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".svg", ".tif", ".tiff":
-		return true
-	}
-	return false
 }
 
 // RegisterExternalFolderRef authorizes one dropped directory outside the
@@ -213,6 +274,9 @@ func normalizeExternalFolderRefToken(token string) string {
 }
 
 func (c *Controller) externalFolderRef(token string) (ref, bool) {
+	if r, ok := c.externalFileRef(token); ok {
+		return r, true
+	}
 	_, rel, abs, ok := c.externalFolderRefTarget(token)
 	if !ok {
 		return ref{}, false
@@ -394,19 +458,9 @@ func (c *Controller) SearchExternalFolderRefs(query string, limit int) []Externa
 	return out
 }
 
-// ExternalFolderRefLocalPath resolves a registered external-folder token path to
-// the local filesystem path authorized for this controller session.
-func (c *Controller) ExternalFolderRefLocalPath(tokenPath string) (path, displayPath string, ok bool) {
-	_, rel, abs, ok := c.externalFolderRefTarget(tokenPath)
-	if !ok {
-		return "", "", false
-	}
-	return filepath.Join(abs, filepath.FromSlash(rel)), externalFolderDisplayPath(abs, rel), true
-}
-
 func sortExternalFolderRefEntries(entries []ExternalFolderRefEntry) {
 	sort.Slice(entries, func(i, j int) bool {
-		return strings.ToLower(entries[i].DisplayName) < strings.ToLower(entries[j].DisplayName)
+		return fileref.NaturalLess(entries[i].DisplayName, entries[j].DisplayName)
 	})
 }
 
@@ -447,6 +501,17 @@ func (c *Controller) detectRefsMode(line string, scopedOnly bool) []ref {
 			refs = append(refs, r)
 			continue
 		}
+		if r, ok := classifyVisionToken(tok); ok {
+			refs = append(refs, r)
+			continue
+		}
+		// Keep missing composer images resolvable so admission rejects the turn
+		// instead of silently sending only path text. Non-image attachments retain
+		// the existing best-effort reference behavior.
+		if isAttachmentRef(tok) && isImageAttachmentRef(tok) {
+			refs = append(refs, ref{kind: refImage, path: tok, raw: tok})
+			continue
+		}
 		if c.workspaceRoot != "" {
 			if rel, ok := workspaceRefPath(tok, c.workspaceRoot); ok {
 				kind := refFile
@@ -474,98 +539,6 @@ func (c *Controller) detectRefsMode(line string, scopedOnly bool) []ref {
 // frontend can decide to resolve off its event loop only when needed.
 func (c *Controller) HasRefs(line string) bool {
 	return len(c.detectRefs(line)) > 0
-}
-
-// inputImages resolves image @-references in the turn input to data URLs so the
-// turn can carry them to a vision-capable model. Best-effort: an unreadable image
-// is skipped — the @ref still lands as text via ResolveRefs.
-func (c *Controller) inputImages(line string) []string {
-	if !c.imageInputEnabled() {
-		return nil
-	}
-	var urls []string
-	for _, r := range c.detectRefs(line) {
-		baseDir := c.workspaceRoot
-		if r.baseDir != "" {
-			baseDir = r.baseDir
-		}
-		if url, err := visionRefImageDataURL(r, baseDir); err == nil {
-			urls = append(urls, url)
-		}
-	}
-	return urls
-}
-
-func visionRefImageDataURL(r ref, baseDir string) (string, error) {
-	switch r.kind {
-	case refImage:
-		return visionImageDataURL(r.path)
-	case refFile:
-		return visionFileImageDataURL(r.path, baseDir)
-	default:
-		return "", fmt.Errorf("reference is not an image")
-	}
-}
-
-func visionFileImageDataURL(path, baseDir string) (string, error) {
-	absPath, absBase, ok := resolveAbsRef(path, baseDir)
-	if !ok {
-		return "", os.ErrNotExist
-	}
-	if absBase == "" {
-		return "", fmt.Errorf("workspace root is required for file image references")
-	}
-
-	root, err := os.OpenRoot(absBase)
-	if err != nil {
-		return "", err
-	}
-	defer root.Close()
-
-	rel, err := filepath.Rel(absBase, absPath)
-	if err != nil {
-		return "", err
-	}
-
-	info, err := root.Lstat(rel)
-	if err != nil {
-		return "", err
-	}
-	if info.Mode()&os.ModeSymlink != 0 {
-		return "", fmt.Errorf("image path must not be a symlink")
-	}
-	if info.IsDir() || info.Size() <= 0 || info.Size() > maxImageAttachmentBytes {
-		return "", fmt.Errorf("image must be between 1 byte and 10 MB")
-	}
-	f, err := root.Open(rel)
-	if err != nil {
-		return "", err
-	}
-	defer f.Close()
-	opened, err := f.Stat()
-	if err != nil {
-		return "", err
-	}
-	if !os.SameFile(info, opened) {
-		return "", fmt.Errorf("image changed while opening")
-	}
-	return dataURLFromImageReader(f, path)
-}
-
-func dataURLFromImageReader(r io.Reader, path string) (string, error) {
-	raw, err := io.ReadAll(io.LimitReader(r, maxImageAttachmentBytes+1))
-	if err != nil {
-		return "", err
-	}
-	if len(raw) == 0 || len(raw) > maxImageAttachmentBytes {
-		return "", fmt.Errorf("image must be between 1 byte and 10 MB")
-	}
-	mime := detectedImageMime(raw)
-	if mime == "" {
-		return "", fmt.Errorf("%s is not a supported image", path)
-	}
-	raw, mime = compressForVision(raw, mime)
-	return "data:" + mime + ";base64," + base64.StdEncoding.EncodeToString(raw), nil
 }
 
 // resolveBareNames batch-resolves simple filenames (no path separator) that
@@ -641,7 +614,7 @@ func FileRefLine(line string) (string, bool) {
 	if info, err := os.Stat(p); err != nil || info.IsDir() {
 		return "", false
 	}
-	return "@" + p, true
+	return "@" + EscapeRefPath(p), true
 }
 
 // SlashCodeCommentLine reports whether a slash-prefixed line is ordinary source
@@ -755,57 +728,50 @@ func workspaceRel(path, baseDir string) (rel, absPath, absBase string, ok bool) 
 	return rel, absPath, absBase, true
 }
 
-// ResolveRefs resolves the @references in a line into a single tagged context
-// block (file/dir contents, MCP resource bodies), plus per-reference error
-// strings for any that failed. An empty block means no references resolved.
-// Safe to call off a frontend's event loop; honours ctx for the resource reads.
-func (c *Controller) ResolveRefs(ctx context.Context, line string) (block string, errs []string) {
-	return c.resolveRefs(ctx, line, false)
-}
-
-// ResolveScopedRefs is the HTTP/frontend variant: file references are honored
-// only when they can be resolved under the controller workspace root.
-func (c *Controller) ResolveScopedRefs(ctx context.Context, line string) (block string, errs []string) {
-	return c.resolveRefs(ctx, line, true)
-}
-
-func (c *Controller) resolveRefs(ctx context.Context, line string, scopedOnly bool) (block string, errs []string) {
-	refs := c.detectRefsMode(line, scopedOnly)
-	refs = resolveBareNames(refs, c.workspaceRoot)
-	var b strings.Builder
-	for _, r := range refs {
-		switch r.kind {
-		case refResource:
-			text, err := c.mcp.readResource(ctx, r.server, r.uri)
-			if err != nil {
-				errs = append(errs, "@"+r.raw+" — "+err.Error())
-				continue
-			}
-			appendRefBlock(&b, "resource", `ref="@`+r.raw+`"`, text)
-		case refFile:
-			baseDir := c.workspaceRoot
-			if r.baseDir != "" {
-				baseDir = r.baseDir
-			}
-			text, isDir, err := readFileRef(r.path, baseDir)
-			if err != nil {
-				errs = append(errs, "@"+r.raw+" — "+err.Error())
-				continue
-			}
-			tag := "file"
-			if isDir {
-				tag = "dir"
-			}
-			displayPath := r.path
-			if r.displayPath != "" {
-				displayPath = r.displayPath
-			}
-			appendRefBlock(&b, tag, `path="`+displayPath+`"`, text)
-		case refImage:
-			appendRefBlock(&b, "image", `path="`+r.path+`"`, "[image attachment available at @"+r.path+"; sent as direct model image input only when the selected model supports vision. Text-only models can still use an available OCR/image/vision tool with this local path; image bytes are not inlined into prompt text.]")
-		}
+func (c *Controller) resolveReferencedInstructions(r ref, baseDir string, includedPaths, includedBodies map[string]bool) (string, []instruction.Diagnostic) {
+	mem := c.memory.current()
+	if mem == nil || strings.TrimSpace(c.workspaceRoot) == "" || r.baseDir != "" {
+		return "", nil
 	}
-	return b.String(), errs
+	absPath, absBase, ok := resolveAbsRef(r.path, baseDir)
+	if !ok || cleanAbsPath(absBase) != cleanAbsPath(c.workspaceRoot) {
+		return "", nil
+	}
+	targetDir := absPath
+	if info, err := os.Stat(absPath); err != nil || !info.IsDir() {
+		targetDir = filepath.Dir(absPath)
+	}
+	resolved := instruction.Resolve(instruction.ResolveOptions{
+		WorkspaceRoot: c.workspaceRoot,
+		TargetDir:     targetDir,
+		UserDir:       mem.UserDir,
+	})
+	var delta []instruction.Document
+	for _, doc := range resolved.Documents {
+		pathKey := cleanAbsPath(doc.Path)
+		if includedPaths[pathKey] || includedBodies[doc.Body] {
+			continue
+		}
+		includedPaths[pathKey] = true
+		includedBodies[doc.Body] = true
+		delta = append(delta, doc)
+	}
+	return instruction.Block(delta), resolved.Diagnostics
+}
+
+func displayPathForRef(r ref) string {
+	if r.displayPath != "" {
+		return r.displayPath
+	}
+	return r.path
+}
+
+func cleanAbsPath(path string) string {
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return filepath.Clean(path)
+	}
+	return filepath.Clean(abs)
 }
 
 func appendRefBlock(b *strings.Builder, tag, attr, body string) {
@@ -833,12 +799,16 @@ func directoryRefNote() string {
 // user-supplied paths cannot escape the workspace; otherwise the path is
 // used as-is (CLI single-workspace compatibility).
 func readFileRef(path, baseDir string) (content string, isDir bool, err error) {
+	return readFileRefWithVision(path, baseDir, false)
+}
+
+func readFileRefWithVision(path, baseDir string, vision bool) (content string, isDir bool, err error) {
 	absPath, absBase, ok := resolveAbsRef(path, baseDir)
 	if !ok {
 		return "", false, os.ErrNotExist
 	}
 	if absBase == "" {
-		return readFileRefUnscoped(absPath)
+		return readFileRefUnscoped(absPath, vision)
 	}
 
 	root, rerr := os.OpenRoot(absBase)
@@ -884,13 +854,13 @@ func readFileRef(path, baseDir string) (content string, isDir bool, err error) {
 
 	buf := make([]byte, maxFileRefBytes+1)
 	n, rerr := io.ReadFull(f, buf)
-	if rerr != nil && rerr != io.ErrUnexpectedEOF && rerr != io.EOF {
+	if rerr != nil && !errors.Is(rerr, io.ErrUnexpectedEOF) && !errors.Is(rerr, io.EOF) {
 		return "", false, rerr
 	}
 	data := buf[:n]
 
 	if mime := imageMime(data, rel); mime != "" {
-		return imageFileRefNote(displayPath, mime, info.Size(), true), false, nil
+		return imageFileRefNote(displayPath, mime, info.Size(), true, vision), false, nil
 	}
 	if bytes.IndexByte(data[:min(n, 8192)], 0) >= 0 {
 		return fmt.Sprintf("[binary file %s, %d bytes — not shown]", displayPath, info.Size()), false, nil
@@ -903,7 +873,7 @@ func readFileRef(path, baseDir string) (content string, isDir bool, err error) {
 
 // readFileRefUnscoped is the legacy readFileRef body kept for CLI single-workspace
 // compatibility, where no controller-scoped sandbox is in effect.
-func readFileRefUnscoped(path string) (content string, isDir bool, err error) {
+func readFileRefUnscoped(path string, vision bool) (content string, isDir bool, err error) {
 	info, err := os.Stat(path)
 	if err != nil {
 		return "", false, err
@@ -963,13 +933,13 @@ func readFileRefUnscoped(path string) (content string, isDir bool, err error) {
 
 	buf := make([]byte, maxFileRefBytes+1)
 	n, rerr := io.ReadFull(f, buf)
-	if rerr != nil && rerr != io.ErrUnexpectedEOF && rerr != io.EOF {
+	if rerr != nil && !errors.Is(rerr, io.ErrUnexpectedEOF) && !errors.Is(rerr, io.EOF) {
 		return "", false, rerr
 	}
 	data := buf[:n]
 
 	if mime := imageMime(data, path); mime != "" {
-		return imageFileRefNote(path, mime, info.Size(), false), false, nil
+		return imageFileRefNote(path, mime, info.Size(), false, vision), false, nil
 	}
 	if bytes.IndexByte(data[:min(n, 8192)], 0) >= 0 {
 		return fmt.Sprintf("[binary file %s, %d bytes — not shown]", path, info.Size()), false, nil
@@ -978,13 +948,6 @@ func readFileRefUnscoped(path string) (content string, isDir bool, err error) {
 		return string(data[:maxFileRefBytes]) + fmt.Sprintf("\n…[truncated; file is %d bytes]…", info.Size()), false, nil
 	}
 	return string(data), false, nil
-}
-
-func imageFileRefNote(displayPath, mime string, size int64, attached bool) string {
-	if attached {
-		return fmt.Sprintf("[image file %s, mime=%s, %d bytes — sent as direct model image input only when the selected model supports vision. Text-only models can still use an available OCR/image/vision tool with this local path; image bytes are not inlined into prompt text.]", displayPath, mime, size)
-	}
-	return fmt.Sprintf("[image file %s, mime=%s, %d bytes — not sent as direct model image input because no workspace root is available. Use a workspace-scoped file reference, image attachment, or an available OCR/image/vision tool with a readable local path.]", displayPath, mime, size)
 }
 
 // walkRootDir walks a directory under a sandboxed *os.Root and writes each
@@ -1007,7 +970,7 @@ func walkRootDir(root *os.Root, dir, base string, b *strings.Builder, n *int, de
 		if entries[i].IsDir() != entries[j].IsDir() {
 			return entries[i].IsDir()
 		}
-		return strings.ToLower(entries[i].Name()) < strings.ToLower(entries[j].Name())
+		return fileref.NaturalLess(entries[i].Name(), entries[j].Name())
 	})
 	for _, e := range entries {
 		if *n >= maxDirEntries {
@@ -1097,14 +1060,14 @@ func extractPDFTextDefault(path string) (pdfExtractResult, error) {
 	python, err := findPython()
 	if err != nil {
 		if firstErr != nil {
-			return pdfExtractResult{}, fmt.Errorf("pdftotext failed (%v), and Python PDF libraries are not available", firstErr)
+			return pdfExtractResult{}, fmt.Errorf("pdftotext failed (%w), and Python PDF libraries are not available", firstErr)
 		}
 		return pdfExtractResult{}, fmt.Errorf("pdftotext and Python PDF libraries are not available")
 	}
 	text, truncated, err := runPDFTextCommand(python, []string{"-c", pythonPDFExtractScript, path})
 	if err != nil {
 		if firstErr != nil {
-			return pdfExtractResult{}, fmt.Errorf("pdftotext failed (%v), Python PDF extraction failed (%w)", firstErr, err)
+			return pdfExtractResult{}, fmt.Errorf("pdftotext failed (%w), Python PDF extraction failed (%w)", firstErr, err)
 		}
 		return pdfExtractResult{}, err
 	}
@@ -1123,7 +1086,8 @@ func findPython() (string, error) {
 func runPDFTextCommand(name string, args []string) (string, bool, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), pdfExtractTimeout)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, name, args...)
+	cmd := proc.CommandContext(ctx, name, args...)
+	cmd.Env = secrets.ProcessEnv()
 	setShellKillTree(cmd)
 	cmd.WaitDelay = pdfExtractWaitDelay
 	proc.HideWindow(cmd)

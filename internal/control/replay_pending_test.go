@@ -2,6 +2,8 @@ package control
 
 import (
 	"context"
+	"encoding/json"
+	"reflect"
 	"testing"
 
 	"reasonix/internal/event"
@@ -13,7 +15,7 @@ import (
 // gate stuck (#3844).
 func TestReplayPendingPromptsReEmitsBlockedApproval(t *testing.T) {
 	reqs := make(chan event.Approval, 8)
-	c := New(Options{Sink: event.FuncSink(func(e event.Event) {
+	c := newOwnedTestController(t, Options{Sink: event.FuncSink(func(e event.Event) {
 		if e.Kind == event.ApprovalRequest {
 			reqs <- e.Approval
 		}
@@ -22,7 +24,7 @@ func TestReplayPendingPromptsReEmitsBlockedApproval(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		_, _, _ = gateApprover{c}.Approve(context.Background(), "bash", "go test ./...", nil)
+		_, _, _ = gateApprover{c}.Approve(context.Background(), "bash", "go test ./...", json.RawMessage(`{"command":"go test ./..."}`))
 	}()
 
 	first := <-reqs
@@ -33,7 +35,7 @@ func TestReplayPendingPromptsReEmitsBlockedApproval(t *testing.T) {
 	c.ReplayPendingPrompts()
 
 	replayed := <-reqs
-	if replayed != first {
+	if !reflect.DeepEqual(replayed, first) {
 		t.Fatalf("replayed = %+v, want identical re-emit of %+v", replayed, first)
 	}
 
@@ -45,7 +47,7 @@ func TestReplayPendingPromptsReEmitsBlockedApproval(t *testing.T) {
 // question, including its question payload (which the controller now retains).
 func TestReplayPendingPromptsReEmitsBlockedAsk(t *testing.T) {
 	asks := make(chan event.Ask, 8)
-	c := New(Options{Sink: event.FuncSink(func(e event.Event) {
+	c := newOwnedTestController(t, Options{Sink: event.FuncSink(func(e event.Event) {
 		if e.Kind == event.AskRequest {
 			asks <- e.Ask
 		}
@@ -79,7 +81,7 @@ func TestReplayPendingPromptsReEmitsBlockedAsk(t *testing.T) {
 // is outstanding, so a frontend (re)connect on an idle session is silent.
 func TestReplayPendingPromptsNoOpWhenIdle(t *testing.T) {
 	var count int
-	c := New(Options{Sink: event.FuncSink(func(e event.Event) {
+	c := newOwnedTestController(t, Options{Sink: event.FuncSink(func(e event.Event) {
 		if e.Kind == event.ApprovalRequest || e.Kind == event.AskRequest {
 			count++
 		}

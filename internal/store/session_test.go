@@ -13,14 +13,21 @@ func TestSessionSidecarLayout(t *testing.T) {
 		{"meta", SessionMeta(p), p + ".meta"},
 		{"goal-state", SessionGoalState(p), "/home/u/.reasonix/sessions/abc.goal-state.json"},
 		{"event-log", SessionEventLog(p), "/home/u/.reasonix/sessions/abc.events.jsonl"},
+		{"event-log-damaged", SessionEventLogDamaged(p), "/home/u/.reasonix/sessions/abc.events.jsonl.damaged"},
+		{"turn-event-log", SessionTurnEventLog(p), "/home/u/.reasonix/sessions/abc.turns.jsonl"},
+		{"turn-event-log-damaged", SessionTurnEventLogDamaged(p), "/home/u/.reasonix/sessions/abc.turns.jsonl.damaged"},
 		{"event-index", SessionEventIndex(p), "/home/u/.reasonix/sessions/abc.event-index.json"},
+		{"display-index", SessionDisplayIndex(p), "/home/u/.reasonix/sessions/abc.display-index.json"},
+		{"transcript-projection", SessionTranscriptProjection(p), "/home/u/.reasonix/sessions/abc.transcript-projection.json"},
 		{"conflict-log", SessionConflictLog(p), "/home/u/.reasonix/sessions/abc.conflicts.jsonl"},
 		{"lock", SessionLockFile(p), p + ".lock"},
 		{"lease-lock", SessionLeaseLock(p), p + ".lease.lock"},
 		{"lease-info", SessionLeaseInfo(p), p + ".lease.json"},
 		{"checkpoint", SessionCheckpointDir(p), "/home/u/.reasonix/sessions/abc.ckpt"},
 		{"jobs", SessionJobsDir(p), "/home/u/.reasonix/sessions/abc.jobs"},
+		{"inbox", SessionInboxDir(p), "/home/u/.reasonix/sessions/abc.inbox"},
 		{"cleanup-pending", SessionCleanupPending(p), "/home/u/.reasonix/sessions/abc.cleanup-pending.json"},
+		{"context", SessionContext(p), "/home/u/.reasonix/sessions/abc.context.json"},
 	}
 	for _, c := range cases {
 		if c.got != c.want {
@@ -37,14 +44,21 @@ func TestSessionSidecarEmptyPath(t *testing.T) {
 		{"meta", SessionMeta},
 		{"goal-state", SessionGoalState},
 		{"event-log", SessionEventLog},
+		{"event-log-damaged", SessionEventLogDamaged},
+		{"turn-event-log", SessionTurnEventLog},
+		{"turn-event-log-damaged", SessionTurnEventLogDamaged},
 		{"event-index", SessionEventIndex},
+		{"display-index", SessionDisplayIndex},
+		{"transcript-projection", SessionTranscriptProjection},
 		{"conflict-log", SessionConflictLog},
 		{"lock", SessionLockFile},
 		{"lease-lock", SessionLeaseLock},
 		{"lease-info", SessionLeaseInfo},
 		{"checkpoint", SessionCheckpointDir},
 		{"jobs", SessionJobsDir},
+		{"inbox", SessionInboxDir},
 		{"cleanup-pending", SessionCleanupPending},
+		{"context", SessionContext},
 	} {
 		if got := fn.f(""); got != "" {
 			t.Errorf("%s(\"\") = %q, want empty", fn.name, got)
@@ -59,9 +73,14 @@ func TestIsSessionTranscriptName(t *testing.T) {
 	}{
 		{"session.jsonl", true},
 		{"session.events.jsonl", false},
+		{"session.turns.jsonl", false},
 		{"session.conflicts.jsonl", false},
 		{"session.guardian.jsonl", false},
+		{"session.wire.jsonl", false},
+		{"session.adjudication.jsonl", false},
+		{"session.execution.jsonl", false},
 		{"session.guardian.events.jsonl", false},
+		{"session.events.jsonl.damaged", false},
 		{"session.jsonl.meta", false},
 		{"notes.txt", false},
 		{"", false},
@@ -80,8 +99,17 @@ func TestSessionSidecarFiles(t *testing.T) {
 		p + ".meta",
 		"/home/u/.reasonix/sessions/abc.goal-state.json",
 		"/home/u/.reasonix/sessions/abc.events.jsonl",
+		"/home/u/.reasonix/sessions/abc.events.jsonl.damaged",
+		"/home/u/.reasonix/sessions/abc.events.jsonl.rotating",
+		"/home/u/.reasonix/sessions/abc.turns.jsonl",
+		"/home/u/.reasonix/sessions/abc.turns.jsonl.damaged",
 		"/home/u/.reasonix/sessions/abc.event-index.json",
+		"/home/u/.reasonix/sessions/abc.display-index.json",
+		"/home/u/.reasonix/sessions/abc.transcript-projection.json",
 		"/home/u/.reasonix/sessions/abc.conflicts.jsonl",
+		"/home/u/.reasonix/sessions/abc.recovery.json",
+		"/home/u/.reasonix/sessions/abc.context.json",
+		"/home/u/.reasonix/sessions/abc.pinned-context.json",
 	}
 	if len(got) != len(want) {
 		t.Fatalf("SessionSidecarFiles = %v, want %v", got, want)
@@ -93,5 +121,18 @@ func TestSessionSidecarFiles(t *testing.T) {
 	}
 	if SessionSidecarFiles("") != nil {
 		t.Error("SessionSidecarFiles(\"\") should be nil")
+	}
+}
+
+func TestAStudioImportIsNotASessionTranscript(t *testing.T) {
+	for name, want := range map[string]bool{
+		"v4-abc.jsonl": false, "v4-abc.events.jsonl": false, "20260101-abc.jsonl": true, "dev4-x.jsonl": true,
+	} {
+		if got := IsSessionTranscriptName(name); got != want {
+			t.Errorf("IsSessionTranscriptName(%q) = %v, want %v", name, got, want)
+		}
+	}
+	if !IsStudioImportName("v4-abc.jsonl.meta") || IsStudioImportName("abc.jsonl") {
+		t.Fatal("IsStudioImportName must key on the v4- prefix alone")
 	}
 }

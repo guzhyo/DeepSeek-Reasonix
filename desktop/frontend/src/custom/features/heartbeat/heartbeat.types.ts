@@ -1,5 +1,10 @@
 // Heartbeat task types — mirrors desktop/heartbeat.go.
 
+export interface HeartbeatRun {
+  at: number;      // unix millis execution time
+  topicId: string; // topic used/created by this run
+}
+
 export interface HeartbeatTask {
   id: string;
   title: string;
@@ -11,8 +16,9 @@ export interface HeartbeatTask {
   topicId?: string;
   lastRunAt?: number;  // unix millis
   newConversationEachRun?: boolean; // true = create new topic each run
+  runHistory?: HeartbeatRun[];      // recent executions (oldest first)
   createdAt?: number;
-  approvalMode?: "ask" | "auto" | "yolo"; // empty defaults to "yolo"
+  approvalMode?: "read-only" | "workspace-write" | "danger-full-access" | "ask" | "auto" | "yolo";
   timeWindowStart?: string; // "HH:MM" — interval tasks only run after this time
   timeWindowEnd?: string;   // "HH:MM" — interval tasks only run before this time
   notifyChannels?: boolean; // true = push to bot channels; false/nil = skip

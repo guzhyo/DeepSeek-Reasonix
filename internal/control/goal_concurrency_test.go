@@ -21,14 +21,12 @@ func TestGoalStateWritesAreConcurrencySafe(t *testing.T) {
 	path := filepath.Join(dir, "session.jsonl")
 	sess := agent.NewSession("sys")
 	exec := agent.New(nil, nil, sess, agent.Options{}, event.Discard)
-	c := New(Options{Executor: exec, SessionDir: dir, SessionPath: path, Label: "test"})
+	c := newOwnedTestController(t, Options{Executor: exec, SessionDir: dir, SessionPath: path, Label: "test"})
 	c.SetGoalWithResearchMode("concurrent goal", GoalResearchOn)
 
 	stop := make(chan struct{})
 	var readers sync.WaitGroup
-	readers.Add(1)
-	go func() {
-		defer readers.Done()
+	readers.Go(func() {
 		for {
 			select {
 			case <-stop:
@@ -40,7 +38,7 @@ func TestGoalStateWritesAreConcurrencySafe(t *testing.T) {
 				_ = c.GoalStatus()    // takes c.mu
 			}
 		}
-	}()
+	})
 
 	var writers sync.WaitGroup
 	for w := range 8 {

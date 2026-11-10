@@ -33,16 +33,22 @@ func (t desktopCountingTool) Execute(context.Context, json.RawMessage) (string, 
 	return "ok", nil
 }
 
-func TestDesktopE2EBlocksRepeatedSuccessfulBashFileWrite(t *testing.T) {
+func TestDesktopE2ERemindsWithoutBlockingRepeatedSuccessfulBashFileWrite(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping desktop E2E repeat-guard test in short mode")
 	}
 
 	var calls int32
 	reg := tool.NewRegistry()
+	todoWrite, ok := tool.LookupBuiltin("todo_write")
+	if !ok {
+		t.Fatal("todo_write builtin is not registered")
+	}
+	reg.Add(todoWrite)
 	reg.Add(desktopCountingTool{name: "bash", calls: &calls})
-	args := `{"command":"python -c \"with open('prompt.txt', 'w') as f: f.write('hello')\""}`
+	args := `{"command":"printf 'hello' > prompt.txt"}`
 	prov := agenttest.NewMock("scripted-desktop",
+		agenttest.Turn{ToolCalls: []provider.ToolCall{{ID: "todo-1", Name: "todo_write", Arguments: `{"todos":[{"content":"update the prompt file","status":"in_progress"}]}`}}},
 		agenttest.Turn{ToolCalls: []provider.ToolCall{{ID: "c1", Name: "bash", Arguments: args}}},
 		agenttest.Turn{ToolCalls: []provider.ToolCall{{ID: "c2", Name: "bash", Arguments: args}}},
 		agenttest.Turn{ToolCalls: []provider.ToolCall{{ID: "c3", Name: "bash", Arguments: args}}},
@@ -62,22 +68,22 @@ func TestDesktopE2EBlocksRepeatedSuccessfulBashFileWrite(t *testing.T) {
 	for {
 		select {
 		case e := <-events:
-			if e.Kind == event.ToolResult {
+			if e.Kind == event.ToolResult && e.Tool.Name == "bash" {
 				results = append(results, e)
 			}
 			if e.Kind == event.TurnDone {
 				if e.Err != nil {
 					t.Fatalf("turn failed: %v", e.Err)
 				}
-				if got := atomic.LoadInt32(&calls); got != 2 {
-					t.Fatalf("bash executed %d times, want 2 before the repeat guard blocks", got)
+				if got := atomic.LoadInt32(&calls); got != 3 {
+					t.Fatalf("bash executed %d times, want all 3 calls to run", got)
 				}
 				if len(results) != 3 {
 					t.Fatalf("tool results = %d, want 3", len(results))
 				}
 				last := results[len(results)-1].Tool.Output
-				if !strings.Contains(last, "[loop guard]") || !strings.Contains(last, "edit_file") {
-					t.Fatalf("third repeated write should nudge the model to change tools, got %q", last)
+				if !strings.Contains(last, "[repeat reminder]") || !strings.Contains(last, "called 3 consecutive times") {
+					t.Fatalf("third repeated write should add a non-blocking reminder, got %q", last)
 				}
 				return
 			}

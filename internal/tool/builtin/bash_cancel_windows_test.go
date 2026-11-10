@@ -34,6 +34,7 @@ func TestBashCancelKillsWindowsChildProcessTree(t *testing.T) {
 	args, _ := json.Marshal(map[string]any{"command": command})
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+	ctx = fullAccessBashTestContext(ctx)
 
 	done := make(chan error, 1)
 	go func() {
@@ -54,7 +55,7 @@ func TestBashCancelKillsWindowsChildProcessTree(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected cancel to return an error")
 	}
-	for i := 0; i < 50; i++ {
+	for range 50 {
 		if !windowsProcessAlive(childPID) {
 			return
 		}
@@ -81,13 +82,13 @@ func TestBashWindowsReapsChildAfterForegroundShellExit(t *testing.T) {
 
 	out, err := (bash{
 		shell: sandbox.Shell{Kind: sandbox.ShellPowerShell, Path: powershell},
-	}).Execute(context.Background(), args)
+	}).Execute(fullAccessBashTestContext(t.Context()), args)
 	childPID := waitForWindowsPIDFile(t, pidFile)
 	if err != nil {
 		killWindowsPID(childPID)
 		t.Fatalf("foreground command failed: %v (out=%q)", err, out)
 	}
-	for i := 0; i < 50; i++ {
+	for range 50 {
 		if !windowsProcessAlive(childPID) {
 			return
 		}
@@ -110,6 +111,7 @@ func TestBashCancelKillsGitBashHereDocPython(t *testing.T) {
 	args, _ := json.Marshal(map[string]any{"command": command})
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+	ctx = fullAccessBashTestContext(ctx)
 
 	done := make(chan error, 1)
 	go func() {
@@ -129,7 +131,7 @@ func TestBashCancelKillsGitBashHereDocPython(t *testing.T) {
 		killWindowsPID(childPID)
 		t.Fatal("cancel did not interrupt Git Bash here-doc python within 20s")
 	}
-	for i := 0; i < 50; i++ {
+	for range 50 {
 		if !windowsProcessAlive(childPID) {
 			return
 		}

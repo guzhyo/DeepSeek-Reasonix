@@ -8,18 +8,82 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"reasonix/internal/agent"
 	"reasonix/internal/event"
 	"reasonix/internal/evidence"
 	"reasonix/internal/hook"
 	"reasonix/internal/provider"
+	"reasonix/internal/skill"
 	"reasonix/internal/tool"
 )
 
+type plannerMetadataRunner struct {
+	meta  plannerTurnMetadata
+	input string
+}
+
+type goalReplacingRunner struct {
+	c        *Controller
+	executor *agent.Agent
+	calls    int
+}
+
+func (r *goalReplacingRunner) Run(context.Context, string) error {
+	r.calls++
+	if r.calls == 1 {
+		r.c.SetGoal("replacement goal")
+		r.executor.ReplaceTodoState(nil)
+		r.executor.Session().Add(provider.Message{
+			Role:    provider.RoleAssistant,
+			Content: "Old Goal turn finished.\n\n[goal:complete]",
+		})
+	}
+	return nil
+}
+
+func (r *plannerMetadataRunner) Run(ctx context.Context, input string) error {
+	r.meta, _ = plannerTurnMetadataFromContext(ctx)
+	r.input = input
+	return nil
+}
+
+func TestTurnOrchestratorAttachesTrustedPlannerMetadata(t *testing.T) {
+	sess := agent.NewSession("sys")
+	sess.Add(provider.Message{Role: provider.RoleUser, Content: "explain the bug"})
+	sess.Add(provider.Message{Role: provider.RoleAssistant, Content: "the bug is in parser.go"})
+	exec := agent.New(nil, tool.NewRegistry(), sess, agent.Options{}, event.Discard)
+	runner := &plannerMetadataRunner{}
+	c := newOwnedTestController(t, Options{
+		Runner:   runner,
+		Executor: exec,
+	})
+	c.SetGoal("migrate authentication across the backend")
+
+	const raw = "fix typo in README"
+	const expanded = "Referenced context:\n\nprivate injected details\n\nfix typo in README"
+	if err := newTurnOrchestrator(c).runTurnWithRawDisplay(context.Background(), expanded, raw, ""); err != nil {
+		t.Fatal(err)
+	}
+
+	if runner.meta.UserText != raw {
+		t.Fatalf("planner metadata user text = %q, want pristine %q", runner.meta.UserText, raw)
+	}
+	if runner.meta.ExplicitPlanMode {
+		t.Fatalf("planner metadata should not force plan mode: %+v", runner.meta)
+	}
+	if !runner.meta.HasConversationContext {
+		t.Fatalf("planner metadata lost executor conversation ownership: %+v", runner.meta)
+	}
+	if !strings.Contains(runner.input, expanded) {
+		t.Fatalf("model input lost expanded context: %q", runner.input)
+	}
+}
+
 func TestTurnOrchestratorRunsForegroundUnit(t *testing.T) {
 	runner := &fakeTurnRunner{}
-	c := New(Options{Runner: runner})
+	c := newOwnedTestController(t, Options{Runner: runner})
 	c.SetPlanMode(true)
 
 	o := newTurnOrchestrator(c)
@@ -35,41 +99,46 @@ func TestTurnOrchestratorRunsForegroundUnit(t *testing.T) {
 	}
 }
 
-func TestTurnOrchestratorSkipsMemoryCompilerForSyntheticTurns(t *testing.T) {
-	// A genuine user turn supplies a Memory v5 source and is not skipped; a
-	// synthetic controller-injected turn (the goal-loop continuation) is marked
-	// to bypass compilation so its contract can't be re-injected and loop
-	// (#5342, #5329).
-	runner := &fakeTurnRunner{}
-	c := New(Options{Runner: runner})
-	o := newTurnOrchestrator(c)
+func TestNonGoalTurnDoesNotInvokeGoalEvaluator(t *testing.T) {
+	tests := []struct {
+		name string
+		run  func(*turnOrchestrator) error
+	}{
+		{
+			name: "ordinary",
+			run: func(o *turnOrchestrator) error {
+				return o.runGoalLoopWithRawDisplay(context.Background(), "answer", "answer", "")
+			},
+		},
+		{
+			name: "edited",
+			run: func(o *turnOrchestrator) error {
+				return o.runEditedGoalLoopWithRawDisplay(context.Background(), "answer", "answer", "", "old answer")
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			runner := &fakeTurnRunner{}
+			evaluator := &fakeGoalEvaluator{}
+			c := newOwnedTestController(t, Options{Runner: runner, GoalEvaluator: evaluator})
 
-	real := "fix the login bug"
-	if err := o.runTurnWithRawDisplay(context.Background(), real, real, ""); err != nil {
-		t.Fatal(err)
-	}
-	if err := o.runTurnWithRawDisplay(context.Background(), goalContinueTurn, goalContinueTurn, ""); err != nil {
-		t.Fatal(err)
-	}
-
-	if len(runner.memoryCompilerSkips) != 2 {
-		t.Fatalf("runs = %d, want 2", len(runner.memoryCompilerSkips))
-	}
-	if runner.memoryCompilerSkips[0] {
-		t.Fatalf("genuine user turn was marked skip-compile")
-	}
-	if !runner.memoryCompilerSkips[1] {
-		t.Fatalf("synthetic goal-continuation turn was NOT marked skip-compile")
-	}
-	// The genuine turn supplies a source; the synthetic one must not.
-	if len(runner.memoryCompilerInputs) != 1 || runner.memoryCompilerInputs[0] != real {
-		t.Fatalf("memory compiler sources = %v, want exactly [%q]", runner.memoryCompilerInputs, real)
+			if err := tt.run(newTurnOrchestrator(c)); err != nil {
+				t.Fatal(err)
+			}
+			if len(runner.inputs) != 1 {
+				t.Fatalf("runner inputs = %d, want 1", len(runner.inputs))
+			}
+			if evaluator.calls != 0 {
+				t.Fatalf("goal evaluator calls = %d, want 0 outside Goal mode", evaluator.calls)
+			}
+		})
 	}
 }
 
 func TestTurnOrchestratorTypedSyntheticTurnDoesNotDependOnPrefix(t *testing.T) {
 	runner := &fakeTurnRunner{}
-	c := New(Options{AutoPlan: "on", Runner: runner})
+	c := newOwnedTestController(t, Options{Runner: runner})
 	o := newTurnOrchestrator(c)
 
 	turn := "Controller-created follow-up with a brand-new synthetic wording:\n- inspect\n- edit\n- verify"
@@ -84,29 +153,42 @@ func TestTurnOrchestratorTypedSyntheticTurnDoesNotDependOnPrefix(t *testing.T) {
 		t.Fatalf("runner inputs = %d, want 1", len(runner.inputs))
 	}
 	if strings.HasPrefix(runner.inputs[0], PlanModeMarker) {
-		t.Fatalf("typed synthetic turn should not be auto-planned, got %q", runner.inputs[0])
-	}
-	if len(runner.memoryCompilerSkips) != 1 || !runner.memoryCompilerSkips[0] {
-		t.Fatalf("typed synthetic turn was not marked skip-compile: %+v", runner.memoryCompilerSkips)
-	}
-	if len(runner.memoryCompilerInputs) != 0 {
-		t.Fatalf("typed synthetic turn supplied Memory v5 source input: %+v", runner.memoryCompilerInputs)
+		t.Fatalf("typed synthetic turn should remain a plain turn, got %q", runner.inputs[0])
 	}
 }
 
-func TestTurnOrchestratorLegacySyntheticPrefixStillSkipsMemoryCompiler(t *testing.T) {
-	runner := &fakeTurnRunner{}
-	c := New(Options{Runner: runner})
-	o := newTurnOrchestrator(c)
+func TestGoalTurnOutputCannotAdvanceReplacementGoal(t *testing.T) {
+	executor := agent.New(nil, tool.NewRegistry(), agent.NewSession("system"), agent.Options{}, event.Discard)
+	runner := &goalReplacingRunner{executor: executor}
+	evaluator := &fakeGoalEvaluator{}
+	c := newOwnedTestController(t, Options{
+		Runner:        runner,
+		Executor:      executor,
+		GoalEvaluator: evaluator,
+		SessionDir:    t.TempDir(),
+	})
+	runner.c = c
+	c.SetGoal("old goal")
 
-	if err := o.runTurnWithRawDisplay(context.Background(), goalContinueTurn, goalContinueTurn, ""); err != nil {
+	if err := newTurnOrchestrator(c).runGoalLoopWithRawDisplay(
+		context.Background(),
+		"work on the old goal",
+		"work on the old goal",
+		"",
+	); err != nil {
 		t.Fatal(err)
 	}
-	if len(runner.memoryCompilerSkips) != 1 || !runner.memoryCompilerSkips[0] {
-		t.Fatalf("legacy synthetic prefix was not marked skip-compile: %+v", runner.memoryCompilerSkips)
+	if runner.calls != 1 {
+		t.Fatalf("runner calls = %d, want 1 old-Goal turn", runner.calls)
 	}
-	if len(runner.memoryCompilerInputs) != 0 {
-		t.Fatalf("legacy synthetic prefix supplied Memory v5 source input: %+v", runner.memoryCompilerInputs)
+	if got := c.Goal(); got != "replacement goal" {
+		t.Fatalf("Goal() = %q, want replacement Goal to remain active", got)
+	}
+	if got := c.GoalStatus(); got != GoalStatusRunning {
+		t.Fatalf("GoalStatus() = %q, want replacement Goal to remain running", got)
+	}
+	if evaluator.calls != 0 {
+		t.Fatalf("stale Goal evaluator calls = %d, want 0", evaluator.calls)
 	}
 }
 
@@ -123,7 +205,7 @@ func TestTurnOrchestratorStopHookIgnoresCanceledTurnContext(t *testing.T) {
 		stopErr = ctx.Err()
 		return hook.SpawnResult{ExitCode: 0}
 	}, nil)
-	c := New(Options{
+	c := newOwnedTestController(t, Options{
 		Runner: cancelingRunner{cancel: cancel},
 		Hooks:  hooks,
 	})
@@ -145,26 +227,24 @@ func TestTurnOrchestratorStopHookIgnoresCanceledTurnContext(t *testing.T) {
 }
 
 type recordingSessionRunner struct {
-	session              *agent.Session
-	inputs               []string
-	memoryCompilerInputs []string
+	session *agent.Session
+	inputs  []string
+	raw     []string
 }
 
 func (r *recordingSessionRunner) Run(ctx context.Context, input string) error {
 	r.inputs = append(r.inputs, input)
-	if source, ok := agent.MemoryCompilerSourceInputFromContext(ctx); ok {
-		r.memoryCompilerInputs = append(r.memoryCompilerInputs, source)
-	}
+	r.raw = append(r.raw, agent.RawUserInput(ctx, input))
 	r.session.Add(provider.Message{Role: provider.RoleUser, Content: input})
 	return nil
 }
 
-func TestTurnOrchestratorGoalContinuationRunsStopPerUnit(t *testing.T) {
-	prov := &scriptedTurns{turns: [][]provider.Chunk{
-		textTurn("Started.\n\n[goal:continue]"),
-		textTurn("Finished.\n\n[goal:complete]"),
-	}}
-	ag := agent.New(prov, tool.NewRegistry(), agent.NewSession(""), agent.Options{}, event.Discard)
+func TestTurnOrchestratorRunsOneGoalTurnPerAdmission(t *testing.T) {
+	prov := &scriptedTurns{turns: flattenTurns(
+		goalToolTurn(GoalStatusRunning, "started", "next"),
+		goalToolTurn(GoalStatusComplete, "", ""),
+	)}
+	ag := agent.New(prov, goalRegistry(), agent.NewSession(""), agent.Options{}, event.Discard)
 	var stopEvents int
 	hooks := hook.NewRunner([]hook.ResolvedHook{{
 		HookConfig: hook.HookConfig{Command: "record-stop"},
@@ -180,7 +260,7 @@ func TestTurnOrchestratorGoalContinuationRunsStopPerUnit(t *testing.T) {
 		}
 		return hook.SpawnResult{ExitCode: 0}
 	}, nil)
-	c := New(Options{Runner: ag, Executor: ag, Hooks: hooks})
+	c := newOwnedTestController(t, Options{Runner: ag, Executor: ag, Hooks: hooks})
 	c.SetGoal("ship the refactor")
 
 	o := newTurnOrchestrator(c)
@@ -189,19 +269,19 @@ func TestTurnOrchestratorGoalContinuationRunsStopPerUnit(t *testing.T) {
 	}
 
 	if prov.call != 2 {
-		t.Fatalf("provider calls = %d, want initial + continuation", prov.call)
+		t.Fatalf("provider calls = %d, want one admitted turn (tool call + final answer)", prov.call)
 	}
-	if stopEvents != 2 {
-		t.Fatalf("Stop hook events = %d, want one per goal-loop turn unit", stopEvents)
+	if stopEvents != 1 {
+		t.Fatalf("Stop hook events = %d, want one per admitted turn", stopEvents)
 	}
 }
 
 func TestTurnOrchestratorApprovedPlanSharesOneStopHook(t *testing.T) {
-	prov := &scriptedTurns{turns: [][]provider.Chunk{
-		textTurn("Plan:\n1. Make the change\n2. Verify it"),
-		textTurn("Done."),
-	}}
-	ag := agent.New(prov, tool.NewRegistry(), agent.NewSession(""), agent.Options{}, event.Discard)
+	prov := &scriptedTurns{turns: planThenExecuteTurns(
+		"Plan:\n1. Make the change\n2. Verify it",
+		"Done.",
+	)}
+	ag := newPlanTestAgent(prov)
 	approvalID := make(chan string, 1)
 	var promptSubmitEvents, stopEvents int
 	hooks := hook.NewRunner([]hook.ResolvedHook{
@@ -228,7 +308,7 @@ func TestTurnOrchestratorApprovedPlanSharesOneStopHook(t *testing.T) {
 		}
 		return hook.SpawnResult{ExitCode: 0}
 	}, nil)
-	c := New(Options{
+	c := newOwnedTestController(t, Options{
 		Runner:   ag,
 		Executor: ag,
 		Hooks:    hooks,
@@ -246,8 +326,8 @@ func TestTurnOrchestratorApprovedPlanSharesOneStopHook(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if prov.call != 2 {
-		t.Fatalf("provider calls = %d, want plan + approved execution", prov.call)
+	if prov.call != 3 {
+		t.Fatalf("provider calls = %d, want plan + read + answer", prov.call)
 	}
 	if promptSubmitEvents != 1 {
 		t.Fatalf("UserPromptSubmit events = %d, want one for plan + approved execution unit", promptSubmitEvents)
@@ -266,7 +346,7 @@ func TestTurnOrchestratorRefTurnRecordsVisibleDisplay(t *testing.T) {
 	exec := agent.New(nil, nil, sess, agent.Options{}, event.Discard)
 	runner := &recordingSessionRunner{session: sess}
 	events := make(chan event.Event, 4)
-	c := New(Options{
+	c := newOwnedTestController(t, Options{
 		WorkspaceRoot: root,
 		Runner:        runner,
 		Executor:      exec,
@@ -290,14 +370,50 @@ func TestTurnOrchestratorRefTurnRecordsVisibleDisplay(t *testing.T) {
 	if !strings.Contains(runner.inputs[0], "Referenced context:") || !strings.Contains(runner.inputs[0], "referenced evidence") {
 		t.Fatalf("model input should include resolved reference context, got %q", runner.inputs[0])
 	}
-	if len(runner.memoryCompilerInputs) != 1 || runner.memoryCompilerInputs[0] != visible {
-		t.Fatalf("memory compiler source input = %+v, want %q", runner.memoryCompilerInputs, visible)
-	}
 	if gotDisplay != visible {
 		t.Fatalf("display recorder display = %q, want visible prompt %q", gotDisplay, visible)
 	}
 	if gotContent != runner.inputs[0] {
 		t.Fatalf("display recorder content = %q, want persisted model input %q", gotContent, runner.inputs[0])
+	}
+}
+
+func TestTurnOrchestratorRefTurnPreservesExpandedPasteForRouting(t *testing.T) {
+	const label = "[Pasted text #1 · 2 lines]"
+	const display = "inspect\n\n" + label
+	const expanded = display + "\n\n--- Begin " + label + " ---\nroute-expanded-paste\nfunc main() {}\n--- End " + label + " ---"
+
+	sess := agent.NewSession("sys")
+	exec := agent.New(nil, nil, sess, agent.Options{}, event.Discard)
+	runner := &recordingSessionRunner{session: sess}
+	reg := tool.NewRegistry()
+	reg.Add(capabilityTestTool{name: "run_skill"})
+	c := newOwnedTestController(t, Options{
+		Runner:   runner,
+		Executor: exec,
+		Registry: reg,
+		Skills: []skill.Skill{{
+			Name:        "paste-review",
+			Description: "review code",
+			Triggers:    []string{"route-expanded-paste"},
+			Scope:       skill.ScopeBuiltin,
+		}},
+	})
+	resolve := func(context.Context, string) resolvedReferences {
+		return resolvedReferences{block: "<file path=\"notes.txt\">\nreference\n</file>"}
+	}
+
+	if err := c.runRefTurnWithResolverSync(context.Background(), expanded, expanded, display, "", resolve); err != nil {
+		t.Fatal(err)
+	}
+	if len(runner.inputs) != 1 || !strings.Contains(runner.inputs[0], "Referenced context:") || !strings.Contains(runner.inputs[0], expanded) {
+		t.Fatalf("provider input = %+v, want resolved context and expanded paste", runner.inputs)
+	}
+	if !strings.Contains(runner.inputs[0], "skill:paste-review prefer") {
+		t.Fatalf("expanded pasted text did not drive capability routing:\n%s", runner.inputs[0])
+	}
+	if len(runner.raw) != 1 || runner.raw[0] != expanded {
+		t.Fatalf("persisted raw input = %+v, want complete user input %q", runner.raw, expanded)
 	}
 }
 
@@ -308,10 +424,9 @@ func TestTurnOrchestratorAutoReasoningLanguageUsesRawPromptForRefTurns(t *testin
 	}
 	runner := &fakeTurnRunner{}
 	events := make(chan event.Event, 4)
-	c := New(Options{
+	c := newOwnedTestController(t, Options{
 		WorkspaceRoot: root,
 		Runner:        runner,
-		AutoPlan:      "off",
 		Sink: event.FuncSink(func(e event.Event) {
 			events <- e
 		}),
@@ -336,50 +451,43 @@ func TestTurnOrchestratorAutoReasoningLanguageUsesRawPromptForRefTurns(t *testin
 	}
 }
 
-func TestTurnOrchestratorCheckpointBoundaryPrecedesUserMessage(t *testing.T) {
+// TestTurnOrchestratorCheckpointPromptIsRawUserInput verifies the rewind picker
+// label records the user's own text, not the composed provider input. compose()
+// prefixes the turn with transient blocks (<response-language>,
+// <reasoning-language>, plan marker, memory, hook context, …); storing that
+// string as checkpoint.Prompt made the Esc-Esc picker show a wall of prefab
+// prompt text instead of the user's messages.
+func TestTurnOrchestratorCheckpointPromptIsRawUserInput(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "session.jsonl")
 	sess := agent.NewSession("sys")
 	exec := agent.New(nil, nil, sess, agent.Options{}, event.Discard)
 	runner := &recordingSessionRunner{session: sess}
-	c := New(Options{
-		Runner:      runner,
-		Executor:    exec,
-		SessionDir:  dir,
-		SessionPath: path,
-		Label:       "test",
+	c := newOwnedTestController(t, Options{
+		Runner:            runner,
+		Executor:          exec,
+		SessionDir:        dir,
+		SessionPath:       path,
+		Label:             "test",
+		ResponseLanguage:  "zh",
+		ReasoningLanguage: "en",
 	})
-
 	o := newTurnOrchestrator(c)
-	if err := o.runTurnWithRawDisplay(context.Background(), "write the test", "write the test", ""); err != nil {
+	const raw = "fix the parser"
+	if err := o.runTurnWithRawDisplay(context.Background(), raw, raw, ""); err != nil {
 		t.Fatal(err)
 	}
-
-	if !c.CheckpointHasBoundary(0) {
-		t.Fatal("checkpoint boundary should be available for the orchestrated turn")
+	cps := c.Checkpoints()
+	if len(cps) != 1 {
+		t.Fatalf("checkpoints = %+v, want exactly one", cps)
 	}
-	if len(sess.Messages) != 2 || sess.Messages[1].Content != "write the test" {
-		t.Fatalf("session messages after turn = %+v, want system + user", sess.Messages)
+	if got := cps[0].Prompt; got != raw {
+		t.Fatalf("checkpoint prompt = %q, want raw user input %q (composed text leaked into the rewind picker)", got, raw)
 	}
-	loaded, err := agent.LoadSession(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(loaded.Messages) != 2 {
-		t.Fatalf("saved messages = %d, want system + user", len(loaded.Messages))
-	}
-	meta, ok, err := agent.LoadBranchMeta(path)
-	if err != nil || !ok {
-		t.Fatalf("load branch meta ok=%v err=%v", ok, err)
-	}
-	if meta.UpdatedAt.IsZero() {
-		t.Fatal("activity meta should be marked after transcript changes")
-	}
-	if err := c.Rewind(0, RewindConversation); err != nil {
-		t.Fatal(err)
-	}
-	if len(sess.Messages) != 1 {
-		t.Fatalf("session messages after rewind = %d, want boundary before user message", len(sess.Messages))
+	for _, prefab := range []string{"<response-language>", "<reasoning-language>"} {
+		if strings.Contains(cps[0].Prompt, prefab) {
+			t.Fatalf("checkpoint prompt contains %q: %q", prefab, cps[0].Prompt)
+		}
 	}
 }
 
@@ -389,7 +497,7 @@ func TestTurnOrchestratorSyntheticTurnDoesNotCreateCheckpoint(t *testing.T) {
 	sess := agent.NewSession("sys")
 	exec := agent.New(nil, nil, sess, agent.Options{}, event.Discard)
 	runner := &recordingSessionRunner{session: sess}
-	c := New(Options{
+	c := newOwnedTestController(t, Options{
 		Runner:      runner,
 		Executor:    exec,
 		SessionDir:  dir,
@@ -417,13 +525,13 @@ func TestTurnOrchestratorSyntheticTurnDoesNotCreateCheckpoint(t *testing.T) {
 	}
 }
 
-func TestTurnOrchestratorStopHookCancelledContext(t *testing.T) {
+func TestTurnOrchestratorStopFailureHookCancelledContext(t *testing.T) {
 	prov := &scriptedTurns{turns: [][]provider.Chunk{textTurn("done")}}
 	ag := agent.New(prov, tool.NewRegistry(), agent.NewSession(""), agent.Options{}, event.Discard)
 	var stopCalls int
 	hooks := hook.NewRunner([]hook.ResolvedHook{{
 		HookConfig: hook.HookConfig{Command: "stop"},
-		Event:      hook.Stop,
+		Event:      hook.StopFailure,
 		Scope:      hook.ScopeProject,
 	}}, "", func(ctx context.Context, in hook.SpawnInput) hook.SpawnResult {
 		if ctx.Err() != nil {
@@ -431,28 +539,30 @@ func TestTurnOrchestratorStopHookCancelledContext(t *testing.T) {
 		}
 		var p hook.Payload
 		json.Unmarshal([]byte(in.Stdin), &p)
-		if p.Event == hook.Stop {
+		if p.Event == hook.StopFailure {
+			if p.Error == "" || !p.IsInterrupt {
+				t.Errorf("failure payload = %+v", p)
+			}
 			stopCalls++
 		}
 		return hook.SpawnResult{ExitCode: 0}
 	}, nil)
-	c := New(Options{Runner: ag, Executor: ag, Hooks: hooks})
+	c := newOwnedTestController(t, Options{Runner: ag, Executor: ag, Hooks: hooks})
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	o := newTurnOrchestrator(c)
-	if err := o.runTurnWithRawDisplay(ctx, "test", "test", ""); err != nil && err != context.Canceled {
+	if err := o.runTurnWithRawDisplay(ctx, "test", "test", ""); err != nil && !errors.Is(err, context.Canceled) {
 		t.Fatal(err)
 	}
 	if stopCalls != 1 {
-		t.Fatalf("Stop hooks called = %d; want 1", stopCalls)
+		t.Fatalf("StopFailure hooks called = %d; want 1", stopCalls)
 	}
 }
 
 // TestTurnOrchestratorCancelPreservesVisibleUserPrompt verifies that when the
-// user explicitly cancels a visible turn (Ctrl+C), the real user prompt remains
-// in the session while incomplete assistant/tool remnants are stripped. Without
-// this, the next user message can lose the just-submitted context (#5499); if
-// the remnants remain, the model can re-execute interrupted work (#5286).
+// user explicitly cancels a visible turn (Ctrl+C), the real user prompt and
+// fully paired tool work remain in the session while unsafe fragments become
+// provider-excluded display history.
 func TestTurnOrchestratorCancelPreservesVisibleUserPrompt(t *testing.T) {
 	sess := agent.NewSession("you are a helpful agent")
 	// Pre-populate with a few messages from an earlier turn.
@@ -475,15 +585,15 @@ func TestTurnOrchestratorCancelPreservesVisibleUserPrompt(t *testing.T) {
 	}
 
 	ex := agent.New(nil, nil, sess, agent.Options{}, event.Discard)
-	c := New(Options{Runner: runner, Executor: ex})
+	c := newOwnedTestController(t, Options{Runner: runner, Executor: ex})
+	c.SetPlanMode(true)
 	// Simulate a user-initiated cancel: set the cancelling flag.
 	c.mu.Lock()
-	c.canceling = true
+	c.turns.cancelRequested = true
 	c.mu.Unlock()
 
-	// Pre-seed todoState as if a successful todo_write from the cancelled turn
-	// had already updated it — this is the state the runner leaves behind before
-	// returning context.Canceled, and what RebuildTodoState must clear.
+	// Pre-seed only the executor's legacy mutable copy. Without a committed
+	// semantic ToolResult event it must not become the host todo projection.
 	ex.ReplaceTodoState([]evidence.TodoItem{{Content: "add abc", Status: "in_progress"}})
 
 	o := newTurnOrchestrator(c)
@@ -492,26 +602,178 @@ func TestTurnOrchestratorCancelPreservesVisibleUserPrompt(t *testing.T) {
 		t.Fatalf("expected context.Canceled, got %v", err)
 	}
 
-	// The visible user prompt must stay, while assistant/tool remnants from the
-	// cancelled turn must be stripped.
+	// The visible user prompt and completed tool pair stay, followed by a durable
+	// provider-excluded recovery record.
 	msgs := sess.Messages
-	if len(msgs) != preCount+1 {
-		t.Fatalf("session messages after cancel = %d, want pre-turn + user prompt %d: %+v", len(msgs), preCount+1, msgs)
+	if len(msgs) != preCount+4 {
+		t.Fatalf("session messages after cancel = %d, want user + tool pair + recovery %d: %+v", len(msgs), preCount+4, msgs)
+	}
+	user := msgs[preCount]
+	if user.Role != provider.RoleUser || user.Content != "add config file abc" {
+		t.Fatalf("cancelled user message = %+v, want prefix-free prompt", user)
+	}
+	if msgs[preCount+1].Role != provider.RoleAssistant || msgs[preCount+2].Role != provider.RoleTool {
+		t.Fatalf("completed tool pair was not retained: %+v", msgs[preCount+1:])
 	}
 	last := msgs[len(msgs)-1]
-	if last.Role != provider.RoleUser || last.Content != "add config file abc" {
-		t.Fatalf("last message after cancel = %+v, want preserved visible user prompt", last)
-	}
-	for _, m := range msgs[preCount+1:] {
-		if m.Role == provider.RoleAssistant || m.Role == provider.RoleTool {
-			t.Fatalf("cancelled turn remnant survived: %+v", m)
-		}
+	if !last.LocalOnly || last.InterruptedTurn == nil || !last.InterruptedTurn.Pending || len(last.InterruptedTurn.CompletedTools) != 1 {
+		t.Fatalf("pending recovery metadata missing: %+v", last)
 	}
 
-	// todoState must also be reset: the in_progress todo written by the
-	// cancelled turn must not survive the strip.
+	// Transcript prose and the executor copy are archival/convenience data. The
+	// host projection changes only from a committed semantic ToolResult event.
 	if todos := c.Todos(); len(todos) != 0 {
-		t.Fatalf("Todos() after cancel = %v, want empty — cancelled todo_write leaked into canonical state", todos)
+		t.Fatalf("Todos() after cancel = %v, want no uncommitted todo projection", todos)
+	}
+}
+
+func TestTurnOrchestratorProviderErrorPreservesCompletedPairAndLocalPartial(t *testing.T) {
+	sess := agent.NewSession("system")
+	apiErr := errors.New("provider connection reset")
+	runner := &cancelStrippingRunner{
+		session: sess,
+		add: []provider.Message{
+			{Role: provider.RoleAssistant, ToolCalls: []provider.ToolCall{{ID: "c1", Name: "write_file", Arguments: `{"path":"a.txt","content":"ok"}`, Added: 1}}},
+			{Role: provider.RoleTool, ToolCallID: "c1", Name: "write_file", Content: "wrote a.txt"},
+			{
+				Role: provider.RoleTool, ToolCallID: provider.LocalOnlyToolID, Name: provider.LocalOnlyToolName,
+				LocalOnly: true, Content: "partial final answer", ReasoningContent: "partial reasoning",
+				InterruptedTurn: &provider.InterruptedTurnRecovery{Pending: true, DroppedPartialText: true, DroppedPartialReasoning: true},
+			},
+		},
+		err: apiErr,
+	}
+	ex := agent.New(nil, nil, sess, agent.Options{}, event.Discard)
+	c := newOwnedTestController(t, Options{Runner: runner, Executor: ex})
+
+	err := newTurnOrchestrator(c).runTurnWithRawDisplay(context.Background(), "update a.txt", "update a.txt", "")
+	if !errors.Is(err, apiErr) {
+		t.Fatalf("run error = %v, want %v", err, apiErr)
+	}
+	msgs := sess.Snapshot()
+	if len(msgs) != 5 || msgs[2].Role != provider.RoleAssistant || msgs[3].Role != provider.RoleTool || !msgs[4].LocalOnly {
+		t.Fatalf("provider-error recovery transcript = %+v", msgs)
+	}
+	recovery := msgs[4].InterruptedTurn
+	if recovery == nil || !recovery.Pending || len(recovery.CompletedTools) != 1 || len(recovery.CompletedTools[0].Files) != 1 || recovery.CompletedTools[0].Files[0] != "a.txt" {
+		t.Fatalf("provider-error recovery metadata = %+v", recovery)
+	}
+	if msgs[4].Content != "partial final answer" || msgs[4].ReasoningContent != "partial reasoning" {
+		t.Fatalf("provider-error display output was not retained: %+v", msgs[4])
+	}
+}
+
+func TestTurnOrchestratorInterruptedAfterCompactionRelocatesVisibleTurn(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		err    error
+		cancel bool
+	}{
+		{name: "cancel", err: context.Canceled, cancel: true},
+		{name: "provider error", err: errors.New("provider connection reset")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			sess := agent.NewSession("system")
+			for range 3 {
+				sess.Add(provider.Message{Role: provider.RoleUser, Content: "old task"})
+				sess.Add(provider.Message{Role: provider.RoleAssistant, Content: "old answer"})
+			}
+			start := sess.Len()
+			runner := &compactingErrorRunner{session: sess, err: tc.err}
+			c := newOwnedTestController(t, Options{Runner: runner, Executor: agent.New(nil, nil, sess, agent.Options{}, event.Discard)})
+			if tc.cancel {
+				c.mu.Lock()
+				c.turns.cancelRequested = true
+				c.mu.Unlock()
+			}
+
+			err := newTurnOrchestrator(c).runTurnWithRawDisplay(context.Background(), "update a.txt", "update a.txt", "")
+			if !errors.Is(err, tc.err) {
+				t.Fatalf("run error = %v, want %v", err, tc.err)
+			}
+			msgs := sess.Snapshot()
+			if start <= len(msgs) {
+				t.Fatalf("test setup did not shrink transcript below stale boundary: start=%d len=%d", start, len(msgs))
+			}
+			userCount := 0
+			for _, m := range msgs {
+				if m.Role == provider.RoleUser && StripComposePrefixes(m.Content) == "update a.txt" {
+					userCount++
+				}
+			}
+			if userCount != 1 {
+				t.Fatalf("current user occurrences = %d, want 1: %+v", userCount, msgs)
+			}
+			if len(msgs) != 6 || !agent.IsCompactionSummary(msgs[1]) || msgs[3].Role != provider.RoleAssistant || msgs[4].Role != provider.RoleTool || !msgs[5].LocalOnly {
+				t.Fatalf("recovered compacted transcript = %+v", msgs)
+			}
+			recovery := msgs[5].InterruptedTurn
+			if recovery == nil || !recovery.Pending || len(recovery.CompletedTools) != 1 || recovery.CompletedTools[0].Name != "write_file" {
+				t.Fatalf("recovery metadata = %+v", recovery)
+			}
+		})
+	}
+}
+
+func TestTurnOrchestratorCancelClassifiesCancelledToolResultAsInterrupted(t *testing.T) {
+	sess := agent.NewSession("system")
+	runner := &cancelStrippingRunner{
+		session: sess,
+		add: []provider.Message{
+			{Role: provider.RoleAssistant, ToolCalls: []provider.ToolCall{{ID: "c1", Name: "bash", Arguments: `{"command":"go test ./..."}`}}},
+			{Role: provider.RoleTool, ToolCallID: "c1", Name: "bash", Content: "error: context canceled"},
+		},
+		err: context.Canceled,
+	}
+	c := newOwnedTestController(t, Options{Runner: runner, Executor: agent.New(nil, nil, sess, agent.Options{}, event.Discard)})
+	c.mu.Lock()
+	c.turns.cancelRequested = true
+	c.mu.Unlock()
+
+	err := newTurnOrchestrator(c).runTurnWithRawDisplay(context.Background(), "run tests", "run tests", "")
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("run error = %v, want cancellation", err)
+	}
+	msgs := sess.Snapshot()
+	recovery := msgs[len(msgs)-1].InterruptedTurn
+	if recovery == nil || len(recovery.CompletedTools) != 0 || len(recovery.InterruptedTools) != 1 || recovery.InterruptedTools[0] != "bash" {
+		t.Fatalf("cancelled tool result was misclassified: %+v", recovery)
+	}
+	if msgs[len(msgs)-3].Role != provider.RoleAssistant || msgs[len(msgs)-2].Role != provider.RoleTool {
+		t.Fatalf("paired cancelled call/result should remain canonical: %+v", msgs)
+	}
+}
+
+func TestTurnOrchestratorCancelBeforeRunnerAddsUserPreservesVisiblePrompt(t *testing.T) {
+	workspace := t.TempDir()
+	writeVisionTestConfig(t, workspace)
+	imagePath := filepath.Join(workspace, "diagram.png")
+	if err := os.WriteFile(imagePath, mustBase64(t, tinyPNG), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	sess := agent.NewSession("system")
+	ex := agent.New(nil, nil, sess, agent.Options{}, event.Discard)
+	c := newOwnedTestController(t, Options{
+		Runner:        cancelBeforeUserRunner{},
+		Executor:      ex,
+		WorkspaceRoot: workspace,
+		ModelRef:      "custom/vision-pro",
+	})
+	c.SetPlanMode(true)
+	c.mu.Lock()
+	c.turns.cancelRequested = true
+	c.mu.Unlock()
+
+	err := newTurnOrchestrator(c).runTurnWithImageRefsRawDisplay(context.Background(), "Referenced context:\n\n<image path=\"diagram.png\">\n@diagram.png\n</image>\n\ninspect the diagnostic", "inspect the diagnostic", "@diagram.png", "")
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected context.Canceled, got %v", err)
+	}
+	msgs := sess.Snapshot()
+	if len(msgs) != 3 || msgs[1].Role != provider.RoleUser || !strings.Contains(msgs[1].Content, "inspect the diagnostic") || !msgs[2].LocalOnly {
+		t.Fatalf("session after pre-executor cancel = %+v, want user plus recovery marker", msgs)
+	}
+	if len(msgs[1].Images) != 1 || !strings.HasPrefix(msgs[1].Images[0], "data:image/png;base64,") {
+		t.Fatalf("session after pre-executor cancel lost user image: %+v", msgs[1].Images)
 	}
 }
 
@@ -531,7 +793,7 @@ func TestTurnOrchestratorCancelFlushesCleanTranscriptToDisk(t *testing.T) {
 			wantNonSystem++
 		}
 	}
-	wantNonSystem++ // the cancelled visible turn's user prompt is preserved
+	wantNonSystem += 4 // visible user + complete assistant/tool pair + recovery
 
 	runner := &cancelStrippingRunner{
 		session: sess,
@@ -545,13 +807,14 @@ func TestTurnOrchestratorCancelFlushesCleanTranscriptToDisk(t *testing.T) {
 	}
 
 	sessionPath := agent.NewSessionPath(t.TempDir(), "test-model")
-	c := New(Options{
+	c := newOwnedTestController(t, Options{
 		Runner:      runner,
 		Executor:    agent.New(nil, nil, sess, agent.Options{}, event.Discard),
 		SessionPath: sessionPath,
 	})
+	c.SetPlanMode(true)
 	c.mu.Lock()
-	c.canceling = true
+	c.turns.cancelRequested = true
 	c.mu.Unlock()
 
 	o := newTurnOrchestrator(c)
@@ -559,9 +822,8 @@ func TestTurnOrchestratorCancelFlushesCleanTranscriptToDisk(t *testing.T) {
 		t.Fatalf("expected context.Canceled, got %v", err)
 	}
 
-	// Load the session file written after the strip and verify it contains the
-	// pre-cancel messages plus the visible user prompt — not the partial
-	// assistant/tool messages.
+	// Load the session file written after cleanup and verify the complete pair and
+	// provider-excluded recovery marker survive restart.
 	loaded, err := agent.LoadSession(sessionPath)
 	if err != nil {
 		t.Fatalf("LoadSession: %v", err)
@@ -577,12 +839,12 @@ func TestTurnOrchestratorCancelFlushesCleanTranscriptToDisk(t *testing.T) {
 	if nonSystem != wantNonSystem {
 		t.Fatalf("on-disk message count (non-system) = %d, want %d — stale partial turn still on disk", nonSystem, wantNonSystem)
 	}
-	if last.Role != provider.RoleUser || last.Content != "do something" {
-		t.Fatalf("last on-disk message = %+v, want preserved visible user prompt", last)
+	if !last.LocalOnly || last.InterruptedTurn == nil || !last.InterruptedTurn.Pending {
+		t.Fatalf("last on-disk message = %+v, want pending local recovery", last)
 	}
 }
 
-func TestResumeClearsStaleVisibleInFlightTurn(t *testing.T) {
+func TestResumeRecoversStaleVisibleInFlightTurn(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "stale-visible.jsonl")
 	sess := agent.NewSession("system")
@@ -606,26 +868,26 @@ func TestResumeClearsStaleVisibleInFlightTurn(t *testing.T) {
 		t.Fatal(err)
 	}
 	exec := agent.New(nil, nil, agent.NewSession("system"), agent.Options{}, event.Discard)
-	c := New(Options{Executor: exec, SessionDir: dir, SessionPath: path})
+	c := newOwnedTestController(t, Options{Executor: exec, SessionDir: dir, SessionPath: path})
 	c.Resume(loaded, path)
 
 	msgs := exec.Session().Snapshot()
-	if len(msgs) != start+1 {
-		t.Fatalf("resumed messages = %d, want pre-turn + user prompt %d: %+v", len(msgs), start+1, msgs)
+	if len(msgs) != start+4 {
+		t.Fatalf("resumed messages = %d, want user + completed pair + recovery %d: %+v", len(msgs), start+4, msgs)
 	}
 	last := msgs[len(msgs)-1]
-	if last.Role != provider.RoleUser || last.Content != "continue work" {
-		t.Fatalf("last resumed message = %+v, want preserved visible user prompt", last)
+	if !last.LocalOnly || last.InterruptedTurn == nil || !last.InterruptedTurn.Pending {
+		t.Fatalf("last resumed message = %+v, want provider-excluded recovery", last)
 	}
 	if todos := c.Todos(); len(todos) != 0 {
-		t.Fatalf("Todos() after stale in-flight recovery = %+v, want empty", todos)
+		t.Fatalf("Todos() after legacy stale in-flight recovery = %+v, want archival todo inactive", todos)
 	}
 	reloaded, err := agent.LoadSession(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(reloaded.Messages) != start+1 {
-		t.Fatalf("persisted messages = %d, want cleaned count %d: %+v", len(reloaded.Messages), start+1, reloaded.Messages)
+	if len(reloaded.Messages) != start+4 {
+		t.Fatalf("persisted messages = %d, want recovered count %d: %+v", len(reloaded.Messages), start+4, reloaded.Messages)
 	}
 	meta, ok, err := agent.LoadBranchMeta(path)
 	if err != nil || !ok {
@@ -643,7 +905,9 @@ func TestResumeClearsStaleSyntheticInFlightTurn(t *testing.T) {
 	sess.Add(provider.Message{Role: provider.RoleUser, Content: "ship it"})
 	sess.Add(provider.Message{Role: provider.RoleAssistant, Content: "Started.\n\n[goal:continue]"})
 	start := len(sess.Messages)
-	sess.Add(provider.Message{Role: provider.RoleUser, Content: goalContinueTurn})
+	// Historical synthetic continuation prompt: retained only as imported test
+	// data so resume can remove an abandoned pre-driver turn.
+	sess.Add(provider.Message{Role: provider.RoleUser, Content: "Continue pursuing the active goal. Do the next useful work and report your judgment with update_goal: continue (give the next concrete step), complete (you judge the goal finished), or blocked (explain why you cannot continue). Keep execution results and any verification limitations accurate."})
 	sess.Add(provider.Message{Role: provider.RoleAssistant, Content: "hidden continuation partial"})
 	if err := sess.Save(path); err != nil {
 		t.Fatal(err)
@@ -657,7 +921,7 @@ func TestResumeClearsStaleSyntheticInFlightTurn(t *testing.T) {
 		t.Fatal(err)
 	}
 	exec := agent.New(nil, nil, agent.NewSession("system"), agent.Options{}, event.Discard)
-	c := New(Options{Executor: exec, SessionDir: dir, SessionPath: path})
+	c := newOwnedTestController(t, Options{Executor: exec, SessionDir: dir, SessionPath: path})
 	c.Resume(loaded, path)
 
 	msgs := exec.Session().Snapshot()
@@ -684,10 +948,37 @@ type cancelStrippingRunner struct {
 	err     error
 }
 
+type compactingErrorRunner struct {
+	session *agent.Session
+	err     error
+}
+
+type cancelBeforeUserRunner struct{}
+
+func (cancelBeforeUserRunner) Run(context.Context, string) error {
+	return context.Canceled
+}
+
 func (r *cancelStrippingRunner) Run(ctx context.Context, input string) error {
 	r.session.Add(provider.Message{Role: provider.RoleUser, Content: input})
 	for _, m := range r.add {
 		r.session.Add(m)
 	}
+	return r.err
+}
+
+func (r *compactingErrorRunner) Run(_ context.Context, input string) error {
+	r.session.Replace([]provider.Message{
+		{Role: provider.RoleSystem, Content: "system"},
+		{Role: provider.RoleUser, Content: "<compaction-summary>\nold work\n</compaction-summary>"},
+		{Role: provider.RoleUser, Content: input, CreatedAt: time.Now().UnixMilli()},
+		{Role: provider.RoleAssistant, ToolCalls: []provider.ToolCall{{ID: "write-1", Name: "write_file", Arguments: `{"path":"a.txt","content":"ok"}`}}},
+		{Role: provider.RoleTool, ToolCallID: "write-1", Name: "write_file", Content: "wrote a.txt"},
+		{
+			Role: provider.RoleTool, ToolCallID: provider.LocalOnlyToolID, Name: provider.LocalOnlyToolName,
+			LocalOnly: true, Content: "partial final answer", ReasoningContent: "private partial reasoning",
+			InterruptedTurn: &provider.InterruptedTurnRecovery{Pending: true},
+		},
+	})
 	return r.err
 }

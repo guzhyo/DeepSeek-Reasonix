@@ -3,6 +3,8 @@ package cli
 import (
 	"strings"
 	"testing"
+
+	"github.com/charmbracelet/colorprofile"
 )
 
 func TestLatexToUnicode(t *testing.T) {
@@ -27,6 +29,11 @@ func TestLatexToUnicode(t *testing.T) {
 		{`\vec{v}`, "v⃗"},
 		{`a^q`, "a^q"},
 		{`f(x) = x^{2y}`, "f(x) = x²ʸ"},
+		{`\boxed{|p\uparrow\rangle}`, "|p↑⟩"},
+		{`\boxed{x}`, "x"},
+		{`\lvert x \rvert`, "∣ x ∣"},
+		{`\Vert x \Vert`, "‖ x ‖"},
+		{`\left. \frac{df}{dx} \right|_{x=0}`, " (df)/(dx) |ₓ₌₀"},
 	}
 	for _, c := range cases {
 		if got := latexToUnicode(c.in); got != c.want {
@@ -53,7 +60,7 @@ func TestNormalizeMath(t *testing.T) {
 }
 
 func TestRenderInlineMath(t *testing.T) {
-	colorEnabled = false
+	activeColorProfile = colorprofile.NoTTY
 	r := newMarkdownRenderer(80)
 
 	out := r.Render(`The mass-energy relation is $E = mc^2$ exactly.`)

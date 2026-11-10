@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
@@ -15,6 +16,7 @@ import (
 	"time"
 
 	"reasonix/internal/fileutil"
+	fileencoding "reasonix/internal/fileutil/encoding"
 	"reasonix/internal/store"
 	"reasonix/internal/tool"
 )
@@ -35,6 +37,9 @@ type SubagentMeta struct {
 	CreatedAt        time.Time      `json:"createdAt"`
 	UpdatedAt        time.Time      `json:"updatedAt"`
 	Status           SubagentStatus `json:"status"`
+	Outcome          string         `json:"outcome,omitempty"`
+	Retryable        bool           `json:"retryable,omitempty"`
+	ErrorCode        string         `json:"errorCode,omitempty"`
 	Kind             string         `json:"kind"` // task | skill
 	Name             string         `json:"name"`
 	WorkspaceRoot    string         `json:"workspaceRoot"`
@@ -46,6 +51,29 @@ type SubagentMeta struct {
 	ToolSchemaHash   string         `json:"toolSchemaHash"`
 	Model            string         `json:"model"`
 	Effort           string         `json:"effort"`
+	// Capsule records what context this run was given; CapsuleHash is its
+	// stable identity for comparing two runs.
+	Capsule     ContextCapsule `json:"capsule"`
+	CapsuleHash string         `json:"capsuleHash"`
+}
+
+// subagentMetaDecodeError distinguishes malformed metadata content from file
+// I/O failures. Cleanup may safely skip one undecodable record, but storage
+// errors must remain visible because they can affect every subagent record.
+type subagentMetaDecodeError struct {
+	ref string
+	err error
+}
+
+func (e *subagentMetaDecodeError) Error() string {
+	return fmt.Sprintf("decode subagent metadata %q: %v", e.ref, e.err)
+}
+
+func (e *subagentMetaDecodeError) Unwrap() error { return e.err }
+
+func isSubagentMetaDecodeError(err error) bool {
+	var decodeErr *subagentMetaDecodeError
+	return errors.As(err, &decodeErr)
 }
 
 // SubagentSpec describes the current invocation identity.
@@ -57,8 +85,12 @@ type SubagentSpec struct {
 	ParentToolCallID string
 	SystemPrompt     string
 	Registry         *tool.Registry
+	ToolContext      context.Context
 	Model            string
 	Effort           string
+	// ResumedFrom feeds the context capsule; it does not change how the
+	// transcript itself is stored.
+	ResumedFrom string
 }
 
 // SubagentRun is a prepared transcript run. Call Release exactly once.
@@ -68,8 +100,9 @@ type SubagentRun struct {
 	Meta       SubagentMeta
 	ForkedFrom string
 
-	store   *SubagentStore
-	release func()
+	store             *SubagentStore
+	release           func()
+	terminalPersisted bool
 }
 
 // SubagentArtifact is a persisted sub-agent transcript and metadata pair owned
@@ -102,8 +135,12 @@ func EphemeralSubagentRun(systemPrompt string) *SubagentRun {
 // SubagentStore persists sub-agent transcripts under config.SessionDir()/subagents.
 // Its locks are process-local; cross-process mutation is intentionally out of v1.
 type SubagentStore struct {
-	dir       string
-	destroyed func(parentSession string) bool
+	dir                string
+	destroyed          func(parentSession string) bool
+	parentSessionProbe func(sessionPath string) bool
+
+	// cleanupBeforeReread is a test seam for deterministic lease interleavings.
+	cleanupBeforeReread func(parentSession, ref string)
 
 	mu     sync.Mutex
 	locked map[string]bool
@@ -122,6 +159,17 @@ func NewSubagentStore(dir string) *SubagentStore {
 func (s *SubagentStore) WithDestroyedChecker(fn func(parentSession string) bool) *SubagentStore {
 	if s != nil {
 		s.destroyed = fn
+	}
+	return s
+}
+
+// WithParentSessionProbe installs a process-local liveness check used before
+// stale cleanup probes a parent transcript lease. Desktop supplies this for
+// tabs and builds that are live before their durable lease is bound. A nil
+// probe preserves the lease-only behavior used by CLI and server frontends.
+func (s *SubagentStore) WithParentSessionProbe(fn func(sessionPath string) bool) *SubagentStore {
+	if s != nil {
+		s.parentSessionProbe = fn
 	}
 	return s
 }
@@ -151,7 +199,7 @@ func ListSubagentsByParent(sessionDir, parentSession string) ([]SubagentArtifact
 			continue
 		}
 		metaPath := filepath.Join(dir, entry.Name())
-		data, err := os.ReadFile(metaPath)
+		data, err := fileencoding.ReadFileUTF8(metaPath)
 		if err != nil {
 			return nil, err
 		}
@@ -197,22 +245,45 @@ func DeleteSubagentsByParent(sessionDir, parentSession string) error {
 	return nil
 }
 
-// CleanupStaleRunning marks persisted running sub-agents as interrupted. It is
-// intended for startup, before this process accepts new background sub-agent
-// work, so a previous crash cannot leave ghost "running" refs behind.
+// CleanupStaleRunning marks persisted running sub-agents as interrupted while
+// holding each parent transcript's session lease. A live parent in this or
+// another process therefore keeps its children untouched, while crash leftovers
+// remain repairable before this process accepts new background work.
 func (s *SubagentStore) CleanupStaleRunning() (int, error) {
 	if s == nil {
 		return 0, nil
 	}
-	entries, err := os.ReadDir(s.dir)
+	// On Windows, os.ReadDir can report ERROR_DIRECTORY as an IsNotExist
+	// error when the store path exists but is a regular file. Check the leaf
+	// first so a malformed store remains a startup error instead of being
+	// mistaken for an absent store.
+	info, err := os.Stat(s.dir)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return 0, nil
 		}
 		return 0, err
 	}
-	now := time.Now().UTC()
-	cleaned := 0
+	if !info.IsDir() {
+		return 0, fmt.Errorf("subagent store path %q is not a directory", s.dir)
+	}
+	entries, err := os.ReadDir(s.dir)
+	if err != nil {
+		// Windows reports a non-directory at this path as ENOENT, so a plain
+		// IsNotExist check would silently accept a corrupt store instead of
+		// surfacing it. Only treat it as "no store yet" when nothing is there.
+		if os.IsNotExist(err) {
+			if _, statErr := os.Lstat(s.dir); statErr != nil {
+				return 0, nil
+			}
+		}
+		return 0, err
+	}
+	type staleParent struct {
+		sessionPath string
+		refs        []string
+	}
+	parents := map[string]*staleParent{}
 	for _, entry := range entries {
 		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".meta.json") {
 			continue
@@ -223,19 +294,89 @@ func (s *SubagentStore) CleanupStaleRunning() (int, error) {
 		}
 		meta, err := s.LoadMeta(ref)
 		if err != nil {
-			return cleaned, err
+			// A corrupt metadata file (truncated write, killed process) must
+			// not abort startup. Skip all content decode failures, including
+			// errors from custom field decoders such as time.Time, while genuine
+			// file I/O errors remain fatal so storage problems stay visible.
+			if isSubagentMetaDecodeError(err) {
+				continue
+			}
+			return 0, err
 		}
 		if meta.Status != SubagentRunning {
 			continue
 		}
-		meta.Status = SubagentInterrupted
-		meta.UpdatedAt = now
-		if err := s.saveMeta(meta); err != nil {
-			return cleaned, err
+		parentSession := strings.TrimSpace(meta.ParentSession)
+		sessionPath, ok := s.parentSessionPath(parentSession)
+		if !ok {
+			// Old or malformed metadata without a provable parent cannot
+			// authorize a destructive lifecycle rewrite.
+			continue
 		}
-		cleaned++
+		parent := parents[parentSession]
+		if parent == nil {
+			parent = &staleParent{sessionPath: sessionPath}
+			parents[parentSession] = parent
+		}
+		parent.refs = append(parent.refs, ref)
+	}
+
+	parentIDs := make([]string, 0, len(parents))
+	for parentID := range parents {
+		parentIDs = append(parentIDs, parentID)
+	}
+	sort.Strings(parentIDs)
+
+	now := time.Now().UTC()
+	cleaned := 0
+	for _, parentID := range parentIDs {
+		parent := parents[parentID]
+		if s.parentSessionProbe != nil && s.parentSessionProbe(parent.sessionPath) {
+			continue
+		}
+		lease, err := TryAcquireSessionLease(parent.sessionPath)
+		if errors.Is(err, ErrSessionLeaseHeld) {
+			continue
+		}
+		if err != nil {
+			return cleaned, fmt.Errorf("acquire parent session lease %q: %w", parentID, err)
+		}
+		for _, ref := range parent.refs {
+			if s.cleanupBeforeReread != nil {
+				s.cleanupBeforeReread(parentID, ref)
+			}
+			// Re-read after acquiring the parent lease: the former owner may
+			// have completed the child between the initial scan and handoff.
+			meta, err := s.LoadMeta(ref)
+			if err != nil {
+				if isSubagentMetaDecodeError(err) {
+					continue
+				}
+				lease.Release()
+				return cleaned, err
+			}
+			if meta.Status != SubagentRunning || strings.TrimSpace(meta.ParentSession) != parentID {
+				continue
+			}
+			meta.Status = SubagentInterrupted
+			meta.UpdatedAt = now
+			if err := s.saveMeta(meta); err != nil {
+				lease.Release()
+				return cleaned, err
+			}
+			cleaned++
+		}
+		lease.Release()
 	}
 	return cleaned, nil
+}
+
+func (s *SubagentStore) parentSessionPath(parentSession string) (string, bool) {
+	parentSession = strings.TrimSpace(parentSession)
+	if parentSession == "" || parentSession == "." || parentSession == ".." || filepath.Base(parentSession) != parentSession {
+		return "", false
+	}
+	return filepath.Join(filepath.Dir(s.dir), parentSession+".jsonl"), true
 }
 
 func (s *SubagentStore) PrepareFresh(spec SubagentSpec) (*SubagentRun, error) {
@@ -297,6 +438,18 @@ func (s *SubagentStore) PrepareContinue(ref string, spec SubagentSpec) (*Subagen
 	}
 	meta.ParentSession = spec.ParentSession
 	meta.ParentToolCallID = spec.ParentToolCallID
+	// Re-acquire the running state while holding the per-ref lease so a resumed
+	// transcript is visible as active and stale cleanup cannot mark it
+	// interrupted while the continuation is executing.
+	meta.Status = SubagentRunning
+	meta.Outcome = ""
+	meta.Retryable = false
+	meta.ErrorCode = ""
+	meta.UpdatedAt = time.Now().UTC()
+	if err := s.saveMeta(meta); err != nil {
+		release()
+		return nil, fmt.Errorf("mark resumed subagent %q running: %w", ref, err)
+	}
 	return &SubagentRun{Ref: ref, Session: sess, Meta: meta, store: s, release: release}, nil
 }
 
@@ -395,7 +548,6 @@ func (s *SubagentStore) sessionAncestors(current string) ([]string, error) {
 	if current == "" {
 		return nil, nil
 	}
-	sessionDir := filepath.Dir(s.dir)
 	var ancestors []string
 	seen := map[string]bool{}
 	for cursor := current; cursor != ""; {
@@ -403,7 +555,15 @@ func (s *SubagentStore) sessionAncestors(current string) ([]string, error) {
 			return nil, fmt.Errorf("cycle at session %q", cursor)
 		}
 		seen[cursor] = true
-		meta, ok, err := LoadBranchMeta(filepath.Join(sessionDir, cursor+".jsonl"))
+		// Route through parentSessionPath so both the caller-provided id and
+		// every parent id read from disk metadata get the same bare-filename
+		// validation — a raw Join would let "../"-shaped ids escape the
+		// session directory.
+		metaPath, valid := s.parentSessionPath(cursor)
+		if !valid {
+			return nil, fmt.Errorf("invalid session identifier %q", cursor)
+		}
+		meta, ok, err := LoadBranchMeta(metaPath)
 		if err != nil {
 			return nil, err
 		}
@@ -526,39 +686,28 @@ func (s *SubagentStore) MarkRunning(run *SubagentRun) error {
 	return s.saveMeta(meta)
 }
 
-func (s *SubagentStore) SaveCompleted(run *SubagentRun) error {
+// ensureBranchCreatedAt seeds the session list sidecar before the first
+// transcript save. Subagent transcripts are written only on completion, so
+// Session.Save would otherwise backfill BranchMeta.CreatedAt with the save
+// moment (completion time). The real start time already lives on run.Meta.
+func (s *SubagentStore) ensureBranchCreatedAt(run *SubagentRun) error {
 	if s == nil || run == nil || run.Ref == "" {
 		return nil
 	}
-	if s.parentDestroyed(run) {
-		return nil
-	}
-	if err := run.Session.Save(s.sessionPath(run.Ref)); err != nil {
+	path := s.sessionPath(run.Ref)
+	if _, ok, err := LoadBranchMeta(path); err != nil {
 		return err
-	}
-	meta := run.Meta
-	meta.Status = SubagentCompleted
-	meta.UpdatedAt = time.Now().UTC()
-	run.Meta = meta
-	return s.saveMeta(meta)
-}
-
-func (s *SubagentStore) SaveFailed(run *SubagentRun) error {
-	if s == nil || run == nil || run.Ref == "" {
+	} else if ok {
 		return nil
 	}
-	if s.parentDestroyed(run) {
-		return nil
+	created := run.Meta.CreatedAt.UTC()
+	if created.IsZero() {
+		created = time.Now().UTC()
 	}
-	var sessionErr error
-	if run.Session != nil {
-		sessionErr = run.Session.Save(s.sessionPath(run.Ref))
-	}
-	meta := run.Meta
-	meta.Status = SubagentFailed
-	meta.UpdatedAt = time.Now().UTC()
-	run.Meta = meta
-	return errors.Join(sessionErr, s.saveMeta(meta))
+	return SaveBranchMetaPreserveUpdated(path, BranchMeta{
+		ID:        BranchID(path),
+		CreatedAt: created,
+	})
 }
 
 func (s *SubagentStore) LoadMeta(ref string) (SubagentMeta, error) {
@@ -566,41 +715,21 @@ func (s *SubagentStore) LoadMeta(ref string) (SubagentMeta, error) {
 	if !validSubagentRef(ref) {
 		return meta, fmt.Errorf("invalid subagent reference %q", ref)
 	}
-	data, err := os.ReadFile(s.metaPath(ref))
+	data, err := fileencoding.ReadFileUTF8(s.metaPath(ref))
 	if err != nil {
 		return meta, fmt.Errorf("load subagent metadata %q: %w", ref, err)
 	}
 	if err := json.Unmarshal(data, &meta); err != nil {
-		return meta, fmt.Errorf("decode subagent metadata %q: %w", ref, err)
+		return meta, &subagentMetaDecodeError{ref: ref, err: err}
 	}
 	return meta, nil
-}
-
-func metaFromSpec(ref string, status SubagentStatus, created, updated time.Time, spec SubagentSpec) SubagentMeta {
-	scope, schemaHash := toolIdentity(spec.Registry)
-	return SubagentMeta{
-		Ref:              ref,
-		CreatedAt:        created,
-		UpdatedAt:        updated,
-		Status:           status,
-		Kind:             strings.TrimSpace(spec.Kind),
-		Name:             strings.TrimSpace(spec.Name),
-		WorkspaceRoot:    strings.TrimSpace(spec.WorkspaceRoot),
-		ParentSession:    strings.TrimSpace(spec.ParentSession),
-		ParentToolCallID: strings.TrimSpace(spec.ParentToolCallID),
-		SystemPromptHash: bytesHash([]byte(spec.SystemPrompt)),
-		ToolScope:        scope,
-		ToolSchemaHash:   schemaHash,
-		Model:            strings.TrimSpace(spec.Model),
-		Effort:           strings.TrimSpace(spec.Effort),
-	}
 }
 
 func validateMeta(meta SubagentMeta, spec SubagentSpec) error {
 	if meta.Status == SubagentRunning {
 		return fmt.Errorf("subagent reference %q is still in progress", meta.Ref)
 	}
-	if meta.Status == SubagentFailed {
+	if meta.Status == SubagentFailed && !meta.Retryable && meta.Outcome != string(SubagentOutcomePartial) {
 		return fmt.Errorf("subagent reference %q failed and cannot be continued", meta.Ref)
 	}
 	if meta.Status == SubagentInterrupted {
@@ -670,14 +799,21 @@ func (s *SubagentStore) isAncestorSession(ancestor, current string) (bool, error
 	if ancestor == "" || current == "" {
 		return false, nil
 	}
-	sessionDir := filepath.Dir(s.dir)
 	seen := map[string]bool{}
 	for cursor := current; cursor != ""; {
 		if seen[cursor] {
 			return false, fmt.Errorf("cycle at session %q", cursor)
 		}
 		seen[cursor] = true
-		meta, ok, err := LoadBranchMeta(filepath.Join(sessionDir, cursor+".jsonl"))
+		// Route through parentSessionPath so both the caller-provided id and
+		// every parent id read from disk metadata get the same bare-filename
+		// validation — a raw Join would let "../"-shaped ids escape the
+		// session directory.
+		metaPath, valid := s.parentSessionPath(cursor)
+		if !valid {
+			return false, fmt.Errorf("invalid session identifier %q", cursor)
+		}
+		meta, ok, err := LoadBranchMeta(metaPath)
 		if err != nil {
 			return false, err
 		}
@@ -768,17 +904,6 @@ func validSubagentRef(ref string) bool {
 		return false
 	}
 	return true
-}
-
-func toolIdentity(reg *tool.Registry) ([]string, string) {
-	if reg == nil {
-		return nil, bytesHash(nil)
-	}
-	names := reg.Names()
-	sort.Strings(names)
-	schemas := normalizeToolSchemas(reg.Schemas())
-	data, _ := json.Marshal(schemas)
-	return names, bytesHash(data)
 }
 
 func bytesHash(data []byte) string {

@@ -1,11 +1,17 @@
 package control
 
 import (
+	"context"
 	"fmt"
 	"sync"
+	"sync/atomic"
+	"time"
 
+	"reasonix/internal/agent"
 	"reasonix/internal/checkpoint"
+	"reasonix/internal/config"
 	"reasonix/internal/diff"
+	"reasonix/internal/provider"
 )
 
 // checkpointManager owns the snapshot-based rewind bookkeeping: the per-session
@@ -15,13 +21,12 @@ import (
 // orchestration (truncating the session, restoring code, emitting events) that
 // needs its other collaborators.
 //
-// turn is decoupled from the store so it never collides after a log restructure;
+// turn is decoupled from the store so it remains monotonic across session work;
 // bound[turn] records len(Session.Messages) at that turn's start — the truncation
 // boundary for a conversation rewind/fork. Boundaries are persisted in each
 // checkpoint and rebuilt from the store on resume (so a reopened session can still
-// rewind conversation / fork), but dropped after a summarize restructures the log
-// so those operations report "unavailable" rather than mis-truncating; code
-// rewind (file-based) is unaffected. Every store call does its disk I/O off mu —
+// rewind conversation / fork). Context compression never changes the transcript,
+// so it leaves these boundaries intact. Every store call does its disk I/O off mu —
 // mu is taken only to read/swap the store pointer and mutate turn/bound.
 type checkpointManager struct {
 	// mu guards store, turn, and bound; every critical section under it is short
@@ -34,10 +39,11 @@ type checkpointManager struct {
 
 // rebind points the store at the (possibly new) session, loading any checkpoints
 // already on disk, and resets the turn counter and boundaries from them. root is
-// the workspace root used to guard restore writes. Called on construction and
-// whenever the session path changes (NewSession/Resume/SetSessionPath/fork).
-func (m *checkpointManager) rebind(dir, root string) {
-	store := checkpoint.New(dir, root)
+// the workspace root used to guard restore writes. opts carry the configured
+// retention. Called on construction and whenever the session path changes
+// (NewSession/Resume/SetSessionPath/fork).
+func (m *checkpointManager) rebind(dir, root string, opts ...checkpoint.Option) {
+	store := checkpoint.New(dir, root, opts...)
 	next := store.NextTurn() // continue numbering past any checkpoints on disk
 	bound := store.Bounds()  // rebuilt from persisted checkpoints so a resumed
 	if bound == nil {        // session can still rewind conversation / fork
@@ -50,6 +56,24 @@ func (m *checkpointManager) rebind(dir, root string) {
 	m.mu.Unlock()
 }
 
+// checkpointOptions turns the workspace [checkpoints] config into store
+// options. A read failure leaves the built-in retention defaults in place —
+// checkpoints are a safety net, so a malformed config must not block a session.
+func (c *Controller) checkpointOptions() []checkpoint.Option {
+	cfg, err := config.LoadForRootReadOnly(c.workspaceRoot)
+	if err != nil {
+		return nil
+	}
+	var opts []checkpoint.Option
+	if turns := cfg.Checkpoints.RetainTurns; turns > 0 {
+		opts = append(opts, checkpoint.WithRetainCheckpoints(turns))
+	}
+	if quota := cfg.Checkpoints.BlobQuotaBytes; quota > 0 {
+		opts = append(opts, checkpoint.WithBlobQuota(quota))
+	}
+	return opts
+}
+
 // enabled reports whether a checkpoint store is bound.
 func (m *checkpointManager) enabled() bool {
 	m.mu.Lock()
@@ -57,20 +81,115 @@ func (m *checkpointManager) enabled() bool {
 	return m.store != nil
 }
 
-// begin opens a checkpoint for the turn about to run, recording msgIndex as the
-// conversation-rewind boundary. No-op when checkpoints are disabled.
-func (m *checkpointManager) begin(input string, msgIndex int) {
+// beginWithObserver opens a checkpoint and updates the mutation observer's
+// ownership turn for subsequent captures.
+func (m *checkpointManager) beginWithObserver(input string, msgIndex int, obs *checkpoint.MutationObserver) (int, *checkpoint.Store, bool) {
 	m.mu.Lock()
 	store := m.store
 	if store == nil {
 		m.mu.Unlock()
-		return
+		return 0, nil, false
 	}
 	turn := m.turn
 	m.turn++
 	m.bound[turn] = msgIndex
 	m.mu.Unlock()
+	if obs != nil {
+		obs.NoteCrossTurnBackgroundWriter(turn)
+		obs.SetOwnershipTurn(turn)
+	}
 	store.Begin(turn, input, msgIndex)
+	return turn, store, true
+}
+
+type guardedTurnCheckpoint struct {
+	session      *agent.Session
+	store        *checkpoint.Store
+	turn         int
+	messageIndex int
+	openedAt     int64
+}
+
+type guardedTurnCompletion struct {
+	checkpoint *guardedTurnCheckpoint
+}
+
+type guardedTurnCompletionKey struct{}
+
+func withGuardedTurnCompletion(ctx context.Context) (context.Context, *guardedTurnCompletion) {
+	completion := &guardedTurnCompletion{}
+	return context.WithValue(ctx, guardedTurnCompletionKey{}, completion), completion
+}
+
+// beginCheckpoint opens a rewind checkpoint before the visible user message is
+// appended. Guarded turns retain the exact boundary so TurnDone can identify
+// the corresponding optimistic frontend item without positional guessing.
+func (c *Controller) beginCheckpoint(ctx context.Context, input string) {
+	if c.executor == nil || c.executor.Session() == nil {
+		return
+	}
+	session := c.executor.Session()
+	messageIndex := session.Len()
+	openedAt := time.Now().UnixMilli()
+	atomic.AddInt64(&c.sessionRevision, 1)
+	turn, store, ok := c.checkpoints.beginWithObserver(input, messageIndex, c.mutationObserver)
+	if ok {
+		if completion, _ := ctx.Value(guardedTurnCompletionKey{}).(*guardedTurnCompletion); completion != nil {
+			completion.checkpoint = &guardedTurnCheckpoint{
+				session: session, store: store, turn: turn, messageIndex: messageIndex, openedAt: openedAt,
+			}
+		}
+	}
+	// User-visible turn start records an irreversible message-send receipt so
+	// recovery never claims a clean rollback of an already-committed prompt.
+	// Keep this owner bookkeeping even when checkpoints are disabled.
+	gen := c.RuntimeGeneration()
+	if gen == 0 {
+		gen = c.RuntimeOwner().Gate.Published()
+	}
+	msgID := fmt.Sprintf("turn-%d-%d", gen, atomic.LoadInt64(&c.sessionRevision))
+	// Dedup: a retried turn with the same revision must not double-record.
+	owner := c.RuntimeOwner()
+	owner.RecordMessageSentOnce(gen, msgID, "control")
+	d := owner.DecideResume(gen)
+	c.mu.Lock()
+	c.lastResumeDecision = d
+	c.mu.Unlock()
+}
+
+// validatedCheckpointTurn returns the checkpoint only while its original
+// boundary still names the real user message committed by this guarded turn.
+// Stale or synthetic candidates fail closed rather than being relocated.
+func (c *Controller) validatedCheckpointTurn(completion *guardedTurnCompletion) *int {
+	if completion == nil || completion.checkpoint == nil || c.executor == nil {
+		return nil
+	}
+	candidate := completion.checkpoint
+	if c.executor.Session() != candidate.session {
+		return nil
+	}
+	if !c.checkpoints.matchesBoundary(candidate.store, candidate.turn, candidate.messageIndex) {
+		return nil
+	}
+	messages := c.terminationMessages()
+	if candidate.messageIndex < 0 || candidate.messageIndex >= len(messages) {
+		return nil
+	}
+	message := messages[candidate.messageIndex]
+	if message.Role != provider.RoleUser || message.LocalOnly ||
+		!agent.IsUserAuthoredTurnMessage(message) ||
+		(message.CreatedAt > 0 && candidate.openedAt > 0 && message.CreatedAt < candidate.openedAt) {
+		return nil
+	}
+	turn := candidate.turn
+	return &turn
+}
+
+func (m *checkpointManager) matchesBoundary(store *checkpoint.Store, turn, messageIndex int) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	boundary, ok := m.bound[turn]
+	return ok && m.store == store && boundary == messageIndex
 }
 
 // turnsByMessageIndex returns message-log index -> checkpoint turn over live
@@ -109,16 +228,19 @@ func (m *checkpointManager) list() []checkpoint.Meta {
 	return store.List()
 }
 
-// restoreCode reverts every file changed at or after turn to its pre-turn
-// content. Errors when checkpoints are disabled.
-func (m *checkpointManager) restoreCode(turn int) (written, deleted []string, err error) {
+func (m *checkpointManager) fileState(path string) (checkpoint.FileState, bool) {
 	m.mu.Lock()
 	store := m.store
 	m.mu.Unlock()
 	if store == nil {
-		return nil, nil, fmt.Errorf("checkpoints unavailable")
+		return checkpoint.FileState{}, false
 	}
-	return store.RestoreCode(turn)
+	return store.FileState(path)
+}
+
+// CheckpointTurnChanges is read-only and never computes from the current tree.
+func (c *Controller) CheckpointTurnChanges(turn int) *checkpoint.TurnChanges {
+	return c.checkpoints.storeRef().TurnChanges(turn)
 }
 
 // snapshot records a pre-edit file change into the open checkpoint — the
@@ -134,9 +256,16 @@ func (m *checkpointManager) snapshot(ch diff.Change) {
 
 // truncateFrom renumbers future turns from `turn` and drops every boundary at or
 // after it — the conversation-rewind renumber after the message log is cut back.
-func (m *checkpointManager) truncateFrom(turn int) {
+func (m *checkpointManager) truncateFrom(turn int) error {
 	m.mu.Lock()
 	store := m.store
+	m.mu.Unlock()
+	if store != nil {
+		if err := store.TruncateFrom(turn); err != nil {
+			return err
+		}
+	}
+	m.mu.Lock()
 	m.turn = turn
 	for k := range m.bound {
 		if k >= turn {
@@ -144,16 +273,12 @@ func (m *checkpointManager) truncateFrom(turn int) {
 		}
 	}
 	m.mu.Unlock()
-	if store != nil {
-		store.TruncateFrom(turn)
-	}
+	return nil
 }
 
-// clearBounds drops every boundary after a summarize restructures the log (so
-// conversation rewind degrades to "unavailable" until fresh turns rebuild them)
-// while keeping turn monotonic so new turns don't collide with the store.
-func (m *checkpointManager) clearBounds() {
+// storeRef returns the live store pointer without holding mu across caller work.
+func (m *checkpointManager) storeRef() *checkpoint.Store {
 	m.mu.Lock()
-	m.bound = map[int]int{}
-	m.mu.Unlock()
+	defer m.mu.Unlock()
+	return m.store
 }

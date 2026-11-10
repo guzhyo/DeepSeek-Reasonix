@@ -1,28 +1,41 @@
 // Package skill loads invokable playbooks ("skills") from Markdown files. A skill
 // is a named, described prompt body the model can invoke via the run_skill tool
-// (or the user via "/<name>"): an "inline" skill folds its body into the turn as
+// (or the user via a slash name): an "inline" skill folds its body into the turn as
 // a tool result, a "subagent" skill runs in an isolated child loop and returns
 // only its final answer. Project scope wins over global; only names+descriptions
 // enter the cache-stable system-prompt index (see index.go) — bodies load on
 // demand. Discovery scans several conventions (.reasonix / .agents / .agent /
 // .claude under the project root and the home dir — see config.ConventionDirs) so
 // skills authored for other agent tools migrate in unchanged. Directory skills
-// use <name>/SKILL.md; flat <name>.md files from Claude roots are loaded only
-// when they carry skill frontmatter. Discovery follows symlinks, so linked
-// skills are picked up like real ones.
+// use <name>/SKILL.md; flat <name>.md files from Claude and plugin-package
+// roots are loaded only when they carry skill frontmatter. Discovery follows
+// symlinks, so linked skills are picked up like real ones.
 package skill
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
+	"path"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
+	"sync"
+
+	"github.com/fsnotify/fsnotify"
 
 	"reasonix/internal/config"
+	fileencoding "reasonix/internal/fileutil/encoding"
 	"reasonix/internal/frontmatter"
+	"reasonix/internal/tool"
 )
+
+// ErrInvocationUnavailable marks a profile/dependency gate that can become
+// runnable after switching profile or connecting the required capability.
+var ErrInvocationUnavailable = errors.New("skill invocation unavailable")
 
 // Scope records where a skill was loaded from. Higher-priority scopes win on a
 // name collision: project > custom > global > builtin.
@@ -55,23 +68,65 @@ const (
 // Skill is a loaded playbook.
 type Skill struct {
 	Name        string // canonical identifier; matches the directory / filename stem
-	Description string // one-liner shown in the pinned index
+	Description string // one-liner shown in the session-context catalog
 	Body        string // full markdown body (post-frontmatter), loaded eagerly
 	Scope       Scope  // where it came from
 	Path        string // absolute path to the SKILL.md / <name>.md, or "(builtin)"
+	Plugin      string // installed plugin package name; empty for non-plugin skills
+	// runtimeBindingsPrepared is session-local invocation state. It must not be
+	// inferred from untrusted Markdown content or persisted skill metadata.
+	runtimeBindingsPrepared bool
+	// SlashPrefix overrides Plugin only for the user-facing invocation name.
+	// Imported Claude agents use <plugin>:agent so an agent and skill may safely
+	// share the same upstream name.
+	SlashPrefix string
 	// AllowedTools, when non-empty, scopes a subagent skill's tool registry to
 	// these literal tool names (from the `allowed-tools` frontmatter).
 	AllowedTools []string
 	RunAs        RunAs  // inline | subagent
 	Model        string // optional model override for runAs=subagent (frontmatter `model:`)
 	Effort       string // optional effort for runAs=subagent (frontmatter `effort:`)
-	// Routing metadata is intentionally kept out of the cache-stable Skills
-	// index; it feeds per-turn capability hints only.
+	// ReadOnly, when true, runs a subagent skill against the read-only tool
+	// registry: writer tools are stripped and bash enforces the read-only
+	// command policy at execution time (frontmatter `read-only:`). This is a
+	// tool-boundary contract, not a prompt promise.
+	ReadOnly bool
+	Color    string // optional display tag for UI surfaces (frontmatter `color:`); no runtime effect
+	// Invocation gates whether this skill enters the Skills catalog the
+	// model reads every turn. "auto" (default) behaves like every skill always
+	// has. "manual" keeps the skill invocable by name (/<name>, run_skill) but
+	// invisible to model-initiated discovery — for user-authored subagent
+	// profiles meant to be triggered deliberately, not autonomously.
+	Invocation string // auto | manual (frontmatter `invocation:`)
+	// Routing metadata is intentionally kept out of the session-context Skills
+	// catalog; it feeds per-turn capability hints only.
 	Triggers         []string
 	NegativeTriggers []string
 	AutoUse          string // off | suggest | prefer | require
 	NeedsFreshData   bool
 	Cost             string // low | medium | high (advisory)
+	// Requires lists capability IDs this skill depends on (e.g. mcp-server:github).
+	// Optional; empty keeps full backward compatibility with older skills.
+	Requires []string
+	// Profiles restricts availability to economy|balanced|delivery. Empty means
+	// the skill is eligible in every profile.
+	Profiles []string
+	// InvalidProfiles preserves rejected profiles frontmatter values so doctor
+	// can warn about typos; the parser drops them from Profiles silently.
+	InvalidProfiles []string
+}
+
+// SlashName returns the user-facing slash identifier. Plugin skills use a
+// package-qualified name while the internal Name remains stable for run_skill.
+func (s Skill) SlashName() string {
+	prefix := strings.TrimSpace(s.SlashPrefix)
+	if prefix == "" {
+		prefix = strings.TrimSpace(s.Plugin)
+	}
+	if prefix == "" {
+		return s.Name
+	}
+	return prefix + ":" + s.Name
 }
 
 // IsValidName reports whether name is a usable skill identifier.
@@ -82,14 +137,24 @@ func IsValidName(name string) bool { return config.IsValidSkillName(name) }
 // ReasonixHomeDir overrides the canonical Reasonix home; empty uses
 // config.ReasonixHomeDir(), or HomeDir/.reasonix when HomeDir is explicitly set.
 type Options struct {
-	HomeDir         string
-	ReasonixHomeDir string
-	ProjectRoot     string
-	CustomPaths     []string
-	ExcludedPaths   []string
-	DisabledNames   []string
-	MaxDepth        int
-	DisableBuiltins bool // suppress shipped built-ins (test-only knob)
+	HomeDir          string
+	ReasonixHomeDir  string
+	ProjectRoot      string
+	CustomPaths      []string
+	PluginPaths      map[string][]string // canonical custom root -> installed plugin package names
+	PluginAgentPaths map[string][]string // plugin roots whose flat Markdown files are Claude agents
+	ExcludedPaths    []string
+	DisabledNames    []string
+	MaxDepth         int
+	DisableBuiltins  bool // suppress shipped built-ins (test-only knob)
+	// Watch keeps long-lived catalogs current through filesystem events. Hosts
+	// that own the Store lifecycle set this and call Close during teardown.
+	Watch bool
+	// WatchService shares physical watches across stores when Watch is enabled.
+	WatchService *WatchService
+	// DisableDiscovery returns an empty store without probing project, custom,
+	// global, plugin, or built-in skill sources. It is a test-only isolation knob.
+	DisableDiscovery bool
 	// Stderr is the writer for diagnostic warnings. When nil, defaults to
 	// os.Stderr. Set to io.Discard to suppress output (e.g. during model
 	// switch inside a bubbletea session).
@@ -98,15 +163,60 @@ type Options struct {
 
 // Store resolves skills across the configured roots.
 type Store struct {
-	homeDir         string
-	reasonixHomeDir string
-	projectRoot     string
-	customPaths     []string
-	excludedPaths   map[string]bool
-	disabled        map[string]bool
-	maxDepth        int
-	disableBuiltins bool
-	stderr          io.Writer
+	homeDir           string
+	reasonixHomeDir   string
+	projectRoot       string
+	customPaths       []string
+	pluginPaths       map[string][]string
+	pluginAgentPaths  map[string][]string
+	excludedPaths     map[string]bool
+	disabled          map[string]bool
+	maxDepth          int
+	disableBuiltins   bool
+	disableDiscovery  bool
+	autoWatch         bool
+	stderr            io.Writer
+	runtimeProfile    string
+	requiresReady     func([]string) []string
+	toolBindings      func(Skill) []tool.MCPBinding
+	catalogMu         sync.Mutex
+	catalogGen        uint64
+	catalog           *catalogSnapshot
+	catalogFlight     *catalogFlight
+	discoveryScans    uint64
+	hostWatch         hostWatchState
+	watcherMu         sync.Mutex
+	watcher           *fsnotify.Watcher
+	watcherDone       chan struct{}
+	watcherLifecycle  watcherLifecycle
+	watcherGeneration uint64
+	closed            bool
+}
+
+// CatalogSnapshot is an immutable, stable-order view of one discovery
+// generation. Complete is false when cancellation or sustained invalidation
+// forces the caller to receive the last complete snapshot instead.
+type CatalogSnapshot struct {
+	Version    uint64
+	Complete   bool
+	Stale      bool
+	Candidates []Skill
+}
+
+type catalogSnapshot struct {
+	version    uint64
+	rootSig    string
+	discovered []Skill
+	enabled    []Skill
+	byName     map[string]Skill
+	slash      []Skill
+	builtins   map[string]Skill
+}
+
+type catalogFlight struct {
+	generation uint64
+	done       chan struct{}
+	cancel     context.CancelFunc
 }
 
 // New builds a Store. Relative custom paths and a relative project root are made
@@ -139,6 +249,8 @@ func New(opts Options) *Store {
 		}
 	}
 	custom := dedupePaths(resolveCustomPaths(opts.CustomPaths, base, home))
+	pluginPaths := normalizePluginPaths(opts.PluginPaths)
+	pluginAgentPaths := normalizePluginPaths(opts.PluginAgentPaths)
 	excluded := map[string]bool{}
 	for _, p := range dedupePaths(resolveCustomPaths(opts.ExcludedPaths, base, home)) {
 		excluded[config.CanonicalSkillPath(p)] = true
@@ -148,15 +260,208 @@ func New(opts Options) *Store {
 		stderr = os.Stderr
 	}
 	return &Store{
-		homeDir:         home,
-		reasonixHomeDir: reasonixHome,
-		projectRoot:     root,
-		customPaths:     custom,
-		excludedPaths:   excluded,
-		disabled:        disabledNameSet(opts.DisabledNames),
-		maxDepth:        normalizeMaxDepth(opts.MaxDepth),
-		disableBuiltins: opts.DisableBuiltins,
-		stderr:          stderr,
+		homeDir:          home,
+		reasonixHomeDir:  reasonixHome,
+		projectRoot:      root,
+		customPaths:      custom,
+		pluginPaths:      pluginPaths,
+		pluginAgentPaths: pluginAgentPaths,
+		excludedPaths:    excluded,
+		disabled:         disabledNameSet(opts.DisabledNames),
+		maxDepth:         normalizeMaxDepth(opts.MaxDepth),
+		disableBuiltins:  opts.DisableBuiltins,
+		disableDiscovery: opts.DisableDiscovery,
+		autoWatch:        opts.Watch,
+		hostWatch:        hostWatchState{service: opts.WatchService},
+		stderr:           stderr,
+		catalogGen:       1,
+	}
+}
+
+// ConfigureInvocationPolicy installs session-local runtime constraints for
+// skill calls. It does not alter discovery or the provider-visible tool schema;
+// callers validate the selected skill immediately before execution.
+func (s *Store) ConfigureInvocationPolicy(profile string, requiresReady func([]string) []string) {
+	if s == nil {
+		return
+	}
+	s.runtimeProfile = normalizeRuntimeProfile(profile)
+	s.requiresReady = requiresReady
+}
+
+// ConfigureToolBindings installs a session-local resolver for plugin-owned MCP
+// tools. It affects only an invoked skill body and never the cache-stable index.
+func (s *Store) ConfigureToolBindings(resolve func(Skill) []tool.MCPBinding) {
+	if s == nil {
+		return
+	}
+	s.toolBindings = resolve
+}
+
+// Prepare binds a plugin skill's portable MCP references to this session's
+// exact callable names. Non-plugin skills and sessions without bindings are
+// returned byte-for-byte unchanged.
+func (s *Store) Prepare(sk Skill) Skill {
+	if s == nil || s.toolBindings == nil || strings.TrimSpace(sk.Plugin) == "" || sk.runtimeBindingsPrepared {
+		return sk
+	}
+	bindings := append([]tool.MCPBinding(nil), s.toolBindings(sk)...)
+	if len(bindings) == 0 {
+		return sk
+	}
+	sort.Slice(bindings, func(i, j int) bool { return bindings[i].CallableName < bindings[j].CallableName })
+	seen := map[string]bool{}
+	unique := bindings[:0]
+	for _, binding := range bindings {
+		if binding.CallableName == "" || seen[binding.CallableName] {
+			continue
+		}
+		seen[binding.CallableName] = true
+		unique = append(unique, binding)
+	}
+	bindings = unique
+	if len(bindings) == 0 {
+		return sk
+	}
+	sk.AllowedTools = bindAllowedTools(sk.AllowedTools, bindings)
+	sk.runtimeBindingsPrepared = true
+
+	var b strings.Builder
+	b.WriteString(strings.TrimRight(sk.Body, " \t\r\n"))
+	b.WriteString("\n\n## Runtime MCP tool bindings\n\n")
+	b.WriteString("These host-generated bindings are authoritative for this invocation. Use the exact direct name below; if only `use_capability` is available, use the stable capability ID. Short or Claude-style MCP names in this skill refer to these bindings.\n")
+	for _, binding := range bindings {
+		fmt.Fprintf(&b, "\n- `%s/%s` → `%s` (capability `%s`)", binding.Server, binding.RawName, binding.CallableName, binding.CapabilityID)
+	}
+	sk.Body = b.String()
+	return sk
+}
+
+func bindAllowedTools(refs []string, bindings []tool.MCPBinding) []string {
+	if len(refs) == 0 {
+		return refs
+	}
+	out := make([]string, 0, len(refs))
+	seen := map[string]bool{}
+	appendOne := func(name string) {
+		if name != "" && !seen[name] {
+			seen[name] = true
+			out = append(out, name)
+		}
+	}
+	for _, ref := range refs {
+		matches := map[string]tool.MCPBinding{}
+		isPattern := strings.ContainsAny(ref, "*?[")
+		for _, binding := range bindings {
+			aliases := append(tool.MCPBindingAliases(binding), binding.CallableName)
+			for _, alias := range aliases {
+				matched := ref == alias
+				if isPattern {
+					matched, _ = path.Match(ref, alias)
+				}
+				if matched {
+					matches[binding.CallableName] = binding
+					break
+				}
+			}
+		}
+		if isPattern {
+			// Preserve the original pattern so an existing broad allowlist such as
+			// "*" keeps all of its prior tools. Add only canonical MCP names the
+			// upstream/Claude pattern itself cannot match in Reasonix.
+			appendOne(ref)
+			names := make([]string, 0, len(matches))
+			for name := range matches {
+				names = append(names, name)
+			}
+			sort.Strings(names)
+			for _, name := range names {
+				if matched, err := path.Match(ref, name); err != nil || !matched {
+					appendOne(name)
+				}
+				// Capability IDs are host-only allowlist entries consumed when the
+				// session exposes this MCP tool solely through use_capability. Do not
+				// add one when the authored pattern already grants the proxy itself.
+				proxyMatched, _ := path.Match(ref, "use_capability")
+				if !proxyMatched {
+					appendOne(matches[name].CapabilityID)
+				}
+			}
+			continue
+		}
+		if len(matches) == 1 {
+			for name, binding := range matches {
+				appendOne(name)
+				appendOne(binding.CapabilityID)
+			}
+			continue
+		}
+		// Preserve unresolved or ambiguous literals. The child registry will not
+		// gain any broader permission from them.
+		appendOne(ref)
+	}
+	return out
+}
+
+// ValidateInvocation enforces profiles/requires frontmatter at the host tool
+// boundary, including direct run_skill calls that bypass capability routing.
+// Skill profiles frontmatter is diagnostic-only: it never blocks invocation.
+// Required capabilities still gate execution.
+func (s *Store) ValidateInvocation(sk Skill) error {
+	if s == nil {
+		return nil
+	}
+	if len(sk.Requires) > 0 && s.requiresReady != nil {
+		if missing := s.requiresReady(sk.Requires); len(missing) > 0 {
+			return fmt.Errorf("%w: skill %q requires unavailable capabilities: %s", ErrInvocationUnavailable, sk.Name, strings.Join(missing, ", "))
+		}
+	}
+	return nil
+}
+
+// AllowedInProfile reports whether a skill lists profile among its frontmatter
+// profiles. Empty profiles mean "all". Role settings no longer filter the
+// model-visible skill index or block run_skill; this helper remains for doctor
+// diagnostics and capability inventory reports.
+func AllowedInProfile(sk Skill, profile string) bool {
+	if len(sk.Profiles) == 0 {
+		return true
+	}
+	want := normalizeRuntimeProfile(profile)
+	if want == "" {
+		return true
+	}
+	for _, candidate := range sk.Profiles {
+		if normalizeRuntimeProfile(candidate) == want {
+			return true
+		}
+	}
+	return false
+}
+
+// FilterForProfile returns skills that declare eligibility for profile.
+// Host boot no longer uses this to hide skills from the model; doctor and
+// inventory tooling may still call it for recommended-profile diagnostics.
+func FilterForProfile(skills []Skill, profile string) []Skill {
+	out := make([]Skill, 0, len(skills))
+	for _, sk := range skills {
+		if AllowedInProfile(sk, profile) {
+			out = append(out, sk)
+		}
+	}
+	return out
+}
+
+func normalizeRuntimeProfile(profile string) string {
+	switch strings.ToLower(strings.TrimSpace(profile)) {
+	case "economy":
+		return "economy"
+	case "delivery":
+		return "delivery"
+	case "balanced", "full":
+		return "balanced"
+	default:
+		return ""
 	}
 }
 
@@ -184,6 +489,8 @@ type Root struct {
 type discoveryRoot struct {
 	Root
 	requireFlatMarker bool
+	plugins           []string
+	forceSubagent     bool
 }
 
 // roots returns the discovery directories, highest priority first: the
@@ -191,6 +498,9 @@ type discoveryRoot struct {
 // under the project root → custom paths → the Reasonix home skills dir → other
 // home-dir convention dirs. A later root never overrides an earlier one.
 func (s *Store) roots() []discoveryRoot {
+	if s == nil || s.disableDiscovery {
+		return nil
+	}
 	type de struct {
 		dir               string
 		scope             Scope
@@ -222,12 +532,38 @@ func (s *Store) roots() []discoveryRoot {
 		if s.excludedPaths[config.CanonicalSkillPath(d.dir)] {
 			continue
 		}
+		key := config.CanonicalSkillPath(d.dir)
 		out = append(out, discoveryRoot{
 			Root:              Root{Dir: d.dir, Scope: d.scope, Priority: len(out), Status: pathStatus(d.dir)},
-			requireFlatMarker: d.requireFlatMarker,
+			requireFlatMarker: d.requireFlatMarker || len(s.pluginPaths[key]) > 0 || len(s.pluginAgentPaths[key]) > 0,
+			plugins:           append([]string(nil), s.pluginPaths[key]...),
+			forceSubagent:     len(s.pluginAgentPaths[key]) > 0,
 		})
 	}
 	return out
+}
+
+func normalizePluginPaths(paths map[string][]string) map[string][]string {
+	out := map[string][]string{}
+	for path, plugins := range paths {
+		key := config.CanonicalSkillPath(path)
+		if key == "" {
+			continue
+		}
+		for _, plugin := range plugins {
+			plugin = strings.TrimSpace(plugin)
+			if plugin == "" || stringSliceContains(out[key], plugin) {
+				continue
+			}
+			out[key] = append(out[key], plugin)
+		}
+		sort.Strings(out[key])
+	}
+	return out
+}
+
+func stringSliceContains(items []string, want string) bool {
+	return slices.Contains(items, want)
 }
 
 // Roots exposes the discovery directories with their status for `/skill paths`.
@@ -292,66 +628,231 @@ func pathStatus(dir string) PathStatus {
 	return StatusOK
 }
 
-// List returns every discoverable skill, deduped by name (first/highest-priority
-// root wins) with built-ins folded in last, sorted by name so the prefix index
-// stays stable and cacheable.
 func (s *Store) List() []Skill {
+	return s.enabledSkills()
+}
+
+// Candidate resolves metadata from the immutable catalog without reading the
+// selected SKILL.md body or its references/scripts.
+func (s *Store) Candidate(name string) (Skill, bool) {
+	if !IsValidName(name) || s == nil || s.disabledName(name) {
+		return Skill{}, false
+	}
+	snapshot := s.catalogSnapshot()
+	if snapshot == nil {
+		return Skill{}, false
+	}
+	candidate, ok := snapshot.byName[name]
+	return cloneSkill(candidate), ok
+}
+
+// SlashList returns the visible user-facing skill directory. Plugin skills are
+// retained per package under /<plugin>:<name>, even when their bare names
+// collide; non-plugin skills keep their existing short names.
+func (s *Store) SlashList() []Skill {
+	s.invalidateChangedRoots()
+	snapshot := s.catalogSnapshot()
+	if snapshot == nil {
+		return nil
+	}
+	return cloneSkills(snapshot.slash)
+}
+
+// VisibleSlashSkills deduplicates skills by their user-facing slash name and
+// returns them in deterministic display order.
+func VisibleSlashSkills(skills []Skill) []Skill {
 	byName := map[string]Skill{}
-	for _, r := range s.roots() {
-		if r.Status != StatusOK {
+	for _, sk := range skills {
+		name := sk.SlashName()
+		if name == "" {
 			continue
 		}
-		for _, sk := range s.discoverRoot(r) {
-			if s.disabledName(sk.Name) {
-				continue
-			}
-			if _, dup := byName[sk.Name]; !dup {
-				byName[sk.Name] = sk
-			}
-		}
-	}
-	if !s.disableBuiltins {
-		for _, sk := range builtinSkills() {
-			if s.disabledName(sk.Name) {
-				continue
-			}
-			if _, dup := byName[sk.Name]; !dup {
-				byName[sk.Name] = sk
-			}
+		if _, dup := byName[name]; !dup {
+			byName[name] = sk
 		}
 	}
 	out := make([]Skill, 0, len(byName))
 	for _, sk := range byName {
 		out = append(out, sk)
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+	sort.Slice(out, func(i, j int) bool { return out[i].SlashName() < out[j].SlashName() })
 	return out
 }
 
-// Read resolves one skill by name, scanning the roots in priority order then the
-// built-ins. ok is false when no such skill exists or the file is unreadable.
+// ResolveSlashSkill resolves a visible qualified plugin name or a compatible
+// short name. A short plugin name is rejected when multiple plugin packages
+// contribute it; a higher-priority non-plugin winner keeps its short name.
+func ResolveSlashSkill(skills []Skill, name string) (Skill, bool) {
+	name = strings.TrimPrefix(strings.TrimSpace(name), "/")
+	if name == "" {
+		return Skill{}, false
+	}
+	for _, sk := range skills {
+		if sk.SlashName() == name {
+			return sk, true
+		}
+	}
+	if strings.Contains(name, ":") || !IsValidName(name) {
+		return Skill{}, false
+	}
+	var winner Skill
+	var found bool
+	plugins := map[string]bool{}
+	for _, sk := range skills {
+		if sk.Name != name {
+			continue
+		}
+		if !found {
+			winner, found = sk, true
+		}
+		if sk.Plugin != "" {
+			plugins[sk.Plugin] = true
+		}
+	}
+	if !found || winner.Plugin != "" && len(plugins) > 1 {
+		return Skill{}, false
+	}
+	return winner, true
+}
+
+// Read resolves one skill by name from the current catalog index and reads only
+// that selected body. ok is false when no such skill exists or the file is
+// unreadable.
 func (s *Store) Read(name string) (Skill, bool) {
+	return s.Load(context.Background(), name)
+}
+
+// Load resolves one selected candidate using a caller-owned cancellation
+// context. Discovery wait and the one allowed stale-target refresh both stop
+// when the owning turn is cancelled.
+func (s *Store) Load(ctx context.Context, name string) (Skill, bool) {
 	if !IsValidName(name) {
 		return Skill{}, false
 	}
 	if s.disabledName(name) {
 		return Skill{}, false
 	}
-	for _, sk := range s.List() {
-		if sk.Name == name {
-			return sk, true
+	for range 2 {
+		snapshot, err := s.Snapshot(ctx)
+		if err != nil {
+			return Skill{}, false
 		}
+		candidate, internal, versionMatched, ok := s.candidateAtVersion(name, snapshot.Version)
+		if !versionMatched {
+			// Invalidation raced the public snapshot copy. Resolve once more from a
+			// single generation rather than walking a possibly obsolete slice.
+			continue
+		}
+		if !ok {
+			return Skill{}, false
+		}
+		return s.loadCandidateContext(ctx, candidate, internal)
 	}
 	return Skill{}, false
 }
 
-func (s *Store) discoverRoot(r discoveryRoot) []Skill {
+// candidateAtVersion resolves an exact identity in O(1) from the same immutable
+// generation returned to the caller. The internal catalog remains immutable
+// after publication, so it is safe to retain its pointer after releasing the
+// catalog lock.
+func (s *Store) candidateAtVersion(name string, version uint64) (Skill, *catalogSnapshot, bool, bool) {
+	s.catalogMu.Lock()
+	defer s.catalogMu.Unlock()
+	snapshot := s.catalog
+	if snapshot == nil || snapshot.version != version {
+		return Skill{}, nil, false, false
+	}
+	candidate, ok := snapshot.byName[name]
+	return cloneSkill(candidate), snapshot, true, ok
+}
+
+// ReadSlash resolves a user-entered slash identifier without changing the
+// bare identifiers accepted by Read/run_skill.
+func (s *Store) ReadSlash(name string) (Skill, bool) {
+	candidate, ok := ResolveSlashSkill(s.discoveredSkills(), name)
+	if !ok {
+		return Skill{}, false
+	}
+	snapshot := s.catalogSnapshot()
+	return s.loadCandidate(candidate, snapshot)
+}
+
+func (s *Store) loadCandidate(candidate Skill, snapshot *catalogSnapshot) (Skill, bool) {
+	return s.loadCandidateContext(context.Background(), candidate, snapshot)
+}
+
+func (s *Store) loadCandidateContext(ctx context.Context, candidate Skill, snapshot *catalogSnapshot) (Skill, bool) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if ctx.Err() != nil {
+		return Skill{}, false
+	}
+	if strings.HasPrefix(candidate.Path, "(builtin") {
+		if snapshot != nil {
+			if builtin, ok := snapshot.builtins[candidate.Name]; ok {
+				return cloneSkill(builtin), true
+			}
+		}
+		return Skill{}, false
+	}
+	loaded, ok := s.parseSkill(candidate.Path, candidate.Name, candidate.Scope, false, true)
+	if ctx.Err() != nil {
+		return Skill{}, false
+	}
+	if ok && loaded.Name == candidate.Name && loaded.Path == candidate.Path {
+		// The catalog candidate deliberately carries metadata only. Use the
+		// freshly parsed selected file as the source of truth so an edit cannot
+		// return a stale description/model/tool policy merely because discovery
+		// was already warm. Source attribution is assigned by discovery rather
+		// than frontmatter and therefore remains attached to the candidate.
+		loaded.Scope = candidate.Scope
+		loaded.Plugin = candidate.Plugin
+		loaded.SlashPrefix = candidate.SlashPrefix
+		if candidate.RunAs == RunSubagent && candidate.SlashPrefix != "" {
+			loaded.RunAs = RunSubagent
+			loaded.Invocation = "manual"
+			loaded.AllowedTools = mapClaudeAgentTools(loaded.AllowedTools)
+			if isClaudeModelAlias(loaded.Model) {
+				loaded.Model = ""
+			}
+		}
+		return loaded, true
+	}
+	// The selected identity changed after the snapshot. Refresh once and resolve
+	// the name again instead of executing the stale target.
+	s.Invalidate("selected skill changed")
+	refreshed, err := s.Snapshot(ctx)
+	if err != nil {
+		return Skill{}, false
+	}
+	next, internal, versionMatched, found := s.candidateAtVersion(candidate.Name, refreshed.Version)
+	if versionMatched && found && next.Path != candidate.Path {
+		return s.loadCandidateContext(ctx, next, internal)
+	}
+	return Skill{}, false
+}
+
+func (s *Store) discoverRoot(ctx context.Context, r discoveryRoot) []Skill {
 	var out []Skill
-	s.scanDir(r.Dir, r.Scope, r.requireFlatMarker, 1, map[string]bool{}, &out)
+	s.scanDir(ctx, r.Dir, r.Scope, r.requireFlatMarker, 1, map[string]bool{}, &out)
+	if r.forceSubagent {
+		for i := range out {
+			out[i].RunAs = RunSubagent
+			out[i].Invocation = "manual"
+			out[i].AllowedTools = mapClaudeAgentTools(out[i].AllowedTools)
+			if isClaudeModelAlias(out[i].Model) {
+				out[i].Model = ""
+			}
+		}
+	}
 	return out
 }
 
-func (s *Store) scanDir(dir string, scope Scope, requireFlatMarker bool, depth int, seen map[string]bool, out *[]Skill) {
+func (s *Store) scanDir(ctx context.Context, dir string, scope Scope, requireFlatMarker bool, depth int, seen map[string]bool, out *[]Skill) {
+	if ctx.Err() != nil {
+		return
+	}
 	key := filepath.Clean(dir)
 	if resolved, err := filepath.EvalSymlinks(dir); err == nil {
 		key = filepath.Clean(resolved)
@@ -366,6 +867,9 @@ func (s *Store) scanDir(dir string, scope Scope, requireFlatMarker bool, depth i
 		return
 	}
 	for _, e := range entries {
+		if ctx.Err() != nil {
+			return
+		}
 		sk, ok := s.readEntry(dir, scope, requireFlatMarker, e)
 		if ok {
 			if depth == 1 || strings.TrimSpace(sk.Description) != "" {
@@ -376,7 +880,7 @@ func (s *Store) scanDir(dir string, scope Scope, requireFlatMarker bool, depth i
 		if depth >= s.maxDepth || !s.canScanChildDir(dir, e) {
 			continue
 		}
-		s.scanDir(filepath.Join(dir, e.Name()), scope, requireFlatMarker, depth+1, seen, out)
+		s.scanDir(ctx, filepath.Join(dir, e.Name()), scope, requireFlatMarker, depth+1, seen, out)
 	}
 }
 
@@ -454,18 +958,18 @@ func (s *Store) readEntry(dir string, scope Scope, requireFlatMarker bool, e os.
 // filename stem when valid; a missing `description:` is a warning, not a failure
 // (the skill loads but won't appear in the model's index).
 func (s *Store) parse(path, stem string, scope Scope) (Skill, bool) {
-	return s.parseSkill(path, stem, scope, false)
+	return s.parseSkill(path, stem, scope, false, false)
 }
 
 // parseFlat reads a flat <name>.md skill candidate. Claude skill roots can also
 // contain ordinary documentation, so those flat files need explicit skill
 // frontmatter before they are treated as skills.
 func (s *Store) parseFlat(path, stem string, scope Scope, requireSkillMarker bool) (Skill, bool) {
-	return s.parseSkill(path, stem, scope, requireSkillMarker)
+	return s.parseSkill(path, stem, scope, requireSkillMarker, false)
 }
 
-func (s *Store) parseSkill(path, stem string, scope Scope, requireSkillMarker bool) (Skill, bool) {
-	b, err := os.ReadFile(path)
+func (s *Store) parseSkill(path, stem string, scope Scope, requireSkillMarker, loadBody bool) (Skill, bool) {
+	b, err := fileencoding.ReadFileUTF8(path)
 	if err != nil {
 		return Skill{}, false
 	}
@@ -480,19 +984,24 @@ func (s *Store) parseSkill(path, stem string, scope Scope, requireSkillMarker bo
 		name = v
 	}
 	desc := strings.TrimSpace(fm[skillFrontmatterDescription])
-	if desc == "" {
+	if desc == "" && !loadBody {
 		fmt.Fprintf(s.stderr, "warning: skill %q at %s has no description: — it will load but won't appear in the skills index\n", name, path)
 	}
-	return Skill{
+	bodyText := ""
+	if loadBody {
+		bodyText = loadBodyWithScripts(path, loadBodyWithReferences(path, strings.TrimSpace(body)))
+	}
+	sk := Skill{
 		Name:         name,
 		Description:  desc,
-		Body:         loadBodyWithScripts(path, loadBodyWithReferences(path, strings.TrimSpace(body))),
+		Body:         bodyText,
 		Scope:        scope,
 		Path:         path,
-		AllowedTools: parseAllowedTools(fm[skillFrontmatterAllowedTools]),
+		AllowedTools: parseAllowedTools(firstNonEmptySkillValue(fm[skillFrontmatterAllowedTools], fm["tools"])),
 		RunAs:        parseRunAs(fm[skillFrontmatterRunAs], fm[skillFrontmatterContext], fm[skillFrontmatterAgent]),
 		Model:        strings.TrimSpace(fm[skillFrontmatterModel]),
 		Effort:       strings.TrimSpace(fm[skillFrontmatterEffort]),
+		ReadOnly:     parseBoolFrontmatter(fm[skillFrontmatterReadOnly]),
 		Triggers:     parseCSVFrontmatter(fm[skillFrontmatterTriggers]),
 		NegativeTriggers: parseCSVFrontmatter(
 			fm[skillFrontmatterNegativeTriggers],
@@ -500,7 +1009,51 @@ func (s *Store) parseSkill(path, stem string, scope Scope, requireSkillMarker bo
 		AutoUse:        parseAutoUse(fm[skillFrontmatterAutoUse]),
 		NeedsFreshData: parseBoolFrontmatter(fm[skillFrontmatterNeedsFreshData]),
 		Cost:           parseCost(fm[skillFrontmatterCost]),
-	}, true
+		Color:          strings.TrimSpace(fm[skillFrontmatterColor]),
+		Invocation:     parseInvocation(fm[skillFrontmatterInvocation]),
+		Requires:       parseCSVFrontmatter(fm[skillFrontmatterRequires]),
+	}
+	sk.Profiles, sk.InvalidProfiles = parseProfilesFrontmatter(fm[skillFrontmatterProfiles])
+	return sk, true
+}
+
+func firstNonEmptySkillValue(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return value
+		}
+	}
+	return ""
+}
+
+func isClaudeModelAlias(model string) bool {
+	switch strings.ToLower(strings.TrimSpace(model)) {
+	case "sonnet", "opus", "haiku", "inherit":
+		return true
+	default:
+		return false
+	}
+}
+
+func mapClaudeAgentTools(in []string) []string {
+	mapping := map[string]string{
+		"read": "read_file", "write": "write_file", "edit": "edit_file",
+		"bash": "bash", "grep": "grep", "glob": "glob", "ls": "ls",
+		"webfetch": "web_fetch", "websearch": "web_search",
+	}
+	out := make([]string, 0, len(in))
+	seen := map[string]bool{}
+	for _, name := range in {
+		mapped := strings.TrimSpace(name)
+		if replacement := mapping[strings.ToLower(mapped)]; replacement != "" {
+			mapped = replacement
+		}
+		if mapped != "" && !seen[mapped] {
+			seen[mapped] = true
+			out = append(out, mapped)
+		}
+	}
+	return out
 }
 
 const (
@@ -512,11 +1065,16 @@ const (
 	skillFrontmatterAllowedTools     = "allowed-tools"
 	skillFrontmatterModel            = "model"
 	skillFrontmatterEffort           = "effort"
+	skillFrontmatterReadOnly         = "read-only"
 	skillFrontmatterTriggers         = "triggers"
 	skillFrontmatterNegativeTriggers = "negative-triggers"
 	skillFrontmatterAutoUse          = "auto-use"
 	skillFrontmatterNeedsFreshData   = "needs-fresh-data"
 	skillFrontmatterCost             = "cost"
+	skillFrontmatterColor            = "color"
+	skillFrontmatterInvocation       = "invocation"
+	skillFrontmatterRequires         = "requires"
+	skillFrontmatterProfiles         = "profiles"
 )
 
 var skillMarkerFrontmatterKeys = []string{
@@ -528,11 +1086,16 @@ var skillMarkerFrontmatterKeys = []string{
 	skillFrontmatterAllowedTools,
 	skillFrontmatterModel,
 	skillFrontmatterEffort,
+	skillFrontmatterReadOnly,
 	skillFrontmatterTriggers,
 	skillFrontmatterNegativeTriggers,
 	skillFrontmatterAutoUse,
 	skillFrontmatterNeedsFreshData,
 	skillFrontmatterCost,
+	skillFrontmatterColor,
+	skillFrontmatterInvocation,
+	skillFrontmatterRequires,
+	skillFrontmatterProfiles,
 }
 
 func hasSkillMarker(content string, fm map[string]string) bool {
@@ -569,73 +1132,10 @@ func frontmatterHasSkillMarkerKey(content string) bool {
 }
 
 func isSkillMarkerFrontmatterKey(key string) bool {
-	for _, marker := range skillMarkerFrontmatterKeys {
-		if key == marker {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(skillMarkerFrontmatterKeys, key)
 }
 
 // Create scaffolds a new skill stub at the chosen scope. Refuses to overwrite.
-func (s *Store) Create(name string, scope Scope) (string, error) {
-	return s.CreateWithContent(name, scope, stubBody(name))
-}
-
-// CreateWithContent writes caller-supplied file contents as a canonical
-// <name>/SKILL.md skill, refusing to clobber an existing directory-layout or
-// legacy flat skill of the same name. Returns the written path.
-func (s *Store) CreateWithContent(name string, scope Scope, content string) (string, error) {
-	if !IsValidName(name) {
-		return "", fmt.Errorf("invalid skill name %q — use letters, digits, '_', '-', '.'", name)
-	}
-	var root string
-	switch scope {
-	case ScopeProject:
-		if s.projectRoot == "" {
-			return "", fmt.Errorf("project scope requires a workspace — run from a project directory, or use global scope")
-		}
-		root = filepath.Join(s.projectRoot, ".reasonix", SkillsDirname)
-	default:
-		root = s.globalSkillsRoot()
-	}
-	flat := filepath.Join(root, name+".md")
-	folder := filepath.Join(root, name, SkillFile)
-	if _, err := os.Stat(flat); err == nil {
-		return "", fmt.Errorf("skill %q already exists at %s", name, flat)
-	}
-	if _, err := os.Stat(folder); err == nil {
-		return "", fmt.Errorf("skill %q already exists at %s", name, folder)
-	}
-	if err := os.MkdirAll(filepath.Dir(folder), 0o755); err != nil {
-		return "", err
-	}
-	// O_EXCL so a concurrent create (or an existing file) is reported, not clobbered.
-	f, err := os.OpenFile(folder, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
-	if err != nil {
-		if os.IsExist(err) {
-			return "", fmt.Errorf("skill %q already exists at %s", name, folder)
-		}
-		return "", err
-	}
-	defer f.Close()
-	if _, err := f.WriteString(content); err != nil {
-		return "", err
-	}
-	return folder, nil
-}
-
-func (s *Store) globalSkillsRoot() string {
-	if s.reasonixHomeDir != "" {
-		return filepath.Join(s.reasonixHomeDir, SkillsDirname)
-	}
-	return filepath.Join(s.homeDir, ".reasonix", SkillsDirname)
-}
-
-// loadBodyWithReferences appends a directory-layout skill's sibling
-// references/*.md files to its body (Anthropic Skills compatibility), so depth
-// material is available without on-demand resolution. Flat skills have no
-// references dir and are returned unchanged.
 func loadBodyWithReferences(skillPath, body string) string {
 	if filepath.Base(skillPath) != SkillFile {
 		return body
@@ -658,7 +1158,7 @@ func loadBodyWithReferences(skillPath, body string) string {
 	var b strings.Builder
 	b.WriteString(body)
 	for _, n := range names {
-		content, err := os.ReadFile(filepath.Join(refsDir, n))
+		content, err := fileencoding.ReadFileUTF8(filepath.Join(refsDir, n))
 		if err != nil {
 			continue
 		}
@@ -726,12 +1226,16 @@ func parseAllowedTools(raw string) []string {
 // parseCSVFrontmatter splits simple comma-separated frontmatter values. Full
 // YAML lists are intentionally out of scope for the existing frontmatter parser.
 func parseCSVFrontmatter(raw string) []string {
-	if strings.TrimSpace(raw) == "" {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
 		return nil
 	}
+	if strings.HasPrefix(raw, "[") && strings.HasSuffix(raw, "]") {
+		raw = strings.TrimSpace(raw[1 : len(raw)-1])
+	}
 	var out []string
-	for _, p := range strings.Split(raw, ",") {
-		if t := strings.TrimSpace(p); t != "" {
+	for p := range strings.SplitSeq(raw, ",") {
+		if t := strings.Trim(strings.TrimSpace(p), `"'`); t != "" {
 			out = append(out, t)
 		}
 	}
@@ -745,6 +1249,30 @@ func parseAutoUse(raw string) string {
 	default:
 		return ""
 	}
+}
+
+// parseProfilesFrontmatter keeps only economy|balanced|delivery values and
+// returns the rejected ones separately so doctor can surface typos instead of
+// the parser hiding them.
+func parseProfilesFrontmatter(raw string) (valid, invalid []string) {
+	seen := map[string]bool{}
+	for _, p := range parseCSVFrontmatter(raw) {
+		p = strings.ToLower(strings.TrimSpace(p))
+		switch p {
+		case "economy", "balanced", "delivery":
+			if !seen[p] {
+				seen[p] = true
+				valid = append(valid, p)
+			}
+		case "":
+		default:
+			if !seen[p] {
+				seen[p] = true
+				invalid = append(invalid, p)
+			}
+		}
+	}
+	return valid, invalid
 }
 
 func parseBoolFrontmatter(raw string) bool {
@@ -763,6 +1291,15 @@ func parseCost(raw string) string {
 	default:
 		return ""
 	}
+}
+
+// parseInvocation maps frontmatter to an invocation mode. Anything other than
+// "manual" (including absent) is "auto" — the existing, universal behavior.
+func parseInvocation(raw string) string {
+	if strings.EqualFold(strings.TrimSpace(raw), "manual") {
+		return "manual"
+	}
+	return "auto"
 }
 
 // parseRunAs maps frontmatter to a run mode. An unknown value defaults to the

@@ -109,6 +109,7 @@ type wsClient struct {
 }
 
 func (a *adapter) gatewayLoop(ctx context.Context) {
+	selectedIntents := qqPrivateIdentifyIntents
 	bot.RunWithRetry(ctx, a.logger, "qq gateway", bot.RetryConfig{}, func(ctx context.Context) error {
 		token, err := a.getAccessToken(ctx)
 		if err != nil {
@@ -117,7 +118,10 @@ func (a *adapter) gatewayLoop(ctx context.Context) {
 		// connectGateway blocks for the connection's lifetime, returning on
 		// disconnect or error; RunWithRetry handles the cancellation-aware
 		// backoff and reconnect.
-		return a.connectGateway(ctx, token)
+		_, err = connectQQGatewayWithIntentFallback(ctx, token, &selectedIntents, a.connectGateway, func() {
+			a.logger.Warn("qq private-guild intent rejected; retrying with public-guild events")
+		})
+		return err
 	})
 }
 
@@ -146,7 +150,7 @@ func (a *adapter) getAccessToken(ctx context.Context) (string, error) {
 		return "", err
 	}
 
-	req, err := http.NewRequestWithContext(ctx, "POST", qqTokenURL, bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, qqTokenURL, bytes.NewReader(body))
 	if err != nil {
 		return "", err
 	}
@@ -214,7 +218,7 @@ func qqExpiresInSeconds(value any) (int, error) {
 	}
 }
 
-func (a *adapter) connectGateway(ctx context.Context, token string) error {
+func (a *adapter) connectGateway(ctx context.Context, token string, intents int) error {
 	gatewayURL, err := a.getGatewayURL(ctx, token)
 	if err != nil {
 		return err
@@ -222,23 +226,20 @@ func (a *adapter) connectGateway(ctx context.Context, token string) error {
 	if parsed, parseErr := url.Parse(gatewayURL); parseErr == nil {
 		a.logger.Info("qq gateway endpoint resolved", "host", parsed.Hostname(), "sandbox", a.cfg.Sandbox)
 	}
-	cfg, err := websocket.NewConfig(gatewayURL, gatewayURL)
-	if err != nil {
-		return err
-	}
-	cfg.Header = http.Header{}
-	cfg.Header.Set("Authorization", "QQBot "+token)
-	cfg.Header.Set("X-Union-Appid", a.appID())
-
-	conn, err := websocket.DialConfig(cfg)
+	conn, err := a.dialGateway(ctx, gatewayURL, token)
 	if err != nil {
 		return fmt.Errorf("dial gateway: %w", err)
 	}
 	defer conn.Close()
+	defer a.dropConn(conn)
+	if !a.trackConn(ctx, conn) {
+		// Stop already closed the tracked conn slot; entering a blocking read
+		// now would leave a connection Stop can no longer unblock.
+		return ctx.Err()
+	}
 	a.logger.Info("qq gateway connected", "sandbox", a.cfg.Sandbox)
 
 	ws := &wsClient{conn: conn, token: token, logger: a.logger}
-	a.ws = ws
 
 	var msg gatewayPayload
 	decoder := json.NewDecoder(conn)
@@ -259,7 +260,7 @@ func (a *adapter) connectGateway(ctx context.Context, token string) error {
 	// Identify
 	identify := identifyData{
 		Token:   fmt.Sprintf("QQBot %s", token),
-		Intents: 1<<0 | 1<<1 | 1<<9 | 1<<10 | 1<<12 | 1<<25 | 1<<26,
+		Intents: intents,
 		Shard:   [2]int{0, 1},
 		Properties: properties{
 			OS:      "linux",
@@ -276,20 +277,19 @@ func (a *adapter) connectGateway(ctx context.Context, token string) error {
 	if err := decoder.Decode(&msg); err != nil {
 		return fmt.Errorf("read ready: %w", err)
 	}
-	if msg.Op == opDispatch && msg.T == "READY" {
-		var ready struct {
-			SessionID string `json:"session_id"`
-		}
-		if err := json.Unmarshal(msg.D, &ready); err != nil {
-			return fmt.Errorf("decode ready: %w", err)
-		}
-		ws.sessionID = ready.SessionID
-		a.sessionID = ready.SessionID
-		a.seq = msg.S
-		a.logger.Info("qq gateway ready", "sandbox", a.cfg.Sandbox, "heartbeat_ms", ws.heartbeatMs)
-	} else {
-		a.logger.Warn("qq gateway expected ready event", "op", msg.Op, "event", msg.T)
+	if err := validateQQReadyPayload(msg); err != nil {
+		return err
 	}
+	var ready struct {
+		SessionID string `json:"session_id"`
+	}
+	if err := json.Unmarshal(msg.D, &ready); err != nil {
+		return fmt.Errorf("decode ready: %w", err)
+	}
+	ws.sessionID = ready.SessionID
+	a.sessionID = ready.SessionID
+	a.seq = msg.S
+	a.logger.Info("qq gateway ready", "sandbox", a.cfg.Sandbox, "heartbeat_ms", ws.heartbeatMs)
 
 	// 启动 heartbeat
 	heartbeatCtx, heartbeatCancel := context.WithCancel(ctx)
@@ -350,6 +350,54 @@ func (a *adapter) connectGateway(ctx context.Context, token string) error {
 	}
 }
 
+// dialGateway dials the QQ gateway honoring ctx. The conn only becomes
+// trackable after the dial returns, so Stop can interrupt a stalled TCP dial
+// or WebSocket/TLS handshake only through ctx cancellation —
+// websocket.DialConfig would dial with context.Background() and leave Stop's
+// loopWG.Wait blocked with nothing to close.
+func (a *adapter) dialGateway(ctx context.Context, gatewayURL, token string) (*websocket.Conn, error) {
+	cfg, err := websocket.NewConfig(gatewayURL, gatewayURL)
+	if err != nil {
+		return nil, err
+	}
+	cfg.Header = http.Header{}
+	cfg.Header.Set("Authorization", "QQBot "+token)
+	cfg.Header.Set("X-Union-Appid", a.appID())
+	return cfg.DialContext(ctx)
+}
+
+// trackConn publishes the live gateway connection so Stop can close it and
+// unblock the blocking websocket reads, which do not honor ctx. Publication is
+// refused once ctx is cancelled, so a conn that finishes dialing concurrently
+// with Stop can never be left open but unreachable.
+func (a *adapter) trackConn(ctx context.Context, conn *websocket.Conn) bool {
+	a.connMu.Lock()
+	defer a.connMu.Unlock()
+	if ctx.Err() != nil {
+		return false
+	}
+	a.conn = conn
+	return true
+}
+
+func (a *adapter) dropConn(conn *websocket.Conn) {
+	a.connMu.Lock()
+	if a.conn == conn {
+		a.conn = nil
+	}
+	a.connMu.Unlock()
+}
+
+func (a *adapter) closeConn() {
+	a.connMu.Lock()
+	conn := a.conn
+	a.conn = nil
+	a.connMu.Unlock()
+	if conn != nil {
+		conn.Close()
+	}
+}
+
 func (a *adapter) appID() string {
 	if value := strings.TrimSpace(a.cfg.AppID); value != "" {
 		return value
@@ -376,7 +424,7 @@ func (a *adapter) apiBaseURL() string {
 }
 
 func (a *adapter) getGatewayURL(ctx context.Context, token string) (string, error) {
-	req, err := http.NewRequestWithContext(ctx, "GET", a.apiBaseURL()+"/gateway", nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, a.apiBaseURL()+"/gateway", nil)
 	if err != nil {
 		return "", err
 	}
@@ -515,29 +563,32 @@ func (a *adapter) sendMessage(ctx context.Context, msg bot.OutboundMessage) (bot
 	if truncated {
 		a.logger.Warn("qq passive reply truncated", "chat_type", msg.ChatType, "chunks", originalChunkCount, "limit", len(chunks))
 	}
-	var last bot.SendResult
+	var delivered bot.SendResult
 	for _, chunk := range chunks {
 		seq := a.nextMessageSeq(msg.ReplyToMsgID)
 		var result bot.SendResult
 		var err error
-		if msg.Keyboard == nil && a.markdownDeliveryDisabled() {
+		plain := msg.Keyboard == nil && a.markdownDeliveryDisabled()
+		if plain {
 			result, err = a.sendPlainMessageChunk(ctx, msg, chunk, seq)
 		} else {
 			result, err = a.sendMessageChunk(ctx, msg, chunk, seq)
 		}
-		if err != nil && msg.Keyboard == nil {
-			a.disableMarkdownDelivery()
-			a.logger.Warn("qq markdown delivery failed, retrying plain text", "chat_type", msg.ChatType, "err", err)
+		if err != nil && !plain && ctx.Err() == nil {
+			if msg.Keyboard == nil {
+				a.disableMarkdownDelivery()
+			}
+			a.logger.Warn("qq rich message delivery failed, retrying plain text", "chat_type", msg.ChatType, "keyboard", msg.Keyboard != nil, "err", err)
 			result, err = a.sendPlainMessageChunk(ctx, msg, chunk, a.nextMessageSeq(msg.ReplyToMsgID))
 		}
 		if err != nil {
 			a.logger.Error("qq message send failed", "chat_type", msg.ChatType, "err", err)
-			return last, err
+			return delivered, err
 		}
 		a.logger.Info("qq message sent", "chat_type", msg.ChatType, "message_id_set", strings.TrimSpace(result.MessageID) != "")
-		last = result
+		delivered.Merge(result)
 	}
-	return last, nil
+	return delivered, nil
 }
 
 func (a *adapter) sendPlainMessageChunk(ctx context.Context, msg bot.OutboundMessage, text string, seq int) (bot.SendResult, error) {
@@ -548,38 +599,14 @@ func (a *adapter) sendPlainMessageChunk(ctx context.Context, msg bot.OutboundMes
 }
 
 func (a *adapter) sendMessageChunk(ctx context.Context, msg bot.OutboundMessage, text string, seq int) (bot.SendResult, error) {
-	if msg.Keyboard != nil {
-		payload := map[string]any{
-			"content":  text,
-			"msg_type": 2,
-		}
-		rows := make([]map[string]any, 0, len(msg.Keyboard.Rows))
-		for _, row := range msg.Keyboard.Rows {
-			buttons := make([]map[string]any, 0, len(row.Buttons))
-			for _, btn := range row.Buttons {
-				buttons = append(buttons, map[string]any{
-					"id": strings.TrimSpace(btn.ID),
-					"render_data": map[string]any{
-						"label": btn.Label,
-						"style": btn.Style,
-					},
-					"action": map[string]any{
-						"type": 2,
-						"data": btn.CallbackID,
-					},
-				})
-			}
-			rows = append(rows, map[string]any{"buttons": buttons})
-		}
-		payload["keyboard"] = map[string]interface{}{
-			"content": rows,
-		}
-		return a.sendMessagePayload(ctx, msg, payload, seq)
-	}
-	return a.sendMessagePayload(ctx, msg, map[string]any{
+	payload := map[string]any{
 		"markdown": map[string]string{"content": text},
 		"msg_type": 2,
-	}, seq)
+	}
+	if msg.Keyboard != nil {
+		payload["keyboard"] = qqKeyboardContent(msg.Keyboard, msg.ChatType)
+	}
+	return a.sendMessagePayload(ctx, msg, payload, seq)
 }
 
 func (a *adapter) sendMessagePayload(ctx context.Context, msg bot.OutboundMessage, payload map[string]any, seq int) (bot.SendResult, error) {
@@ -598,7 +625,7 @@ func (a *adapter) sendMessagePayload(ctx context.Context, msg bot.OutboundMessag
 	url := a.qqSendURL(msg)
 
 	body, _ := json.Marshal(payload)
-	req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewBuffer(body))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewBuffer(body))
 	if err != nil {
 		return bot.SendResult{}, err
 	}

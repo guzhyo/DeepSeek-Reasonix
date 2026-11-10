@@ -20,6 +20,17 @@ func (s *closeTrackingSink) Close() {
 	s.closed.Store(true)
 }
 
+type blockingCloseTrackingSink struct {
+	closeTrackingSink
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (s *blockingCloseTrackingSink) Emit(event.Event) {
+	close(s.entered)
+	<-s.release
+}
+
 func TestTabEventSinkSetBotSinkClosesPreviousSink(t *testing.T) {
 	sink := &tabEventSink{}
 	first := &closeTrackingSink{}
@@ -44,6 +55,54 @@ func TestTabEventSinkSetBotSinkClosesPreviousSink(t *testing.T) {
 	}
 }
 
+func TestTabEventSinkOldTurnDoneDoesNotClearReplacement(t *testing.T) {
+	sink := &tabEventSink{}
+	old := &blockingCloseTrackingSink{
+		entered: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	replacement := &closeTrackingSink{}
+
+	if !sink.tryBeginTurn() {
+		t.Fatal("failed to reserve initial turn")
+	}
+	sink.SetBotSink(old)
+	done := make(chan struct{})
+	go func() {
+		sink.Emit(event.Event{Kind: event.TurnDone})
+		close(done)
+	}()
+	select {
+	case <-old.entered:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("old forwarder did not receive TurnDone")
+	}
+
+	sink.SetBotSink(replacement)
+	if sink.tryBeginTurn() {
+		t.Fatal("new turn admitted before old TurnDone completed")
+	}
+	close(old.release)
+	select {
+	case <-done:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("TurnDone did not finish")
+	}
+
+	if replacement.closed.Load() {
+		t.Fatal("old TurnDone cleared the replacement forwarder")
+	}
+	got, _ := sink.botSinkSnapshot()
+	if got != replacement {
+		t.Fatalf("attached forwarder = %T, want replacement", got)
+	}
+	if !sink.tryBeginTurn() {
+		t.Fatal("next turn was not admitted after TurnDone completed")
+	}
+	sink.cancelTurnStart()
+	sink.SetBotSink(nil)
+}
+
 func TestTabEventSinkDoesNotBlockOnRuntimeEventsEmit(t *testing.T) {
 	entered := make(chan struct{})
 	release := make(chan struct{})
@@ -51,7 +110,7 @@ func TestTabEventSinkDoesNotBlockOnRuntimeEventsEmit(t *testing.T) {
 	var calls atomic.Int32
 
 	sink := &tabEventSink{tabID: "tab", ctx: context.Background()}
-	sink.runtimeEvents.emit = func(_ context.Context, name string, payload ...interface{}) {
+	sink.runtimeEvents.emit = func(_ context.Context, name string, payload ...any) {
 		if name != eventChannel {
 			t.Errorf("event name = %q, want %q", name, eventChannel)
 		}
@@ -108,15 +167,40 @@ func TestTabEventSinkDoesNotBlockOnRuntimeEventsEmit(t *testing.T) {
 func TestEmitProjectTreeChangedDoesNotBlockOnRuntimeEventsEmit(t *testing.T) {
 	entered := make(chan struct{})
 	release := make(chan struct{})
+	allDelivered := make(chan struct{}, 1)
 	var calls atomic.Int32
+	var runtimeCalls atomic.Int32
+	var legacyCalls atomic.Int32
 
 	app := &App{ctx: context.Background()}
-	app.runtimeEvents.emit = func(_ context.Context, name string, payload ...interface{}) {
-		if name != "project-tree:changed" {
-			t.Errorf("event name = %q, want project-tree:changed", name)
+	app.runtimeEvents.emit = func(_ context.Context, name string, payload ...any) {
+		switch name {
+		case "project-tree:runtime-changed":
+			runtimeCalls.Add(1)
+			if len(payload) != 1 {
+				t.Errorf("runtime payload count = %d, want 1", len(payload))
+			} else if event, ok := payload[0].(ProjectTreeRuntimeSnapshot); !ok || event.Topics == nil || event.Revision == 0 {
+				t.Errorf("runtime payload = %#v, want a versioned snapshot with [] topics", payload[0])
+			}
+		case "runtime-state:changed":
+			if len(payload) != 1 {
+				t.Errorf("unified runtime payload count = %d", len(payload))
+			} else if snapshot, ok := payload[0].(RuntimeStateProjection); !ok || snapshot.Sessions == nil || snapshot.Revision == 0 {
+				t.Errorf("invalid unified runtime snapshot: %#v", payload[0])
+			}
+		case "project-tree:changed":
+			legacyCalls.Add(1)
+			if len(payload) != 0 {
+				t.Errorf("legacy payload count = %d, want 0", len(payload))
+			}
+		default:
+			t.Errorf("event name = %q, want project-tree:runtime-changed or project-tree:changed", name)
 		}
-		if len(payload) != 0 {
-			t.Errorf("payload count = %d, want 0", len(payload))
+		if runtimeCalls.Load() >= 2 && legacyCalls.Load() >= 2 {
+			select {
+			case allDelivered <- struct{}{}:
+			default:
+			}
 		}
 		if calls.Add(1) == 1 {
 			close(entered)
@@ -130,6 +214,11 @@ func TestEmitProjectTreeChangedDoesNotBlockOnRuntimeEventsEmit(t *testing.T) {
 	case <-time.After(500 * time.Millisecond):
 		t.Fatal("first project tree runtime emit did not start")
 	}
+	// Unchanged snapshots are intentionally deduplicated. A real binding
+	// change must still publish without waiting for the blocked transport.
+	app.mu.Lock()
+	app.tabs = map[string]*WorkspaceTab{"second": {ID: "second", Scope: "global"}}
+	app.mu.Unlock()
 
 	done := make(chan struct{})
 	go func() {
@@ -143,14 +232,12 @@ func TestEmitProjectTreeChangedDoesNotBlockOnRuntimeEventsEmit(t *testing.T) {
 	}
 
 	close(release)
-	deadline := time.Now().Add(500 * time.Millisecond)
-	for time.Now().Before(deadline) {
-		if calls.Load() >= 2 {
-			return
-		}
-		time.Sleep(5 * time.Millisecond)
+	select {
+	case <-allDelivered:
+		return
+	case <-time.After(500 * time.Millisecond):
+		t.Fatalf("runtime emit calls = %d (runtime=%d legacy=%d), want two broadcasts on both contracts", calls.Load(), runtimeCalls.Load(), legacyCalls.Load())
 	}
-	t.Fatalf("runtime emit calls = %d, want at least 2", calls.Load())
 }
 
 func TestAsyncRuntimeEmitterDrainsBacklogInOrder(t *testing.T) {
@@ -162,7 +249,7 @@ func TestAsyncRuntimeEmitterDrainsBacklogInOrder(t *testing.T) {
 	var calls atomic.Int32
 
 	emitter := &asyncRuntimeEmitter{}
-	emitter.emit = func(_ context.Context, _ string, payload ...interface{}) {
+	emitter.emit = func(_ context.Context, _ string, payload ...any) {
 		if len(payload) != 1 {
 			t.Errorf("payload count = %d, want 1", len(payload))
 			return
@@ -180,7 +267,7 @@ func TestAsyncRuntimeEmitterDrainsBacklogInOrder(t *testing.T) {
 	}
 
 	ctx := context.Background()
-	for i := 0; i < backlog; i++ {
+	for i := range backlog {
 		emitter.Emit(ctx, "agent:event", strconv.Itoa(i))
 	}
 
@@ -191,7 +278,7 @@ func TestAsyncRuntimeEmitterDrainsBacklogInOrder(t *testing.T) {
 	}
 	close(release)
 
-	for i := 0; i < backlog; i++ {
+	for i := range backlog {
 		select {
 		case got := <-delivered:
 			if want := strconv.Itoa(i); got != want {

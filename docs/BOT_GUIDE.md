@@ -7,8 +7,8 @@
 <a href="./GUIDE.md">General guide</a>
 
 > For desktop and CLI users. This guide explains how to connect Feishu, Lark,
-> WeChat, and QQ bots, how to use Reasonix from IM, and how approvals, Ask
-> questions, YOLO, and bot commands work.
+> WeChat, and QQ bots, how to use Reasonix from IM, and how permissions, model
+> questions, and bot commands work.
 
 ## Contents
 
@@ -19,7 +19,7 @@
 - [Usage flow](#usage-flow)
 - [Channel interaction differences](#channel-interaction-differences)
 - [Command quick reference](#command-quick-reference)
-- [Approvals and YOLO](#approvals-and-yolo)
+- [Permission presets](#permission-presets)
 - [Do upgrades require rebinding?](#do-upgrades-require-rebinding)
 - [Troubleshooting](#troubleshooting)
 
@@ -35,7 +35,7 @@ Common uses:
 - Ask Reasonix to inspect code, read docs, explain errors, or summarize findings.
 - Trigger tool calls from IM and receive progress or final results in the chat.
 - Approve or deny sensitive actions such as file writes or shell commands.
-- Enable YOLO for trusted temporary work so ordinary tool approvals are skipped.
+- Select Full access for trusted temporary work when ordinary filesystem confinement is unnecessary.
 - Open the matching desktop IM session to inspect context, cost, tokens, and tool
   traces.
 
@@ -209,7 +209,7 @@ reasonix bot pairing reject CODE
 ```
 
 If `qq_admins`, `feishu_admins`, `weixin_admins`, or the matching
-`*_approvers` lists are configured, `/yolo` and `/mode` are admin-only while
+`*_approvers` lists are configured, `/mode` is admin-only while
 `/projects`, `/use project`, `/sessions`, `/attach session`, and `/search all`
 are also admin-only. `/approve` and `/deny` require an approver or admin. When
 no role lists are set, existing allowlisted users keep the previous command
@@ -298,8 +298,6 @@ without exposing real account IDs, local paths, or private chat content.
 
 ![Feishu approval card example](./assets/bot-feishu-approval.svg)
 
-![Lark YOLO mode example](./assets/bot-lark-yolo.svg)
-
 ![WeChat text command example](./assets/bot-weixin-text-commands.svg)
 
 ![QQ approval card example](./assets/bot-qq-approval.svg)
@@ -330,19 +328,19 @@ These commands work in Feishu, Lark, WeChat, and QQ.
 | `/approve <id>` | Approve a pending operation | `/approve 1` |
 | `/deny <id>` | Deny a pending operation | `/deny 1` |
 | `/answer <id> <option>` | Answer an Ask question | `/answer ask-1 2` |
-| `/yolo` | Enable YOLO | `/yolo` |
-| `/yolo on` | Enable YOLO | `/yolo on` |
-| `/yolo off` | Return to Ask mode | `/yolo off` |
-| `/yolo auto` | Switch to Auto approval mode | `/yolo auto` |
-| `/yolo status` | Show the current tool approval mode | `/yolo status` |
-| `/mode yolo` | Switch to YOLO | `/mode yolo` |
-| `/mode ask` | Switch to Ask mode | `/mode ask` |
-| `/mode auto` | Switch to Auto mode | `/mode auto` |
+| `/mode read-only` | Read the workspace; request narrow authorization for writes or side effects | `/mode read-only` |
+| `/mode workspace-write` | Allow writes inside the workspace and private session temporary directory | `/mode workspace-write` |
+| `/mode danger-full-access` | Select Full access explicitly | `/mode danger-full-access` |
+| `/mode status` | Show the current permission preset and enforcement capability | `/mode status` |
 | `/queue status` | Show the current queue mode | `/queue status` |
 | `/queue steer` | Treat mid-run messages as guidance for the current task | `/queue steer` |
 | `/queue followup` | Queue mid-run messages as later turns | `/queue followup` |
 | `/queue collect` | Merge queued messages into one later turn | `/queue collect` |
 | `/queue interrupt` | Cancel the current task and keep the newest message | `/queue interrupt` |
+| `/queue list` / `/queue show <n\|id>` | Inspect durable queued work | `/queue list` |
+| `/queue delete <n\|id>` / `/queue move <n\|id> <to>` | Delete or reorder pending work | `/queue move 2 1` |
+| `/queue pause` / `/queue resume` | Stop or resume automatic dispatch | `/queue resume` |
+| `/queue retry <n\|id>` / `/queue refresh <n\|id>` | Retry uncertain work or refresh frozen references | `/queue retry 1` |
 | `/projects [query]` | List indexed project workspaces | `/projects reasonix` |
 | `/use project <id\|name>` | Route this remote session to an indexed project | `/use project p1` |
 | `/use project default` | Clear the project override and return to configured routing | `/use project default` |
@@ -361,9 +359,12 @@ Shortcut replies:
   produce guidance.
 
 The default queue mode is `steer`: when the same session is already running, a
-new message is injected as mid-turn guidance instead of waiting for the whole
-turn to finish. `queue_cap` and `queue_drop` bound backlog growth in config.
-`reasonix bot doctor --deep` reports queue, pairing, and role diagnostics.
+new message is persisted before it is injected as mid-turn guidance. If the
+active turn cannot accept it, the same durable item remains a follow-up.
+Capacity is fail-closed at 64 items, 4 MiB per item, and 64 MiB per session;
+`queue_drop` no longer removes older work. After recovery the inbox stays
+paused until `/queue resume`. `reasonix bot doctor --deep` reports queue,
+pairing, and role diagnostics.
 
 Queue modes:
 
@@ -395,20 +396,20 @@ saved, the bot sends a short warning and continues with the available text. The
 built-in Feishu, Weixin, and QQ adapters currently focus on text events; ordinary
 IM attachment extraction can be added at the adapter layer.
 
-## Approvals and YOLO
+## Permission presets
 
-Reasonix bots use the same permission system as the desktop app. Ask mode is the
-default: sensitive tool calls such as file writes and shell commands request
-confirmation first.
+Reasonix bots use the same permission runtime as the desktop app. Workspace
+write is the default, so ordinary builds, tests, pipes, and inline scripts run
+inside the workspace sandbox without repeated approval prompts.
 
 ```mermaid
 flowchart TD
   A["Model prepares a tool call"] --> B{"Matches a deny rule?"}
   B -- "Yes" --> C["Block immediately"]
-  B -- "No" --> D{"Tool approval mode"}
-  D -- "Ask" --> E["Send approval to IM"]
-  D -- "Auto" --> F["Auto-allow when policy permits"]
-  D -- "YOLO" --> G["Skip ordinary tool approvals"]
+  B -- "No" --> D{"Permission preset"}
+  D -- "Read only" --> E["Request a scoped authorization when needed"]
+  D -- "Workspace write" --> F["Run inside the workspace sandbox"]
+  D -- "Full access" --> G["Skip ordinary confinement and prompts"]
   E --> H{"User choice"}
   H -- "Allow" --> I["Run tool"]
   H -- "Deny" --> J["Stop that operation"]
@@ -416,19 +417,22 @@ flowchart TD
   G --> I
 ```
 
-YOLO boundaries:
+Permission boundaries:
 
-- YOLO skips ordinary tool approval prompts.
-- YOLO does not bypass hard `deny` rules.
-- YOLO does not answer model Ask questions for you.
-- YOLO does not approve plan-mode plan approvals for you.
+- Read only never grants a write merely because a command uses shell syntax.
+- Workspace write trusts the connected bot identity inside its selected workspace.
+- Full access runs commands as the current OS user without Reasonix filesystem
+  or network sandboxing. Host `deny` rules still apply before launch; model
+  questions and plan approvals remain separate user decisions.
+- Session authorizations are scoped to the named directory, server capability,
+  or operation; approving one command never grants arbitrary shell access.
 
 Recommendations:
 
-- Use `/yolo` for temporary trusted debugging or fast local iteration.
-- Use `/mode ask` for risky work, production code, or anything uncertain.
-- Use `/mode auto` when you want fewer routine prompts while keeping policy
-  decisions.
+- Use `/mode workspace-write` for normal repository work.
+- Use `/mode read-only` for inspection and review.
+- Use `/mode danger-full-access` only when the user explicitly intends to remove
+  ordinary filesystem confinement.
 
 ## Do upgrades require rebinding?
 
@@ -466,7 +470,7 @@ You may need to bind again if:
 | QQ button action fails | Same as Feishu/Lark — send the text command from the card, such as `/approve <id>` or `/deny <id>`. |
 | WeChat reply `1` does nothing | Numeric shortcuts only work when an approval or Ask is pending; use the full command if needed. |
 | QQ reply `1` does nothing | Same as WeChat — numeric shortcuts only work when an approval or Ask is pending; use the full command if needed. |
-| Need to confirm the current mode | Send `/status` or `/yolo status`. |
+| Need to confirm the current mode | Send `/status` or `/mode status`. |
 | Need a fresh context | Send `/new` or `/reset`. |
 | Need to stop the current task | Send `/stop`. |
 

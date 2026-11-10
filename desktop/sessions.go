@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/json"
 	"errors"
@@ -14,8 +15,8 @@ import (
 
 	"reasonix/internal/agent"
 	"reasonix/internal/config"
-	"reasonix/internal/control"
 	"reasonix/internal/fileutil"
+	filelock "reasonix/internal/identitylock"
 	"reasonix/internal/store"
 )
 
@@ -31,6 +32,21 @@ const sessionDisplayFile = ".display.json"
 const sessionPlannerDisplayFile = ".planner-display.json"
 const sessionTrashDir = ".trash"
 const sessionTrashMetaFile = ".trash-meta.json"
+
+const (
+	// Durable sidecar publication includes an fsync while holding the update
+	// lock. Keep enough queue budget for a burst of in-process writers on
+	// slower Windows disks, but fail external contention quickly so turn
+	// completion and retry-queue handoff do not stall behind another process.
+	sessionSidecarQueueTimeout        = 5 * time.Second
+	sessionSidecarExternalLockTimeout = 750 * time.Millisecond
+)
+
+var (
+	sessionTitlesQueueTimeout                = sessionSidecarQueueTimeout
+	sessionPlannerDisplayExternalLockTimeout = sessionSidecarExternalLockTimeout
+	sessionDisplayExternalLockTimeout        = sessionSidecarExternalLockTimeout
+)
 
 func sessionTitlesPath(dir string) string  { return filepath.Join(dir, sessionTitlesFile) }
 func sessionDisplayPath(dir string) string { return filepath.Join(dir, sessionDisplayFile) }
@@ -51,22 +67,37 @@ func desktopSessionDir(root string) string {
 	return config.SessionDir()
 }
 
-// loadSessionTitles reads the basename→title map (missing/corrupt → empty).
-func loadSessionTitles(dir string) map[string]string {
-	m := map[string]string{}
-	b, err := readFileWithTimeout(sessionTitlesPath(dir), topicFileReadTimeout)
-	if err != nil {
-		return m
-	}
-	_ = json.Unmarshal(b, &m)
-	return m
-}
-
 func loadSessionTitlesForUpdate(dir string) (map[string]string, error) {
 	return loadStringMapForUpdate(sessionTitlesPath(dir))
 }
 
-// saveSessionTitles writes the map atomically (temp file + rename).
+func updateSessionTitles(dir string, mutate func(map[string]string) bool) error {
+	if strings.TrimSpace(dir) == "" {
+		return errors.New("title directory is empty")
+	}
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), sessionTitlesQueueTimeout)
+	defer cancel()
+	release, err := filelock.AcquireWithExternalTimeout(ctx, sessionTitlesPath(dir)+".lock", sessionSidecarExternalLockTimeout)
+	if err != nil {
+		return fmt.Errorf("lock title sidecar: %w", err)
+	}
+	defer release()
+
+	m, err := loadSessionTitlesForUpdate(dir)
+	if err != nil {
+		return err
+	}
+	if !mutate(m) {
+		return nil
+	}
+	return saveSessionTitles(dir, m)
+}
+
+// saveSessionTitles writes the map durably and atomically. Keep this on the
+// shared helper so the temporary file is fsynced before it is published.
 func saveSessionTitles(dir string, m map[string]string) error {
 	b, err := json.MarshalIndent(m, "", "  ")
 	if err != nil {
@@ -75,56 +106,7 @@ func saveSessionTitles(dir string, m map[string]string) error {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err
 	}
-	tmp, err := os.CreateTemp(dir, ".titles.*.tmp")
-	if err != nil {
-		return err
-	}
-	tmpPath := tmp.Name()
-	if _, err := tmp.Write(b); err != nil {
-		tmp.Close()
-		os.Remove(tmpPath)
-		return err
-	}
-	if err := tmp.Close(); err != nil {
-		os.Remove(tmpPath)
-		return err
-	}
-	return fileutil.ReplaceFile(tmpPath, sessionTitlesPath(dir))
-}
-
-// setSessionTitle sets (or, with an empty title, clears) a session's custom name.
-func setSessionTitle(dir, sessionPath, title string) error {
-	sessionPath, _, err := validateSessionPath(dir, sessionPath)
-	if err != nil {
-		return err
-	}
-	m, err := loadSessionTitlesForUpdate(dir)
-	if err != nil {
-		return err
-	}
-	key := filepath.Base(sessionPath)
-	if strings.TrimSpace(title) == "" {
-		delete(m, key)
-	} else {
-		m[key] = strings.TrimSpace(title)
-	}
-	return saveSessionTitles(dir, m)
-}
-
-// deleteSessionFile moves a session's .jsonl and file sidecars into the local
-// trash. Title/display sidecars stay in place so trash previews and restores can
-// preserve the user's labels.
-func deleteSessionFile(dir, sessionPath string) error {
-	sessionPath, key, err := validateSessionPath(dir, sessionPath)
-	if err != nil {
-		return err
-	}
-	return trashSessionArtifacts(dir, sessionPath, key)
-}
-
-type trashedSessionMeta struct {
-	Key       string `json:"key"`
-	DeletedAt int64  `json:"deletedAt"`
+	return fileutil.AtomicWriteFile(sessionTitlesPath(dir), b, 0o600)
 }
 
 type sessionTrashArtifact struct {
@@ -139,21 +121,6 @@ func sessionTelemetryPath(sessionPath string) string {
 	return sessionPath + ".telemetry.json"
 }
 
-func sessionTrashArtifacts(sessionPath, key string) []sessionTrashArtifact {
-	stem := strings.TrimSuffix(key, ".jsonl")
-	return []sessionTrashArtifact{
-		{src: sessionPath, name: key},
-		{src: store.SessionMeta(sessionPath), name: key + ".meta"},
-		{src: store.SessionGoalState(sessionPath), name: stem + ".goal-state.json"},
-		{src: store.SessionEventLog(sessionPath), name: stem + ".events.jsonl"},
-		{src: store.SessionEventIndex(sessionPath), name: stem + ".event-index.json"},
-		{src: store.SessionConflictLog(sessionPath), name: stem + ".conflicts.jsonl"},
-		{src: sessionTelemetryPath(sessionPath), name: key + ".telemetry.json"},
-		{src: store.SessionCheckpointDir(sessionPath), name: stem + ".ckpt"},
-		{src: store.SessionJobsDir(sessionPath), name: stem + ".jobs"},
-	}
-}
-
 // errSessionBusyElsewhere is the sanitized error surfaced when a destructive
 // session operation is blocked by a live owner. It intentionally carries no
 // writer id, hostname, or path.
@@ -166,7 +133,9 @@ var errSessionBusyElsewhere = errors.New("session is in use by another Reasonix 
 // would let another process acquire the lease in between and then lose its
 // freshly locked lease file, breaking cross-process mutual exclusion.
 func acquireSessionRemovalGuard(sessionPath string) (*agent.SessionRemovalGuard, error) {
-	guard, err := agent.TryAcquireSessionRemovalGuard(sessionPath)
+	guard, err := withSessionLeaseContentionRetry(func() (*agent.SessionRemovalGuard, error) {
+		return agent.TryAcquireSessionRemovalGuard(sessionPath)
+	})
 	if err != nil {
 		if errors.Is(err, agent.ErrSessionLeaseHeld) {
 			return nil, errSessionBusyElsewhere
@@ -203,64 +172,6 @@ func reconcileDesktopCleanupPending(dir string) error {
 		}
 		return removeDesktopSessionArtifacts(item.SessionPath)
 	})
-}
-
-func reconcileDesktopTrashSessionArtifacts(dir, sessionPath, key string) error {
-	// Hold the removal guard across the whole move so no runtime can acquire
-	// the session (or save into it) while its artifacts are relocated; the
-	// lock sidecars are deleted atomically with the guard release.
-	guard, err := acquireSessionRemovalGuard(sessionPath)
-	if err != nil {
-		return err
-	}
-	defer guard.Release()
-	itemDir := filepath.Join(sessionTrashPath(dir), key)
-	if info, err := os.Stat(itemDir); err == nil {
-		if !info.IsDir() {
-			return fmt.Errorf("session trash target is not a directory: %s", key)
-		}
-		trashPath := filepath.Join(itemDir, key)
-		if trashInfo, err := os.Stat(trashPath); err == nil && !trashInfo.IsDir() {
-			matches, err := trashSessionMatchesLive(sessionPath, trashPath)
-			if err != nil {
-				return err
-			}
-			if !matches {
-				itemDir, err = reserveUniqueSessionTrashItemDir(dir, key)
-				if err != nil {
-					return err
-				}
-			}
-		} else if err != nil && !os.IsNotExist(err) {
-			return err
-		}
-	} else if os.IsNotExist(err) {
-		if err := os.MkdirAll(itemDir, 0o755); err != nil {
-			return err
-		}
-	} else {
-		return err
-	}
-	for _, artifact := range sessionTrashArtifacts(sessionPath, key) {
-		if err := movePathIfExists(artifact.src, filepath.Join(itemDir, artifact.name)); err != nil {
-			return err
-		}
-	}
-	if err := trashSubagentArtifacts(dir, sessionPath, itemDir); err != nil {
-		return err
-	}
-	if err := guard.RemoveSidecarsAndRelease(); err != nil {
-		return err
-	}
-	meta := trashedSessionMeta{Key: key, DeletedAt: time.Now().UnixMilli()}
-	b, err := json.MarshalIndent(meta, "", "  ")
-	if err != nil {
-		return err
-	}
-	if err := os.WriteFile(filepath.Join(itemDir, sessionTrashMetaFile), b, 0o644); err != nil {
-		return err
-	}
-	return agent.ClearCleanupPending(sessionPath)
 }
 
 func validateSessionTrashTarget(dir, sessionPath, key string) error {
@@ -345,7 +256,7 @@ func reserveUniqueSessionTrashItemDir(dir, key string) (string, error) {
 		return "", err
 	}
 	stem := strings.TrimSuffix(key, ".jsonl")
-	for i := 0; i < 100; i++ {
+	for i := range 100 {
 		name := fmt.Sprintf("%s.jsonl-deleted-%d-%02d", stem, time.Now().UnixNano(), i)
 		itemDir := filepath.Join(root, name)
 		if err := os.Mkdir(itemDir, 0o755); err == nil {
@@ -384,6 +295,10 @@ func liveSessionDiscardable(sessionPath string) (bool, error) {
 	if agent.IsCleanupPending(sessionPath) {
 		return true, nil
 	}
+	return liveSessionContentDiscardable(sessionPath)
+}
+
+func liveSessionContentDiscardable(sessionPath string) (bool, error) {
 	info, err := os.Stat(sessionPath)
 	if os.IsNotExist(err) {
 		return true, nil
@@ -442,7 +357,7 @@ func trashSessionArtifactsBeforeMove(dir, sessionPath, key string, beforeMove fu
 		return err
 	}
 	if !target.shouldMove {
-		return nil
+		return agent.ClearCleanupPending(sessionPath)
 	}
 	// Acquired after prepareSessionTrashTarget: the duplicate-trash path in
 	// there takes its own removal guard, and the guard is not reentrant.
@@ -451,6 +366,9 @@ func trashSessionArtifactsBeforeMove(dir, sessionPath, key string, beforeMove fu
 		return err
 	}
 	defer guard.Release()
+	if err := invalidateTopicDirMarkers(dir); err != nil {
+		return err
+	}
 	itemDir := target.itemDir
 	if target.allocateUnique {
 		itemDir, err = reserveUniqueSessionTrashItemDir(dir, key)
@@ -474,7 +392,7 @@ func trashSessionArtifactsBeforeMove(dir, sessionPath, key string, beforeMove fu
 	if err := guard.RemoveSidecarsAndRelease(); err != nil {
 		return err
 	}
-	meta := trashedSessionMeta{Key: key, DeletedAt: time.Now().UnixMilli()}
+	meta := trashedSessionMeta{Key: key, DeletedAt: time.Now().UnixMilli(), Kind: "deleted"}
 	b, err := json.MarshalIndent(meta, "", "  ")
 	if err != nil {
 		return err
@@ -504,7 +422,7 @@ func listTrashedSessionFiles(dir string) ([]string, error) {
 		}
 		itemDir := filepath.Join(root, e.Name())
 		keys := []string{}
-		if b, err := os.ReadFile(filepath.Join(itemDir, sessionTrashMetaFile)); err == nil {
+		if b, err := readFileUTF8(filepath.Join(itemDir, sessionTrashMetaFile)); err == nil {
 			var meta trashedSessionMeta
 			if json.Unmarshal(b, &meta) == nil && store.IsSessionTranscriptName(meta.Key) {
 				keys = append(keys, meta.Key)
@@ -529,7 +447,7 @@ func listTrashedSessionFiles(dir string) ([]string, error) {
 }
 
 func trashedSessionDeletedAt(path string) int64 {
-	b, err := os.ReadFile(filepath.Join(filepath.Dir(path), sessionTrashMetaFile))
+	b, err := readFileUTF8(filepath.Join(filepath.Dir(path), sessionTrashMetaFile))
 	if err != nil {
 		return 0
 	}
@@ -540,43 +458,6 @@ func trashedSessionDeletedAt(path string) int64 {
 	return meta.DeletedAt
 }
 
-func restoreTrashedSessionFile(dir, path string) error {
-	_, key, itemDir, err := validateTrashedSessionPath(dir, path)
-	if err != nil {
-		return err
-	}
-	target := filepath.Join(dir, key)
-	if _, err := os.Stat(target); err == nil {
-		discardable, err := liveSessionDiscardable(target)
-		if err != nil {
-			return err
-		}
-		if !discardable {
-			return fmt.Errorf("session already exists: %s", key)
-		}
-		if err := removeDesktopSessionArtifacts(target); err != nil {
-			return err
-		}
-	} else if !os.IsNotExist(err) {
-		return err
-	}
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return err
-	}
-	if err := checkRestoreSubagentConflicts(dir, itemDir); err != nil {
-		return err
-	}
-	for _, artifact := range sessionTrashArtifacts(target, key) {
-		if err := movePathIfExists(filepath.Join(itemDir, artifact.name), artifact.src); err != nil {
-			return err
-		}
-	}
-	if err := restoreSubagentArtifacts(dir, itemDir); err != nil {
-		return err
-	}
-	return os.RemoveAll(itemDir)
-}
-
 func purgeTrashedSessionFile(dir, path string) error {
 	_, key, itemDir, err := validateTrashedSessionPath(dir, path)
 	if err != nil {
@@ -585,17 +466,19 @@ func purgeTrashedSessionFile(dir, path string) error {
 	if err := os.RemoveAll(itemDir); err != nil {
 		return err
 	}
-	m, err := loadSessionTitlesForUpdate(dir)
-	if err != nil {
+	if err := updateSessionTitles(dir, func(m map[string]string) bool {
+		if _, ok := m[key]; !ok {
+			return false
+		}
+		delete(m, key)
+		return true
+	}); err != nil {
 		return err
 	}
-	if _, ok := m[key]; ok {
-		delete(m, key)
-		if err := saveSessionTitles(dir, m); err != nil {
-			return err
-		}
-	}
 	if err := removeSessionDisplayKey(dir, key); err != nil {
+		return err
+	}
+	if err := removeSessionPlannerDisplay(dir, key); err != nil {
 		return err
 	}
 	return nil
@@ -631,12 +514,14 @@ func isRenameCrossDeviceOrBusy(err error) bool {
 		return false
 	}
 	// Cross-device link.
-	if le, ok := err.(*os.LinkError); ok {
-		if le.Err == syscall.EXDEV {
+	le := &os.LinkError{}
+	if errors.As(err, &le) {
+		if errors.Is(le.Err, syscall.EXDEV) {
 			return true
 		}
 		// Windows: "The process cannot access the file because it is being used by another process."
-		if errno, ok := le.Err.(syscall.Errno); ok {
+		var errno syscall.Errno
+		if errors.As(le.Err, &errno) {
 			return errno == 32 // ERROR_SHARING_VIOLATION
 		}
 	}
@@ -835,7 +720,7 @@ func validateSessionPath(dir, sessionPath string) (string, string, error) {
 	if err != nil {
 		return "", "", err
 	}
-	if !store.IsSessionTranscriptName(filepath.Base(absPath)) {
+	if !isLegacySessionTranscriptName(filepath.Base(absPath)) {
 		return "", "", fmt.Errorf("not a session file: %s", sessionPath)
 	}
 	rel, err := filepath.Rel(absDir, absPath)
@@ -880,7 +765,7 @@ func validateTrashedSessionPath(dir, sessionPath string) (string, string, string
 	if err != nil {
 		return "", "", "", err
 	}
-	if !store.IsSessionTranscriptName(filepath.Base(absPath)) {
+	if !isLegacySessionTranscriptName(filepath.Base(absPath)) {
 		return "", "", "", fmt.Errorf("not a session file: %s", sessionPath)
 	}
 	rel, err := filepath.Rel(root, absPath)
@@ -892,7 +777,7 @@ func validateTrashedSessionPath(dir, sessionPath string) (string, string, string
 		return "", "", "", fmt.Errorf("invalid trash session path: %s", sessionPath)
 	}
 	if parts[0] != parts[1] {
-		b, err := os.ReadFile(filepath.Join(root, parts[0], sessionTrashMetaFile))
+		b, err := readFileUTF8(filepath.Join(root, parts[0], sessionTrashMetaFile))
 		if err != nil {
 			return "", "", "", fmt.Errorf("invalid trash session path: %s", sessionPath)
 		}
@@ -928,9 +813,17 @@ type sessionDisplayMap map[string]map[string]string
 type sessionPlannerDisplayMap map[string][]plannerDisplayTurn
 
 type plannerDisplayTurn struct {
+	TurnID   string           `json:"turnId,omitempty"`
 	UserHash string           `json:"userHash"`
 	Messages []HistoryMessage `json:"messages"`
 }
+
+var errCorruptSessionPlannerDisplay = errors.New("corrupt planner display sidecar")
+
+// sessionPlannerDisplayUpdateAfterLoad is a subprocess-test seam. Production
+// leaves it nil; tests use it to force two independent processes into the old
+// stale read-modify-write window without relying on scheduler timing.
+var sessionPlannerDisplayUpdateAfterLoad func()
 
 func messageDisplayKey(content string) string {
 	sum := sha256.Sum256([]byte(content))
@@ -939,7 +832,7 @@ func messageDisplayKey(content string) string {
 
 func loadSessionDisplays(dir string) sessionDisplayMap {
 	m := sessionDisplayMap{}
-	b, err := os.ReadFile(sessionDisplayPath(dir))
+	b, err := readFileUTF8(sessionDisplayPath(dir))
 	if err != nil {
 		return m
 	}
@@ -956,12 +849,30 @@ func loadSessionPlannerDisplays(dir string) sessionPlannerDisplayMap {
 	if strings.TrimSpace(dir) == "" {
 		return m
 	}
-	b, err := os.ReadFile(sessionPlannerDisplayPath(dir))
+	b, err := readFileUTF8(sessionPlannerDisplayPath(dir))
 	if err != nil {
 		return m
 	}
 	_ = json.Unmarshal(b, &m)
 	return m
+}
+
+func loadSessionPlannerDisplaysForUpdate(dir string) (sessionPlannerDisplayMap, error) {
+	m := sessionPlannerDisplayMap{}
+	b, err := readFileUTF8(sessionPlannerDisplayPath(dir))
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return m, nil
+		}
+		return nil, err
+	}
+	if err := json.Unmarshal(b, &m); err != nil {
+		return nil, fmt.Errorf("%w: %w", errCorruptSessionPlannerDisplay, err)
+	}
+	if m == nil {
+		m = sessionPlannerDisplayMap{}
+	}
+	return m, nil
 }
 
 func saveSessionPlannerDisplays(dir string, m sessionPlannerDisplayMap) error {
@@ -972,35 +883,111 @@ func saveSessionPlannerDisplays(dir string, m sessionPlannerDisplayMap) error {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err
 	}
-	tmp, err := os.CreateTemp(dir, ".planner-display.*.tmp")
+	return fileutil.AtomicWriteFile(sessionPlannerDisplayPath(dir), b, 0o600)
+}
+
+func saveOrRemoveSessionPlannerDisplays(dir string, m sessionPlannerDisplayMap) error {
+	if len(m) == 0 {
+		err := os.Remove(sessionPlannerDisplayPath(dir))
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	return saveSessionPlannerDisplays(dir, m)
+}
+
+func updateSessionPlannerDisplays(dir string, recoverCorrupt bool, mutate func(sessionPlannerDisplayMap) bool) error {
+	if strings.TrimSpace(dir) == "" {
+		return errors.New("planner display directory is empty")
+	}
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), sessionSidecarQueueTimeout)
+	defer cancel()
+	release, err := filelock.AcquireWithExternalTimeout(ctx, sessionPlannerDisplayPath(dir)+".lock", sessionPlannerDisplayExternalLockTimeout)
 	if err != nil {
-		return err
+		return fmt.Errorf("lock planner display sidecar: %w", err)
 	}
-	tmpPath := tmp.Name()
-	if _, err := tmp.Write(b); err != nil {
-		tmp.Close()
-		os.Remove(tmpPath)
-		return err
+	defer release()
+
+	m, err := loadSessionPlannerDisplaysForUpdate(dir)
+	if err != nil {
+		if !recoverCorrupt || !errors.Is(err, errCorruptSessionPlannerDisplay) {
+			return err
+		}
+		// A corrupt shared map cannot be edited safely. Destructive cleanup is
+		// allowed to retire the unreadable sidecar so deleted-session display
+		// data does not linger and later records can start from a valid map.
+		if removeErr := os.Remove(sessionPlannerDisplayPath(dir)); removeErr != nil && !os.IsNotExist(removeErr) {
+			return errors.Join(err, removeErr)
+		}
+		m = sessionPlannerDisplayMap{}
 	}
-	if err := tmp.Close(); err != nil {
-		os.Remove(tmpPath)
-		return err
+	if sessionPlannerDisplayUpdateAfterLoad != nil {
+		sessionPlannerDisplayUpdateAfterLoad()
 	}
-	return fileutil.ReplaceFile(tmpPath, sessionPlannerDisplayPath(dir))
+	if !mutate(m) {
+		return nil
+	}
+	return saveOrRemoveSessionPlannerDisplays(dir, m)
 }
 
 func recordSessionPlannerDisplay(dir, sessionPath, userContent string, messages []HistoryMessage) error {
+	return recordSessionPlannerDisplayForTurn(dir, sessionPath, "", userContent, messages)
+}
+
+func recordSessionPlannerDisplayForTurn(dir, sessionPath, turnID, userContent string, messages []HistoryMessage) error {
 	if strings.TrimSpace(sessionPath) == "" || strings.TrimSpace(userContent) == "" || len(messages) == 0 {
 		return nil
 	}
-	m := loadSessionPlannerDisplays(dir)
 	key := filepath.Base(sessionPath)
 	turn := plannerDisplayTurn{
+		TurnID:   strings.TrimSpace(turnID),
 		UserHash: messageDisplayKey(userContent),
 		Messages: cloneHistoryMessages(messages),
 	}
-	m[key] = append(m[key], turn)
-	return saveSessionPlannerDisplays(dir, m)
+	return updateSessionPlannerDisplays(dir, false, func(m sessionPlannerDisplayMap) bool {
+		if turn.TurnID != "" {
+			for i := range m[key] {
+				if m[key][i].TurnID == turn.TurnID {
+					m[key][i] = turn
+					return true
+				}
+			}
+		}
+		m[key] = append(m[key], turn)
+		return true
+	})
+}
+
+func removeSessionPlannerDisplay(dir, sessionPath string) error {
+	if strings.TrimSpace(sessionPath) == "" {
+		return nil
+	}
+	key := filepath.Base(sessionPath)
+	return updateSessionPlannerDisplays(dir, true, func(m sessionPlannerDisplayMap) bool {
+		if _, ok := m[key]; !ok {
+			return false
+		}
+		delete(m, key)
+		return true
+	})
+}
+
+func pruneSessionPlannerDisplays(dir string, protected map[string]struct{}) error {
+	return updateSessionPlannerDisplays(dir, true, func(m sessionPlannerDisplayMap) bool {
+		changed := false
+		for key := range m {
+			if sessionDisplayKeyStillOwned(dir, key, protected) {
+				continue
+			}
+			delete(m, key)
+			changed = true
+		}
+		return changed
+	})
 }
 
 func sessionPlannerDisplayTurns(dir, sessionPath string) []plannerDisplayTurn {
@@ -1017,6 +1004,7 @@ func sessionPlannerDisplayTurns(dir, sessionPath string) []plannerDisplayTurn {
 			continue
 		}
 		out = append(out, plannerDisplayTurn{
+			TurnID:   turn.TurnID,
 			UserHash: turn.UserHash,
 			Messages: cloneHistoryMessages(turn.Messages),
 		})
@@ -1032,21 +1020,7 @@ func saveSessionDisplays(dir string, m sessionDisplayMap) error {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err
 	}
-	tmp, err := os.CreateTemp(dir, ".display.*.tmp")
-	if err != nil {
-		return err
-	}
-	tmpPath := tmp.Name()
-	if _, err := tmp.Write(b); err != nil {
-		tmp.Close()
-		os.Remove(tmpPath)
-		return err
-	}
-	if err := tmp.Close(); err != nil {
-		os.Remove(tmpPath)
-		return err
-	}
-	return fileutil.ReplaceFile(tmpPath, sessionDisplayPath(dir))
+	return fileutil.AtomicWriteFile(sessionDisplayPath(dir), b, 0o600)
 }
 
 func saveOrRemoveSessionDisplays(dir string, m sessionDisplayMap) error {
@@ -1060,17 +1034,44 @@ func saveOrRemoveSessionDisplays(dir string, m sessionDisplayMap) error {
 	return saveSessionDisplays(dir, m)
 }
 
+// updateSessionDisplays serializes the display sidecar's read-modify-write
+// cycle. Parallel tabs can record display text concurrently; atomic rename
+// protects readers from partial JSON but cannot prevent the last writer from
+// replacing another tab's freshly added keys (#6873).
+func updateSessionDisplays(dir string, mutate func(sessionDisplayMap) bool) error {
+	if strings.TrimSpace(dir) == "" {
+		return errors.New("display directory is empty")
+	}
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), sessionSidecarQueueTimeout)
+	defer cancel()
+	release, err := filelock.AcquireWithExternalTimeout(ctx, sessionDisplayPath(dir)+".lock", sessionDisplayExternalLockTimeout)
+	if err != nil {
+		return fmt.Errorf("lock display sidecar: %w", err)
+	}
+	defer release()
+
+	m := loadSessionDisplays(dir)
+	if !mutate(m) {
+		return nil
+	}
+	return saveOrRemoveSessionDisplays(dir, m)
+}
+
 func removeSessionDisplayKey(dir, key string) error {
 	key = strings.TrimSpace(key)
 	if key == "" {
 		return nil
 	}
-	m := loadSessionDisplays(dir)
-	if m[key] == nil {
-		return nil
-	}
-	delete(m, key)
-	return saveOrRemoveSessionDisplays(dir, m)
+	return updateSessionDisplays(dir, func(m sessionDisplayMap) bool {
+		if m[key] == nil {
+			return false
+		}
+		delete(m, key)
+		return true
+	})
 }
 
 func removeSessionDisplay(dir, sessionPath string) error {
@@ -1081,22 +1082,20 @@ func removeSessionDisplay(dir, sessionPath string) error {
 }
 
 func pruneSessionDisplays(dir string, protected map[string]struct{}) error {
-	m := loadSessionDisplays(dir)
-	if len(m) == 0 {
-		return nil
-	}
-	changed := false
-	for key := range m {
-		if sessionDisplayKeyStillOwned(dir, key, protected) {
-			continue
+	return updateSessionDisplays(dir, func(m sessionDisplayMap) bool {
+		if len(m) == 0 {
+			return false
 		}
-		delete(m, key)
-		changed = true
-	}
-	if !changed {
-		return nil
-	}
-	return saveOrRemoveSessionDisplays(dir, m)
+		changed := false
+		for key := range m {
+			if sessionDisplayKeyStillOwned(dir, key, protected) {
+				continue
+			}
+			delete(m, key)
+			changed = true
+		}
+		return changed
+	})
 }
 
 func sessionDisplayKeyStillOwned(dir, key string, protected map[string]struct{}) bool {
@@ -1131,13 +1130,14 @@ func recordSessionDisplay(dir, sessionPath, content, display string) error {
 	if strings.TrimSpace(sessionPath) == "" || content == display || strings.TrimSpace(display) == "" {
 		return nil
 	}
-	m := loadSessionDisplays(dir)
-	key := filepath.Base(sessionPath)
-	if m[key] == nil {
-		m[key] = map[string]string{}
-	}
-	m[key][messageDisplayKey(content)] = display
-	return saveSessionDisplays(dir, m)
+	return updateSessionDisplays(dir, func(m sessionDisplayMap) bool {
+		key := filepath.Base(sessionPath)
+		if m[key] == nil {
+			m[key] = map[string]string{}
+		}
+		m[key][messageDisplayKey(content)] = display
+		return true
+	})
 }
 
 // sessionDisplayResolver loads the sidecar once and returns a per-message
@@ -1154,7 +1154,7 @@ func sessionDisplayResolverFromMap(displays sessionDisplayMap, sessionPath strin
 				return display
 			}
 		}
-		return control.StripComposePrefixes(content)
+		return historyReplayUserContent(content)
 	}
 }
 

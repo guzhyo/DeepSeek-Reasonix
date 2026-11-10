@@ -12,11 +12,14 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"time"
 
 	"reasonix/internal/agent"
+	"reasonix/internal/proc"
+	"reasonix/internal/secrets"
 )
 
 const (
@@ -141,10 +144,8 @@ func (c *botProjectCollector) add(root, source string) {
 	if source == "" {
 		return
 	}
-	for _, existing := range entry.Sources {
-		if existing == source {
-			return
-		}
+	if slices.Contains(entry.Sources, source) {
+		return
 	}
 	entry.Sources = append(entry.Sources, source)
 }
@@ -365,8 +366,8 @@ func botSessionPathFromTarget(target string) string {
 	if target == "" {
 		return ""
 	}
-	if strings.HasPrefix(target, "path:") {
-		return canonicalBotPath(strings.TrimPrefix(target, "path:"))
+	if after, ok := strings.CutPrefix(target, "path:"); ok {
+		return canonicalBotPath(after)
 	}
 	if filepath.IsAbs(target) && strings.HasSuffix(target, ".jsonl") {
 		return canonicalBotPath(target)
@@ -497,7 +498,7 @@ func formatBotProjects(projects []botProjectEntry, query string, limit int) stri
 	}
 	var b strings.Builder
 	fmt.Fprintf(&b, "项目索引（%d/%d）：", limit, len(matches))
-	for i := 0; i < limit; i++ {
+	for i := range limit {
 		project := matches[i]
 		fmt.Fprintf(&b, "\n%s %s — %s", project.ID, project.Name, displayBotPath(project.Root))
 		if len(project.Sources) > 0 {
@@ -523,7 +524,7 @@ func formatBotSessions(sessions []botSessionEntry, query string, limit int) stri
 	}
 	var b strings.Builder
 	fmt.Fprintf(&b, "会话索引（%d/%d）：", limit, len(matches))
-	for i := 0; i < limit; i++ {
+	for i := range limit {
 		session := matches[i]
 		project := firstNonEmptyString(session.ProjectName, "global")
 		fmt.Fprintf(&b, "\n%s %s", session.ID, project)
@@ -557,7 +558,7 @@ func formatBotProjectSearchResults(results []botProjectSearchResult, limit int) 
 	}
 	var b strings.Builder
 	fmt.Fprintf(&b, "跨项目检索结果（%d/%d）：", limit, len(results))
-	for i := 0; i < limit; i++ {
+	for i := range limit {
 		result := results[i]
 		project := firstNonEmptyString(result.ProjectName, result.ProjectID)
 		fmt.Fprintf(&b, "\n- %s %s:%d: %s", project, displayBotPath(result.Path), result.Line, singleLineBotText(result.Text, 120))
@@ -615,7 +616,11 @@ func searchBotProjectsWithRG(ctx context.Context, rg string, projects []botProje
 		query,
 	}
 	args = append(args, roots...)
-	cmd := exec.CommandContext(ctx, rg, args...)
+	cmd := proc.CommandContext(ctx, rg, args...)
+	cmd.Env = secrets.ProcessEnv()
+	// The desktop app hosts bot bridges in the GUI process; without this an
+	// rg search flashes a console window on Windows.
+	proc.HideWindow(cmd)
 	out, err := cmd.Output()
 	if err != nil {
 		var exitErr *exec.ExitError

@@ -38,6 +38,7 @@ func TestSessionDataGuardDeniesSessionStores(t *testing.T) {
 		projectSession,
 		filepath.Join(root, "sessions", "sub", "new.jsonl"),                     // not-yet-existing file under the store
 		filepath.Join(root, "projects", "any-slug", "sessions", "x.jsonl.meta"), // CAS ledger sidecar
+		filepath.Join(root, "projects", "@assigned", ".workspace-root"),         // project state ownership
 	} {
 		if err := g.Check(target); err == nil {
 			t.Errorf("Check(%q) = nil, want session-data denial", target)
@@ -136,6 +137,65 @@ func TestSessionDataGuardZeroValueUnconfined(t *testing.T) {
 	}
 }
 
+func TestSessionDataGuardDeniesSecurityBoundaryFiles(t *testing.T) {
+	root, _, _ := stateRootFor(t)
+	g := NewSessionDataGuard(root, nil)
+
+	// settings.json holds the global hooks (arbitrary shell commands run on
+	// every future session), so it remains a security boundary.
+	target := filepath.Join(root, "settings.json")
+	if err := g.Check(target); err == nil {
+		t.Errorf("Check(%q) = nil, want security-boundary denial", target)
+	} else if !strings.Contains(err.Error(), "security boundary") {
+		t.Errorf("Check(%q) error %q should name the security boundary", target, err)
+	}
+	if err := g.Check(filepath.Join(root, "trust.json")); err != nil {
+		t.Errorf("obsolete trust.json should not remain a security boundary: %v", err)
+	}
+	// The same names nested below the state root are ordinary files (a project
+	// checkout under a home workspace may legitimately contain them).
+	if err := g.Check(filepath.Join(root, "backups", "settings.json")); err != nil {
+		t.Errorf("nested settings.json should be writable: %v", err)
+	}
+	// An explicit allow_write entry stays the sanctioned escape hatch.
+	allowed := NewSessionDataGuard(root, []string{root})
+	if err := allowed.Check(filepath.Join(root, "settings.json")); err == nil {
+		t.Error("allow_write of the state root is an ancestor and must not lift settings.json")
+	}
+	fileAllow := NewSessionDataGuard(root, []string{filepath.Join(root, "settings.json")})
+	if err := fileAllow.Check(filepath.Join(root, "settings.json")); err != nil {
+		t.Errorf("explicit allow_write of settings.json should pass, got %v", err)
+	}
+}
+
+func TestSessionDataGuardSecurityFilesCaseVariantOnFoldingSystems(t *testing.T) {
+	if !foldPaths {
+		t.Skip("case-sensitive default filesystem: a case variant is a genuinely different path")
+	}
+	root, _, _ := stateRootFor(t)
+	g := NewSessionDataGuard(root, nil)
+	if err := g.Check(filepath.Join(root, "Settings.JSON")); err == nil {
+		t.Fatal("case variant of settings.json reaches the same bytes on this filesystem and must be denied")
+	}
+}
+
+func TestSessionDataGuardHomeAncestorDoesNotLiftSessions(t *testing.T) {
+	root, cliSession, _ := stateRootFor(t)
+	home := filepath.Dir(root)
+	if home == "." || home == string(filepath.Separator) {
+		home = t.TempDir()
+		root = filepath.Join(home, "state")
+		if err := os.MkdirAll(filepath.Join(root, "sessions"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		cliSession = filepath.Join(root, "sessions", "x.json")
+	}
+	g := NewSessionDataGuard(root, []string{home})
+	if err := g.Check(cliSession); err == nil {
+		t.Fatal("allow_write of $HOME must not lift session-store protection")
+	}
+}
+
 func TestSessionDataGuardAllowWriteEscapeHatch(t *testing.T) {
 	root, cliSession, projectSession := stateRootFor(t)
 	g := NewSessionDataGuard(root, []string{filepath.Join(root, "sessions")})
@@ -154,7 +214,7 @@ func TestWriteToolsRejectSessionData(t *testing.T) {
 	// Workspace root covers the state root — the accidental self-write shape
 	// (e.g. a home-directory workspace).
 	guard := NewSessionDataGuard(root, nil)
-	tools := ConfineWriters([]string{root}, guard)
+	tools := ConfineWriters([]string{root}, guard, ManagedConfigPaths{})
 
 	argsFor := func(name, target string) json.RawMessage {
 		var m map[string]any
@@ -278,12 +338,13 @@ func TestSessionDataGuardCommandHintRelativeFromStateRoot(t *testing.T) {
 }
 
 func TestBashAppendsSessionDataHint(t *testing.T) {
+	requirePOSIXShellTest(t)
 	root, cliSession, _ := stateRootFor(t)
 	guard := NewSessionDataGuard(root, nil)
 	b := ConfineBash(sandbox.Spec{Mode: "off"}, guard)
 
 	args, _ := json.Marshal(map[string]string{"command": "echo " + cliSession})
-	out, err := b.Execute(context.Background(), args)
+	out, err := b.Execute(fullAccessBashTestContext(t.Context()), args)
 	if err != nil {
 		t.Fatalf("bash: %v", err)
 	}
@@ -292,7 +353,7 @@ func TestBashAppendsSessionDataHint(t *testing.T) {
 	}
 	// An ordinary command stays clean.
 	args, _ = json.Marshal(map[string]string{"command": "echo hello"})
-	out, err = b.Execute(context.Background(), args)
+	out, err = b.Execute(fullAccessBashTestContext(t.Context()), args)
 	if err != nil {
 		t.Fatalf("bash: %v", err)
 	}

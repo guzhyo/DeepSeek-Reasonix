@@ -10,10 +10,14 @@
 //	                             encrypted minisign private key in $MINISIGN_PRIVATE_KEY
 //	                             (decrypted with $MINISIGN_PASSWORD).
 //
-//	manifest <dir> <ver> <tag>   Scan <dir> for the per-platform artifacts, compute
+//	manifest <dir> <ver> <tag> [notes-ver]
+//	                             Scan <dir> for the per-platform artifacts, compute
 //	                             size + sha256, and write <dir>/latest.json with GitHub
 //	                             release download URLs. The R2 mirror step rewrites those
 //	                             URLs to the CDN afterwards (url + sig fields together).
+//
+//	windows-payload <dir> <ver> Write a deterministic manifest of the installer
+//	                             executables and every file under <dir>/app.
 package main
 
 import (
@@ -23,6 +27,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -30,12 +35,27 @@ import (
 	"aead.dev/minisign"
 
 	"reasonix/desktop/internal/update"
+	"reasonix/internal/installlayout"
 )
 
-// platforms are the manifest keys we publish. A built artifact is matched to a key
-// by substring (file names embed the key, e.g. Reasonix-darwin-arm64.zip), so the
-// generator and the updater agree on update.PlatformKey output.
-var platforms = []string{"darwin-arm64", "darwin-amd64", "windows-amd64", "windows-arm64", "linux-amd64"}
+var websiteDownloads = map[string]struct{}{
+	"Reasonix-darwin-arm64.dmg":     {},
+	"Reasonix-darwin-amd64.dmg":     {},
+	"Reasonix-darwin-universal.dmg": {},
+	"Reasonix-windows-amd64.zip":    {},
+}
+
+var updaterArtifacts = map[string]struct {
+	key  string
+	kind string
+}{
+	"Reasonix-darwin-arm64.zip":            {key: "darwin-arm64", kind: artifactPortable},
+	"Reasonix-darwin-amd64.zip":            {key: "darwin-amd64", kind: artifactPortable},
+	"Reasonix-windows-amd64-installer.exe": {key: "windows-amd64", kind: artifactPortable},
+	"Reasonix-windows-arm64-installer.exe": {key: "windows-arm64", kind: artifactPortable},
+	"Reasonix-linux-amd64.tar.gz":          {key: "linux-amd64", kind: artifactPortable},
+	"Reasonix-linux-amd64.deb":             {key: "linux-amd64", kind: artifactNative},
+}
 
 func main() {
 	if len(os.Args) < 2 {
@@ -46,10 +66,19 @@ func main() {
 	case "sign":
 		err = signFiles(os.Args[2:])
 	case "manifest":
-		if len(os.Args) != 5 {
+		if len(os.Args) != 5 && len(os.Args) != 6 {
 			usage()
 		}
-		err = genManifest(os.Args[2], os.Args[3], os.Args[4])
+		notesVersion := os.Args[3]
+		if len(os.Args) == 6 {
+			notesVersion = os.Args[5]
+		}
+		err = genManifest(os.Args[2], os.Args[3], os.Args[4], notesVersion)
+	case "windows-payload":
+		if len(os.Args) != 4 {
+			usage()
+		}
+		err = genWindowsPayloadManifest(os.Args[2], os.Args[3])
 	case "genkey":
 		if len(os.Args) != 3 {
 			usage()
@@ -70,8 +99,77 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage:\n  sign <file>...\n  manifest <dir> <version> <tag>\n  genkey <dir>\n  verify <file>")
+	fmt.Fprintln(os.Stderr, "usage:\n  sign <file>...\n  manifest <dir> <version> <tag> [notes-version]\n  windows-payload <dir> <version>\n  genkey <dir>\n  verify <file>")
 	os.Exit(2)
+}
+
+func genWindowsPayloadManifest(dir, version string) error {
+	hashes := make(map[string]string)
+	for _, name := range update.WindowsPayloadFileNames() {
+		sum, err := hashRegularFile(filepath.Join(dir, name))
+		if err != nil {
+			return fmt.Errorf("Windows payload %s: %w", name, err)
+		}
+		hashes[name] = sum
+	}
+	if err := hashWindowsPayloadTree(dir, hashes); err != nil {
+		return err
+	}
+	b, err := update.EncodeWindowsPayloadManifest(version, hashes)
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(filepath.Join(dir, update.WindowsPayloadManifestName), b, 0o644)
+}
+
+// hashWindowsPayloadTree records every regular file under dir/app with its
+// forward-slash name; a symlink anywhere in the tree fails the build.
+func hashWindowsPayloadTree(dir string, hashes map[string]string) error {
+	root := filepath.Join(dir, installlayout.AppShellDirName)
+	info, err := os.Lstat(root)
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("Windows payload %s: %w", installlayout.AppShellDirName, err)
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("Windows payload %s is not a directory", installlayout.AppShellDirName)
+	}
+	return filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		rel, relErr := filepath.Rel(dir, path)
+		if relErr != nil {
+			return relErr
+		}
+		name := filepath.ToSlash(rel)
+		if d.Type()&fs.ModeSymlink != 0 {
+			return fmt.Errorf("Windows payload %s: symlinks are not allowed", name)
+		}
+		if d.IsDir() {
+			return nil
+		}
+		sum, err := hashRegularFile(path)
+		if err != nil {
+			return fmt.Errorf("Windows payload %s: %w", name, err)
+		}
+		hashes[name] = sum
+		return nil
+	})
+}
+
+func hashRegularFile(path string) (string, error) {
+	info, err := os.Lstat(path)
+	if err != nil {
+		return "", err
+	}
+	if !info.Mode().IsRegular() {
+		return "", fmt.Errorf("not a regular file")
+	}
+	_, sum, err := hashFile(path)
+	return sum, err
 }
 
 // verifyFile checks <file> against <file>.minisig using the embedded public key —
@@ -164,15 +262,29 @@ func signFiles(files []string) error {
 // genManifest scans dir for the per-platform artifacts and writes dir/latest.json.
 // version is the semver compared by the updater (e.g. "v1.1.0"); tag is the GitHub
 // release tag used in download URLs (e.g. "desktop-v1.1.0").
-func genManifest(dir, version, tag string) error {
+//
+// Portable updater channels land in platforms (tarballs/installers). Debian/Ubuntu
+// .deb packages land only in native_packages so older clients keep resolving the
+// tarball under platforms["linux-amd64"].
+func genManifest(dir, version, tag string, notesVersions ...string) error {
 	repo := os.Getenv("GITHUB_REPOSITORY")
 	if repo == "" || repo == "esengine/reasonix" {
 		repo = "esengine/DeepSeek-Reasonix"
 	}
+	notesVersion := version
+	if len(notesVersions) > 1 {
+		return fmt.Errorf("manifest: expected at most one release-notes version")
+	}
+	if len(notesVersions) == 1 {
+		notesVersion = notesVersions[0]
+	}
 	m := update.Manifest{
-		Version:      version,
-		DownloadPage: "https://reasonix.io/#start",
-		Platforms:    map[string]update.Asset{},
+		Version:         version,
+		DownloadPage:    "https://reasonix.io/?download=desktop#start",
+		ReleaseNotesURL: "https://reasonix.io/changelog/" + notesVersion + "/",
+		Platforms:       map[string]update.Asset{},
+		NativePackages:  map[string]update.Asset{},
+		Downloads:       map[string]update.Asset{},
 	}
 	entries, err := os.ReadDir(dir)
 	if err != nil {
@@ -183,8 +295,9 @@ func genManifest(dir, version, tag string) error {
 		if e.IsDir() || strings.HasSuffix(name, ".minisig") || name == "latest.json" {
 			continue
 		}
-		key := matchPlatform(name)
-		if key == "" {
+		key, kind := matchArtifact(name)
+		_, websiteDownload := websiteDownloads[name]
+		if key == "" && !websiteDownload {
 			continue
 		}
 		size, sum, err := hashFile(filepath.Join(dir, name))
@@ -192,11 +305,31 @@ func genManifest(dir, version, tag string) error {
 			return err
 		}
 		url := fmt.Sprintf("https://github.com/%s/releases/download/%s/%s", repo, tag, name)
-		m.Platforms[key] = update.Asset{URL: url, Sig: url + ".minisig", Size: size, SHA256: sum}
-		fmt.Printf("manifest: %s -> %s (%d bytes)\n", key, name, size)
+		asset := update.Asset{URL: url, Sig: url + ".minisig", Size: size, SHA256: sum}
+		asset.InstallLayout = update.ElectronInstallLayout
+		if websiteDownload {
+			m.Downloads[name] = asset
+			fmt.Printf("manifest download: %s (%d bytes)\n", name, size)
+		}
+		if key != "" {
+			switch kind {
+			case artifactNative:
+				m.NativePackages[key] = asset
+				fmt.Printf("manifest native: %s -> %s (%d bytes)\n", key, name, size)
+			default:
+				m.Platforms[key] = asset
+				fmt.Printf("manifest: %s -> %s (%d bytes)\n", key, name, size)
+			}
+		}
 	}
 	if len(m.Platforms) == 0 {
 		return fmt.Errorf("manifest: no platform artifacts found in %s", dir)
+	}
+	if len(m.NativePackages) == 0 {
+		m.NativePackages = nil // omit empty map so older tooling sees a clean document
+	}
+	if len(m.Downloads) == 0 {
+		m.Downloads = nil
 	}
 	b, err := json.MarshalIndent(m, "", "  ")
 	if err != nil {
@@ -205,24 +338,19 @@ func genManifest(dir, version, tag string) error {
 	return os.WriteFile(filepath.Join(dir, "latest.json"), append(b, '\n'), 0o644)
 }
 
-// matchPlatform returns the platform key embedded in a file name, or "" if none.
-func matchPlatform(name string) string {
-	// The .deb is a human-download package (like the macOS .dmg); the Linux updater
-	// channel is the .tar.gz. Skip it so it doesn't shadow the tarball's linux-amd64 key.
-	if strings.HasSuffix(name, ".deb") {
-		return ""
+const (
+	artifactPortable = "portable"
+	artifactNative   = "native"
+)
+
+// matchArtifact returns the platform key and channel kind embedded in a file name,
+// or ("", "") if the file is not a publishable updater/download artifact.
+func matchArtifact(name string) (key, kind string) {
+	artifact, ok := updaterArtifacts[name]
+	if !ok {
+		return "", ""
 	}
-	// The Windows updater channel is the per-arch -installer.exe; the portable .zip
-	// is a human download, so skip it or it would shadow the installer's key.
-	if strings.Contains(name, "windows-") && !strings.HasSuffix(name, "-installer.exe") {
-		return ""
-	}
-	for _, p := range platforms {
-		if strings.Contains(name, p) {
-			return p
-		}
-	}
-	return ""
+	return artifact.key, artifact.kind
 }
 
 // hashFile returns the size and lowercase-hex SHA-256 of a file, streaming it so

@@ -1,59 +1,62 @@
+export type InlineMathDecision = "math" | "literal";
+
+const PURE_NUMBER = /^\d+(?:,\d{3})*(?:\.\d+)?$/;
+
+/**
+ * Decide how an `inlineMath` node produced by remark-math should render.
+ *
+ * Pure-number spans with glued delimiters are mathematical by default
+ * (assistant-ui `escapeCurrencyDollars` parity): prose currency pairs such
+ * as `$5 and $10` never reach this classifier with a numeric body, because
+ * their word-containing spans match no math pattern below and restore
+ * verbatim. Other non-math content is also restored verbatim as text.
+ */
+export function classifyInlineMath(math: string): InlineMathDecision {
+  if (!math || math !== math.trim() || math.includes("\n")) return "literal";
+  if (math.includes("://") || math.includes("](")) return "literal";
+
+  if (PURE_NUMBER.test(math)) return "math";
+
+  // A percentage enclosed in explicit delimiters is mathematical notation.
+  // latexNormalizeForKatex escapes its `%` for KaTeX.
+  if (/^\d+(?:,\d{3})*(?:\.\d+)?%$/.test(math)) return "math";
+
+  // Number followed by variable: implicit multiplication (2.5x, 3y^2).
+  if (/^\d+(?:\.\d+)?[A-Za-z](?:[A-Za-z0-9^_{}]*)?$/.test(math)) return "math";
+  // Number with LaTeX escape: 10\%, 5\cdot3.
+  if (/^\d+(?:\.\d+)?\\(?:%|[A-Za-z]+)(?:\{[^{}]*\})?(?:[A-Za-z0-9\\{}^_+\-*/=<>.()]*)$/.test(math)) return "math";
+
+  // Unary plus/minus: +2, -x, +\alpha, - 3.14.
+  if (/^[+\-]\s*(?:\d+(?:\.\d+)?|[A-Za-z\\])/.test(math)) return "math";
+
+  // LaTeX command (\alpha, \frac{x}{y}, \tfrac12, ...).
+  if (/\\[A-Za-z]+/.test(math)) return "math";
+  if (/[\^_{}|]/.test(math)) return "math";
+  if (/^[+\-=<>±∓]$/.test(math)) return "math";
+  if (/\b(?:alpha|beta|gamma|sum|int|prod|lim|infty|sqrt|frac|sin|cos|tan|log|ln|max|min|partial|nabla|left|right)\b/.test(math)) return "math";
+  if (/^[A-Za-z]{1,6}\s*\([^)]{1,80}\)$/.test(math)) return "math";
+  if (/^[A-Za-z]'{1,}\s*\([^)]{1,80}\)$/.test(math)) return "math";
+  if (/^(?:\(\d+\))+$/.test(math)) return "math";
+  if (/[A-Za-z0-9)\]}]\s*[+\-*/=<>]\s*[+\-]?\s*[A-Za-z0-9([{\\]/.test(math)) return "math";
+
+  // One-sided relation/equality against an implicit operand. The complete
+  // anchors are important: `=1 dollar` must not be accepted by a prefix match.
+  const operand = String.raw`(?:[+\-]?\s*(?:\d+(?:\.\d+)?|[A-Za-z]|\\[A-Za-z]+))`;
+  const relation = String.raw`(?:<=?|>=?|=|≠|≤|≥)`;
+  if (new RegExp(`^(?:${relation}\\s*${operand}|${operand}\\s*${relation})$`).test(math)) return "math";
+
+  if (/^\(?(?:[A-Za-z0-9]|\\[A-Za-z]+)(?:\s*,\s*(?:[A-Za-z0-9]|\\[A-Za-z]+)){1,10}\)?$/.test(math)) return "math";
+  if (/^\[[A-Za-z0-9^_+\-,.\\\s{}]+\]$/.test(math)) return "math";
+
+  if (/[A-Za-z]\s+[A-Za-z]/.test(math)) return "literal";
+  if (/^[A-Z][A-Z0-9_]{1,}$/.test(math)) return "literal";
+  if (/^v\d+(?:\.\d+)*$/i.test(math)) return "literal";
+  if (/^[A-Za-z]{2,}$/.test(math)) return "literal";
+
+  if (/^(?:[A-Za-z]|\\[A-Za-z]+)'{1,}$/.test(math)) return "math";
+  return /^[A-Za-z]$/.test(math) ? "math" : "literal";
+}
+
 export function isLikelyInlineMath(math: string): boolean {
-  if (!math || math !== math.trim() || math.includes("\n")) return false;
-  if (math.includes("://") || math.includes("](")) return false;
-  // Number followed by variable: implicit multiplication (2.5x, 3y^2)
-  if (/^\d+(?:\.\d+)?[A-Za-z](?:[A-Za-z0-9^_{}]*)?$/.test(math)) return true;
-  // Number with LaTeX escape: 10\%, 5\cdot3
-  if (/^\d+(?:\.\d+)?\\(?:%|[A-Za-z]+)(?:\{[^{}]*\})?(?:[A-Za-z0-9\\{}^_+\-*/=<>.()]*)$/.test(math)) return true;
-  // Pure numbers, decimals, and percentages are too often currency or
-  // prose percentages to parse as math. More explicit numeric math
-  // forms are accepted above/below: 2.5x, 10\%, +2, x=50%, etc.
-  if (/^\d+(?:\.\d+)?%?$/.test(math)) return false;
-
-  // Unary plus/minus: +2, -x, +\alpha, - 3.14
-  if (/^[+\-]\s*(?:\d+(?:\.\d+)?|[A-Za-z\\])/.test(math)) return true;
-
-  // LaTeX command (\alpha, \frac{x}{y}, \tfrac12, ...). Do not require a
-  // word boundary after the command name: \tfrac12 / \sqrt2 / \log3 have no
-  // boundary between the command letters and the trailing digit.
-  if (/\\[A-Za-z]+/.test(math)) return true;
-  if (/[\^_{}|]/.test(math)) return true;
-  // Lone math operators are common in physics prose: "the sign of $+$",
-  // "the $<$ relation".
-  if (/^[+\-=<>±∓]$/.test(math)) return true;
-  if (/\b(?:alpha|beta|gamma|sum|int|prod|lim|infty|sqrt|frac|sin|cos|tan|log|ln|max|min|partial|nabla|left|right)\b/.test(math)) return true;
-  // Short identifiers followed by parenthesised arguments cover both
-  // function calls (f(x)) and group notation (SO(3,1), SU(2), GL(n)).
-  if (/^[A-Za-z]{1,6}\s*\([^)]{1,80}\)$/.test(math)) return true;
-  // Primed function call: f'(x), g''(t).
-  if (/^[A-Za-z]'{1,}\s*\([^)]{1,80}\)$/.test(math)) return true;
-  // Permutation cycle notation: (12), (123), (12)(34).
-  if (/^(?:\(\d+\))+$/.test(math)) return true;
-  // Binary operator between operands. The RHS may start with a unary sign:
-  // K = -iJ, p = +\alpha, a = -b.
-  if (/[A-Za-z0-9)\]}]\s*[+\-*/=<>]\s*[+\-]?\s*[A-Za-z0-9([{\\]/.test(math)) return true;
-  // One-sided comparison: < B, > 0, B < — comparison against an implicit
-  // operand is common in prose.
-  if (/^(?:<=?|>=?|≠|≤|≥)\s*[A-Za-z0-9]|[A-Za-z0-9]\s*(?:<=?|>=?|≠|≤|≥)$/.test(math)) return true;
-  // Comma-separated tokens: ordered pairs, tuples, sets (A, B), 1, 2, 3,
-  // \alpha, \beta. Currency/env-var usage never looks like this.
-  if (/^\(?(?:[A-Za-z0-9]|\\[A-Za-z]+)(?:\s*,\s*(?:[A-Za-z0-9]|\\[A-Za-z]+)){1,10}\)?$/.test(math)) return true;
-
-  // Bracketed labels/indexes such as [56], [8], [N], [\mathbf{56}], [56,0^+]
-  // are common in group theory and arrays. Markdown links are rejected above
-  // by the "](" guard.
-  if (/^\[[A-Za-z0-9^_+\-,.\\\s{}]+\]$/.test(math)) return true;
-
-  if (/[A-Za-z]\s+[A-Za-z]/.test(math)) return false;
-  if (/^[A-Z][A-Z0-9_]{1,}$/.test(math)) return false;
-  if (/^v\d+(?:\.\d+)*$/i.test(math)) return false;
-  if (/^[A-Za-z]{2,}$/.test(math)) return false;
-
-  // Letter or Greek command followed by one or more primes: x', S', y'', \psi'.
-  if (/^(?:[A-Za-z]|\\[A-Za-z]+)'{1,}$/.test(math)) return true;
-
-  // Single letter (a-z, A-Z). Uppercase single letters (S, A, G, …) are
-  // common math names (sets, algebras, groups) and $X$ is essentially
-  // never written for the English word I/A by hand.
-  return /^[A-Za-z]$/.test(math);
+  return classifyInlineMath(math) === "math";
 }

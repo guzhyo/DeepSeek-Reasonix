@@ -3,16 +3,22 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"net/http"
 	"regexp"
 	"runtime"
 	"strings"
+
+	"reasonix/internal/config"
 )
 
-// crash_app.go is the crash/feedback/performance reporting surface. Reports are
-// sent only on an explicit user click in the frontend UI — never automatically.
+// crash_app.go is the crash/feedback/performance reporting surface. Frontend
+// reports are sent on an explicit user click. Native fatal/lifecycle reports are
+// queued locally and sent on a later launch only when desktop telemetry is on.
 
 var crashEndpoint = "https://crash.reasonix.io/v1/report"
 
@@ -58,46 +64,106 @@ type crashBreadcrumb struct {
 	Msg string `json:"msg,omitempty"`
 }
 
+type crashDiagnostics struct {
+	SubjectVersion      string `json:"subjectVersion,omitempty"`
+	SubjectBuildCommit  string `json:"subjectBuildCommit,omitempty"`
+	SubjectChannel      string `json:"subjectChannel,omitempty"`
+	ObserverVersion     string `json:"observerVersion,omitempty"`
+	ObserverBuildCommit string `json:"observerBuildCommit,omitempty"`
+	RunID               string `json:"runId,omitempty"`
+	IncidentID          string `json:"incidentId,omitempty"`
+	ProcessRole         string `json:"processRole,omitempty"`
+	LastPhase           string `json:"lastPhase,omitempty"`
+	LastPhaseAt         string `json:"lastPhaseAt,omitempty"`
+	ObservedAt          string `json:"observedAt,omitempty"`
+	TerminationReason   string `json:"terminationReason,omitempty"`
+	CleanupOutcome      string `json:"cleanupOutcome,omitempty"`
+	ExitCode            *int32 `json:"exitCode,omitempty"`
+	Signal              string `json:"signal,omitempty"`
+	Evidence            string `json:"evidence,omitempty"`
+	Category            string `json:"category,omitempty"`
+	LegacyParsed        bool   `json:"legacyParsed,omitempty"`
+}
+
+// webRuntimeDiagnostic and webView2Diagnostic are decode-only: pending reports
+// written by the retired WebView2/WebKitGTK shell must still decode and forward
+// after upgrade. No producer remains under the Electron shell.
+type webRuntimeDiagnostic struct {
+	Engine              string `json:"engine"`
+	Kind                string `json:"kind"`
+	Reason              string `json:"reason"`
+	ExitCode            *int32 `json:"exitCode,omitempty"`
+	ProcessDescription  string `json:"processDescription,omitempty"`
+	FailureSourceModule string `json:"failureSourceModule,omitempty"`
+	RuntimeVersion      string `json:"runtimeVersion"`
+	GPUMode             string `json:"gpuMode"`
+	CompatibilityMode   bool   `json:"compatibilityMode,omitempty"`
+	Recovery            string `json:"recovery"`
+}
+
+type webView2Diagnostic struct {
+	Kind                string `json:"kind"`
+	Reason              string `json:"reason"`
+	ExitCode            *int32 `json:"exitCode,omitempty"`
+	ProcessDescription  string `json:"processDescription,omitempty"`
+	FailureSourceModule string `json:"failureSourceModule,omitempty"`
+	RuntimeVersion      string `json:"runtimeVersion"`
+	GPUDisabled         bool   `json:"gpuDisabled"`
+	Recovery            string `json:"recovery"`
+}
+
 type crashReport struct {
-	Kind           string            `json:"kind"`
-	Version        string            `json:"version"`
-	OS             string            `json:"os"`
-	Arch           string            `json:"arch"`
-	Message        string            `json:"message"`
-	Device         deviceInfo        `json:"device"`
-	SchemaVersion  int               `json:"schemaVersion,omitempty"`
-	Source         string            `json:"source,omitempty"`
-	Label          string            `json:"label,omitempty"`
-	ErrorType      string            `json:"errorType,omitempty"`
-	ErrorMessage   string            `json:"errorMessage,omitempty"`
-	Stack          string            `json:"stack,omitempty"`
-	ComponentStack string            `json:"componentStack,omitempty"`
-	TopFrame       string            `json:"topFrame,omitempty"`
-	BuildCommit    string            `json:"buildCommit,omitempty"`
-	Channel        string            `json:"channel,omitempty"`
-	Language       string            `json:"language,omitempty"`
-	View           string            `json:"view,omitempty"`
-	Breadcrumbs    []crashBreadcrumb `json:"breadcrumbs,omitempty"`
-	OccurredAt     string            `json:"occurredAt,omitempty"`
+	EventID         string                `json:"eventId,omitempty"`
+	DedupKey        string                `json:"dedupKey,omitempty"`
+	InstallID       string                `json:"installId,omitempty"`
+	Kind            string                `json:"kind"`
+	Version         string                `json:"version"`
+	OS              string                `json:"os"`
+	Arch            string                `json:"arch"`
+	Message         string                `json:"message"`
+	Device          deviceInfo            `json:"device"`
+	SchemaVersion   int                   `json:"schemaVersion,omitempty"`
+	Source          string                `json:"source,omitempty"`
+	Label           string                `json:"label,omitempty"`
+	ErrorType       string                `json:"errorType,omitempty"`
+	ErrorMessage    string                `json:"errorMessage,omitempty"`
+	ErrorFamily     string                `json:"errorFamily,omitempty"`
+	Stack           string                `json:"stack,omitempty"`
+	ComponentStack  string                `json:"componentStack,omitempty"`
+	TopFrame        string                `json:"topFrame,omitempty"`
+	FingerprintHint string                `json:"fingerprintHint,omitempty"`
+	BuildCommit     string                `json:"buildCommit,omitempty"`
+	Channel         string                `json:"channel,omitempty"`
+	Language        string                `json:"language,omitempty"`
+	View            string                `json:"view,omitempty"`
+	Breadcrumbs     []crashBreadcrumb     `json:"breadcrumbs,omitempty"`
+	OccurredAt      string                `json:"occurredAt,omitempty"`
+	Diagnostics     *crashDiagnostics     `json:"diagnostics,omitempty"`
+	WebRuntime      *webRuntimeDiagnostic `json:"webRuntime,omitempty"`
+	// WebView2 is retained only so pending reports written by the retired
+	// WebView2 shell can still be decoded and forwarded after upgrade.
+	WebView2 *webView2Diagnostic `json:"webview2,omitempty"`
 }
 
 type frontendCrashPayload struct {
-	SchemaVersion  int               `json:"schemaVersion"`
-	Kind           string            `json:"kind"`
-	Source         string            `json:"source"`
-	Label          string            `json:"label"`
-	Message        string            `json:"message"`
-	ErrorType      string            `json:"errorType"`
-	ErrorMessage   string            `json:"errorMessage"`
-	Stack          string            `json:"stack"`
-	ComponentStack string            `json:"componentStack"`
-	TopFrame       string            `json:"topFrame"`
-	BuildCommit    string            `json:"buildCommit"`
-	Channel        string            `json:"channel"`
-	Language       string            `json:"language"`
-	View           string            `json:"view"`
-	Breadcrumbs    []crashBreadcrumb `json:"breadcrumbs"`
-	OccurredAt     string            `json:"occurredAt"`
+	SchemaVersion   int               `json:"schemaVersion"`
+	Kind            string            `json:"kind"`
+	Source          string            `json:"source"`
+	Label           string            `json:"label"`
+	Message         string            `json:"message"`
+	ErrorType       string            `json:"errorType"`
+	ErrorMessage    string            `json:"errorMessage"`
+	ErrorFamily     string            `json:"errorFamily"`
+	Stack           string            `json:"stack"`
+	ComponentStack  string            `json:"componentStack"`
+	TopFrame        string            `json:"topFrame"`
+	FingerprintHint string            `json:"fingerprintHint"`
+	BuildCommit     string            `json:"buildCommit"`
+	Channel         string            `json:"channel"`
+	Language        string            `json:"language"`
+	View            string            `json:"view"`
+	Breadcrumbs     []crashBreadcrumb `json:"breadcrumbs"`
+	OccurredAt      string            `json:"occurredAt"`
 }
 
 func normalizeReportKind(kind string) (string, bool) {
@@ -151,8 +217,39 @@ func baseCrashReport(kind string) crashReport {
 	}
 }
 
+func ensureCrashIdentity(report *crashReport) error {
+	if report.EventID == "" {
+		value := make([]byte, 16)
+		if _, err := rand.Read(value); err != nil {
+			return fmt.Errorf("generate crash event id: %w", err)
+		}
+		report.EventID = hex.EncodeToString(value)
+	}
+	if report.DedupKey == "" {
+		basis := strings.Join([]string{
+			report.Kind,
+			report.Version,
+			report.Source,
+			report.Label,
+			report.ErrorType,
+			normalizeCrashFingerprintField(report.ErrorMessage),
+			normalizeCrashFingerprintField(report.TopFrame),
+			normalizeCrashFingerprintField(report.FingerprintHint),
+		}, "\n")
+		sum := sha256.Sum256([]byte(basis))
+		report.DedupKey = hex.EncodeToString(sum[:])
+	}
+	return nil
+}
+
+var crashFingerprintNumber = regexp.MustCompile(`\b\d+\b`)
+
+func normalizeCrashFingerprintField(value string) string {
+	return crashFingerprintNumber.ReplaceAllString(strings.ToLower(strings.TrimSpace(value)), "<n>")
+}
+
 func topFrameFromStack(stack string) string {
-	for _, line := range strings.Split(stack, "\n") {
+	for line := range strings.SplitSeq(stack, "\n") {
 		line = strings.TrimSpace(line)
 		if line == "" {
 			continue
@@ -205,14 +302,16 @@ func crashReportFromDetail(kind, detail string) (crashReport, error) {
 		if payloadKind, ok := normalizeReportKind(payload.Kind); ok {
 			r.Kind = payloadKind
 		}
-		r.SchemaVersion = payload.SchemaVersion
+		r.SchemaVersion = currentCrashSchema
 		r.Source = sanitizeCrashField(payload.Source, 32)
 		r.Label = sanitizeCrashField(payload.Label, 64)
 		r.ErrorType = sanitizeCrashField(payload.ErrorType, 128)
 		r.ErrorMessage = sanitizeCrashText(payload.ErrorMessage, maxCrashFieldBytes)
+		r.ErrorFamily = sanitizeCrashField(payload.ErrorFamily, 128)
 		r.Stack = sanitizeCrashText(payload.Stack, maxCrashStackBytes)
 		r.ComponentStack = sanitizeCrashText(payload.ComponentStack, maxCrashStackBytes)
 		r.TopFrame = sanitizeCrashText(payload.TopFrame, 300)
+		r.FingerprintHint = sanitizeCrashText(payload.FingerprintHint, 300)
 		r.BuildCommit = sanitizeCrashField(payload.BuildCommit, 64)
 		r.Channel = sanitizeCrashField(payload.Channel, 32)
 		r.Language = sanitizeCrashField(payload.Language, 64)
@@ -250,10 +349,27 @@ func (a *App) ReportCrash(kind, detail string) error {
 	if err != nil {
 		return err
 	}
+	if err := ensureCrashIdentity(&r); err != nil {
+		return err
+	}
+	if r.Kind == "crash" || r.Kind == "exception" {
+		r.Diagnostics = a.currentCrashDiagnostics("confirmed", "crash")
+		r.Diagnostics.ProcessRole = "renderer"
+		if r.BuildCommit != "" {
+			r.Diagnostics.SubjectBuildCommit = r.BuildCommit
+		}
+	}
 	return postCrashReport(a.reqCtx(), c, crashEndpoint, r)
 }
 
 func postCrashReport(ctx context.Context, c *http.Client, endpoint string, r crashReport) error {
+	// Pending crash files deliberately omit the anonymous installation id. Add
+	// it only at send time, under the same desktop.telemetry opt-in as pings.
+	if cfg, err := config.Load(); err == nil && cfg.DesktopTelemetry() {
+		if id, idErr := installID(); idErr == nil {
+			r.InstallID = id
+		}
+	}
 	body, err := json.Marshal(r)
 	if err != nil {
 		return err

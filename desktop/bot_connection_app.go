@@ -17,6 +17,7 @@ import (
 	"reasonix/internal/bot/weixin"
 	"reasonix/internal/botruntime"
 	"reasonix/internal/config"
+	"reasonix/internal/control"
 )
 
 type BotConnectionCredentialView struct {
@@ -176,7 +177,7 @@ func (a *App) PollBotConnectionInstall(installID string) (BotInstallPollResult, 
 			Access:     botInstallAccess(result.UserID),
 			Credential: config.BotConnectionCredential{AccountID: result.AccountID, TokenEnv: "WEIXIN_BOT_TOKEN"},
 		}, func(c *config.Config) {
-			c.Bot.Enabled = true
+			c.Bot.Enabled = c.Bot.Enabled || config.BotInstallMayEnableGateway(c)
 			c.Bot.Weixin.Enabled = true
 			c.Bot.Weixin.AccountID = result.AccountID
 			c.Bot.Weixin.APIBase = result.BaseURL
@@ -292,6 +293,63 @@ func (a *App) TestBotConnection(id, target string) (BotConnectionDiagnostic, err
 	diag := botConnectionDiagnostic(conn, conn.ID, "ok", "send", "test_send_ok", msg, false)
 	diag.MessageID = result.MessageID
 	return diag, nil
+}
+
+// TestDingtalkBot 向最近交互过的钉钉会话发送测试消息，验证凭据与发送链路。
+func (a *App) TestDingtalkBot() (BotConnectionDiagnostic, error) {
+	cfg, err := a.loadDesktopBotConfig()
+	if err != nil {
+		return botConnectionDiagnostic(nil, "dingtalk", "error", "config", "config_load_failed", err.Error(), true), nil
+	}
+	conn, connID, connOK := dingtalkRuntimeConnection(cfg.Bot.Connections)
+	clientID := strings.TrimSpace(cfg.Bot.Dingtalk.ClientID)
+	if clientID == "" {
+		clientID = os.Getenv(strings.TrimSpace(cfg.Bot.Dingtalk.ClientIDEnv))
+	}
+	secret := strings.TrimSpace(cfg.Bot.Dingtalk.ClientSecret)
+	if secret == "" {
+		secret = os.Getenv(strings.TrimSpace(cfg.Bot.Dingtalk.SecretEnv))
+	}
+	if connOK {
+		if v := strings.TrimSpace(conn.Credential.AppID); v != "" {
+			clientID = v
+		}
+		if v := strings.TrimSpace(conn.Credential.AppSecretEnv); v != "" {
+			secret = os.Getenv(v)
+		}
+	}
+	if clientID == "" || secret == "" {
+		return botConnectionDiagnostic(nil, "dingtalk", "warning", "credential", "dingtalk_secret_missing", "钉钉凭据未配置完整（AppKey / AppSecret）。", false), nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	// domain 传空：匹配任意 domain 的钉钉 adapter（空 domain 视为匹配任意）。
+	result, err := a.botRuntime.TestSendToAdapter(ctx, connID, "", "Reasonix bot 测试消息：钉钉配置与发送链路可用。")
+	if err != nil {
+		if strings.Contains(err.Error(), "requires a known chat") {
+			return botConnectionDiagnostic(nil, "dingtalk", "warning", "send", "dingtalk_test_send_no_chat", "还没有可发送的钉钉会话：请先在钉钉中给机器人发一条消息，之后即可发送测试消息。", false), nil
+		}
+		return botConnectionDiagnostic(nil, "dingtalk", "error", "send", "dingtalk_test_send_failed", err.Error(), true), nil
+	}
+	diag := botConnectionDiagnostic(nil, "dingtalk", "ok", "send", "dingtalk_test_send_ok", "测试消息已发送，请检查钉钉会话。", false)
+	diag.MessageID = result.MessageID
+	return diag, nil
+}
+
+// dingtalkRuntimeConnection 返回第一个启用的钉钉 connection 与运行时 id。
+func dingtalkRuntimeConnection(connections []config.BotConnectionConfig) (config.BotConnectionConfig, string, bool) {
+	for _, conn := range connections {
+		if !conn.Enabled || strings.TrimSpace(conn.Provider) != string(bot.PlatformDingtalk) {
+			continue
+		}
+		return conn, botruntime.ConnectionRuntimeID(conn), true
+	}
+	return config.BotConnectionConfig{}, string(bot.PlatformDingtalk), false
+}
+
+func dingtalkRuntimeConnectionID(connections []config.BotConnectionConfig) string {
+	_, id, _ := dingtalkRuntimeConnection(connections)
+	return id
 }
 
 func botConnectionDiagnostic(conn *config.BotConnectionConfig, id, status, phase, code, message string, reportable bool) BotConnectionDiagnostic {
@@ -531,7 +589,7 @@ func (a *App) pollFeishuConnectionInstall(installID string, session *botInstallS
 		Access:     botInstallAccess(userID),
 		Credential: config.BotConnectionCredential{AppID: appID, AppSecretEnv: secretEnv},
 	}, func(c *config.Config) {
-		c.Bot.Enabled = true
+		c.Bot.Enabled = c.Bot.Enabled || config.BotInstallMayEnableGateway(c)
 		c.Bot.Feishu.Enabled = true
 		c.Bot.Feishu.Domain = domain
 		c.Bot.Feishu.AppID = appID
@@ -557,7 +615,7 @@ func (a *App) upsertBotConnection(conn config.BotConnectionConfig, updateLegacy 
 		conn.Status = "connected"
 	}
 	if normalizeBotConnectionToolApprovalMode(conn.ToolApprovalMode) == "" {
-		conn.ToolApprovalMode = "ask"
+		conn.ToolApprovalMode = control.ToolApprovalWorkspaceWrite
 	}
 	if conn.ID == "" {
 		conn.ID = connectionID(conn.Provider, conn.Domain)
@@ -693,7 +751,7 @@ func postFeishuInstallFormResult(base string, body map[string]string) (map[strin
 	for k, v := range body {
 		reqBody.Set(k, v)
 	}
-	req, err := http.NewRequestWithContext(ctx, "POST", strings.TrimRight(base, "/")+"/oauth/v1/app/registration", strings.NewReader(reqBody.Encode()))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimRight(base, "/")+"/oauth/v1/app/registration", strings.NewReader(reqBody.Encode()))
 	if err != nil {
 		return nil, 0, err
 	}
@@ -781,7 +839,7 @@ func botConnectionConfig(view BotConnectionView) config.BotConnectionConfig {
 		Enabled:          view.Enabled,
 		Status:           strings.TrimSpace(view.Status),
 		Model:            strings.TrimSpace(view.Model),
-		ToolApprovalMode: firstNonEmptyBot(normalizeBotConnectionToolApprovalMode(view.ToolApprovalMode), "ask"),
+		ToolApprovalMode: firstNonEmptyBot(normalizeBotConnectionToolApprovalMode(view.ToolApprovalMode), control.ToolApprovalWorkspaceWrite),
 		WorkspaceRoot:    strings.TrimSpace(view.WorkspaceRoot),
 		Access:           botAccessConfigFromView(view.Access),
 		Credential: config.BotConnectionCredential{
@@ -798,16 +856,10 @@ func botConnectionConfig(view BotConnectionView) config.BotConnectionConfig {
 }
 
 func normalizeBotConnectionToolApprovalMode(mode string) string {
-	switch strings.ToLower(strings.TrimSpace(mode)) {
-	case "ask":
-		return "ask"
-	case "auto":
-		return "auto"
-	case "yolo", "full", "full-access", "bypass":
-		return "yolo"
-	default:
+	if strings.TrimSpace(mode) == "" {
 		return ""
 	}
+	return config.NormalizeToolApprovalMode(mode)
 }
 
 func botConnectionConfigs(views []BotConnectionView) []config.BotConnectionConfig {

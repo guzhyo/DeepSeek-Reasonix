@@ -2,10 +2,7 @@ package cli
 
 import (
 	"context"
-	"errors"
 	"fmt"
-	"os"
-	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -13,6 +10,8 @@ import (
 
 	tea "charm.land/bubbletea/v2"
 	"github.com/charmbracelet/x/ansi"
+
+	"reasonix/internal/gitcmd"
 )
 
 const gitStatusTimeout = 700 * time.Millisecond
@@ -26,11 +25,13 @@ type gitStatus struct {
 	Untracked int
 }
 
-func fetchGitStatus() tea.Cmd {
+// fetchGitStatus reads the status line through repo, the identity the session
+// resolved when it opened.
+func fetchGitStatus(repo gitcmd.Repo) tea.Cmd {
 	return func() tea.Msg {
 		ctx, cancel := context.WithTimeout(context.Background(), gitStatusTimeout)
 		defer cancel()
-		status, err := loadGitStatus(ctx, "")
+		status, err := loadGitStatus(ctx, repo)
 		if err != nil {
 			return gitStatusMsg{}
 		}
@@ -38,23 +39,23 @@ func fetchGitStatus() tea.Cmd {
 	}
 }
 
-func loadGitStatus(ctx context.Context, cwd string) (gitStatus, error) {
-	root, err := runGit(ctx, cwd, "rev-parse", "--show-toplevel")
-	if err != nil {
-		return gitStatus{}, err
-	}
-	root = strings.TrimSpace(root)
-	if root == "" {
-		return gitStatus{}, errors.New("empty git root")
-	}
+func loadGitStatus(ctx context.Context, repo gitcmd.Repo) (gitStatus, error) {
+	return loadGitStatusWithRunner(ctx, repo, runGit)
+}
 
-	status := gitStatus{Repo: filepath.Base(root)}
-	if branch, err := runGit(ctx, root, "symbolic-ref", "--quiet", "--short", "HEAD"); err == nil && strings.TrimSpace(branch) != "" {
+func loadGitStatusWithRunner(ctx context.Context, repo gitcmd.Repo, run func(context.Context, gitcmd.Repo, ...string) (string, error)) (gitStatus, error) {
+	if !repo.Valid() {
+		return gitStatus{}, gitcmd.ErrNotRepository
+	}
+	root := repo.Top()
+
+	status := gitStatus{Repo: filepath.Base(root.WorkTree)}
+	if branch, err := run(ctx, root, "symbolic-ref", "--quiet", "--short", "HEAD"); err == nil && strings.TrimSpace(branch) != "" {
 		status.Branch = strings.TrimSpace(branch)
-	} else if sha, err := runGit(ctx, root, "rev-parse", "--short", "HEAD"); err == nil && strings.TrimSpace(sha) != "" {
+	} else if sha, err := run(ctx, root, "rev-parse", "--short", "HEAD"); err == nil && strings.TrimSpace(sha) != "" {
 		status.Branch = strings.TrimSpace(sha)
 		status.Detached = true
-	} else if ref, err := runGit(ctx, root, "symbolic-ref", "--short", "HEAD"); err == nil && strings.TrimSpace(ref) != "" {
+	} else if ref, err := run(ctx, root, "symbolic-ref", "--short", "HEAD"); err == nil && strings.TrimSpace(ref) != "" {
 		status.Branch = strings.TrimSpace(ref)
 	}
 	if status.Branch == "" {
@@ -62,21 +63,20 @@ func loadGitStatus(ctx context.Context, cwd string) (gitStatus, error) {
 		status.Detached = true
 	}
 
-	if out, err := runGit(ctx, root, "diff", "--numstat", "HEAD", "--"); err == nil {
+	if out, err := run(ctx, root, "diff", "--numstat", "HEAD", "--"); err == nil {
 		status.Added, status.Removed = parseGitNumstat(out)
 	}
-	if out, err := runGit(ctx, root, "status", "--porcelain=v1", "--untracked-files=normal"); err == nil {
+	if out, err := run(ctx, root, "status", "--porcelain=v1", "--untracked-files=normal"); err == nil {
 		status.Untracked = countUntracked(out)
+	}
+	if err := ctx.Err(); err != nil {
+		return gitStatus{}, err
 	}
 	return status, nil
 }
 
-func runGit(ctx context.Context, cwd string, args ...string) (string, error) {
-	cmd := exec.CommandContext(ctx, "git", args...)
-	if cwd != "" {
-		cmd.Dir = cwd
-	}
-	cmd.Env = append(os.Environ(), "GIT_OPTIONAL_LOCKS=0")
+func runGit(ctx context.Context, repo gitcmd.Repo, args ...string) (string, error) {
+	cmd := repo.Command(ctx, args...)
 	out, err := cmd.Output()
 	if err != nil {
 		return "", err
@@ -85,7 +85,7 @@ func runGit(ctx context.Context, cwd string, args ...string) (string, error) {
 }
 
 func parseGitNumstat(out string) (added int, removed int) {
-	for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
+	for line := range strings.SplitSeq(strings.TrimSpace(out), "\n") {
 		if line == "" {
 			continue
 		}
@@ -109,7 +109,7 @@ func parseGitNumstat(out string) (added int, removed int) {
 
 func countUntracked(out string) int {
 	n := 0
-	for _, line := range strings.Split(strings.TrimRight(out, "\n"), "\n") {
+	for line := range strings.SplitSeq(strings.TrimRight(out, "\n"), "\n") {
 		if strings.HasPrefix(line, "?? ") {
 			n++
 		}
@@ -128,7 +128,9 @@ var (
 	statusAutoColor  = cliColor{"#f59e0b", 214}
 	statusPlanColor  = cliColor{"#2563eb", 27}
 	statusYoloColor  = cliColor{"#e5484d", 167}
-	statusShellColor = cliColor{"#16a34a", 71} // green — shell mode indicator
+	statusShellColor = cliColor{"#16a34a", 71}
+	modeTagLight     = cliColor{"#ffffff", 231}
+	modeTagDark      = cliColor{"#111827", 234}
 )
 
 func (m chatTUI) statusModeColor() cliColor {
@@ -206,7 +208,7 @@ func (s gitStatus) dirtyPlain() string {
 	if len(parts) == 0 {
 		return ""
 	}
-	return " (" + strings.Join(parts, " ") + ")"
+	return "  " + strings.Join(parts, " ")
 }
 
 func (s gitStatus) render(repo, branch string) string {
@@ -216,7 +218,9 @@ func (s gitStatus) render(repo, branch string) string {
 	if s.Detached {
 		b.WriteString(yellow(branch))
 	} else {
-		b.WriteString(green(branch))
+		// A branch name is identity, not a success condition. Keep semantic green
+		// for additions and use the theme's readable neutral value colour here.
+		b.WriteString(footerValue(branch))
 	}
 
 	var parts []string
@@ -227,9 +231,8 @@ func (s gitStatus) render(repo, branch string) string {
 		parts = append(parts, yellow(fmt.Sprintf("?%d", s.Untracked)))
 	}
 	if len(parts) > 0 {
-		b.WriteString(dim(" ("))
+		b.WriteString("  ")
 		b.WriteString(strings.Join(parts, " "))
-		b.WriteString(dim(")"))
 	}
 	return b.String()
 }

@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"runtime"
+	"slices"
 	"strings"
 
 	tea "charm.land/bubbletea/v2"
@@ -21,13 +22,19 @@ import (
 
 func (m chatTUI) applyMCPAction(v mcpServerView, action mcpAction) (tea.Model, tea.Cmd) {
 	switch action {
+	case mcpActionMode, mcpActionConnect, mcpActionAuth, mcpActionClearAuth, mcpActionDisable, mcpActionRemove:
+		if m.mcpConnectBusy(v.Name) {
+			return m, nil
+		}
+	}
+	switch action {
 	case mcpActionViewTools:
 		m.mcp.stage = mcpStageTools
 	case mcpActionMode:
 		m.mcp.stage = mcpStageMode
 		m.mcp.mode = mcpModeIndex(v.Tier)
 	case mcpActionEdit:
-		return m.openMCPConfig()
+		return m.openMCPConfig(v)
 	case mcpActionAuth:
 		return m.authenticateMCP(v)
 	case mcpActionClearAuth:
@@ -54,22 +61,73 @@ func (m chatTUI) connectSelectedMCP(v mcpServerView) (tea.Model, tea.Cmd) {
 	if v.Status == "connected" {
 		m.ctrl.DisconnectMCPServer(v.Name)
 	}
-	n, err := m.ctrl.ConnectConfiguredMCPServer(v.Name)
-	if err != nil {
-		m.notice("mcp connect: " + err.Error())
-		return m, nil
+	delete(m.mcpDisabled, v.Name)
+	m.notice("connecting " + v.Name + "…")
+	return m, m.startMCPConnect(v.Name, mcpConnectRetry, nil)
+}
+
+// mcpConnectBusy refuses an action on a server whose connect is in flight:
+// its result would otherwise land on a server the user has since changed.
+func (m *chatTUI) mcpConnectBusy(name string) bool {
+	if !m.mcpConnecting[name] {
+		return false
 	}
-	if m.mcpDisabled != nil {
-		delete(m.mcpDisabled, v.Name)
+	m.notice("mcp: still connecting " + name + " — try again when it finishes")
+	return true
+}
+
+// startMCPConnect runs the handshake off the UI loop: it can take up to the
+// server's startup timeout, and inside Update it would freeze every key.
+func (m *chatTUI) startMCPConnect(name string, cause mcpConnectCause, entry *config.PluginEntry) tea.Cmd {
+	if m.mcpConnecting == nil {
+		m.mcpConnecting = map[string]bool{}
 	}
-	m.host = m.ctrl.Host()
+	m.mcpConnecting[name] = true
+	ctrl := m.ctrl
+	return func() tea.Msg {
+		n, err := ctrl.ConnectConfiguredMCPServer(name)
+		return mcpConnectDoneMsg{server: name, cause: cause, entry: entry, tools: n, err: err}
+	}
+}
+
+func (m *chatTUI) handleMCPConnectDone(msg mcpConnectDoneMsg) {
+	delete(m.mcpConnecting, msg.server)
+	if msg.err == nil && !m.mcpStillWanted(msg.server) {
+		m.ctrl.DisconnectMCPServer(msg.server)
+		m.refreshHostAndInvalidateSlashCatalog()
+		m.refreshMCPManager()
+		m.notice("mcp: dropped the connection to " + msg.server + " — it was disabled or removed while connecting")
+		return
+	}
+	switch {
+	case msg.err != nil && msg.cause == mcpConnectMode:
+		if msg.entry != nil {
+			recordMCPModePluginFailure(m.ctrl, *msg.entry, msg.err)
+		}
+		m.notice("saved connection mode, but connect failed: " + msg.err.Error())
+	case msg.err != nil && msg.cause == mcpConnectAuth:
+		m.notice("MCP authorization saved, but reconnect failed: " + msg.err.Error())
+	case msg.err != nil:
+		m.notice("mcp connect: " + msg.err.Error())
+	case msg.cause == mcpConnectAuth:
+		if m.host != nil {
+			m.host.ClearFailure(msg.server)
+		}
+		m.notice(fmt.Sprintf("authorized and connected %s — %d tools (available next message)", msg.server, msg.tools))
+	default:
+		m.notice(fmt.Sprintf("connected %s — %d tools (available next message)", msg.server, msg.tools))
+	}
+	m.refreshHostAndInvalidateSlashCatalog()
 	m.refreshMCPManager()
-	if m.mcp != nil {
-		m.mcp.stage = mcpStageDetail
-		m.mcp.selectName(v.Name)
+}
+
+// mcpStillWanted reports whether a server that just connected is still
+// configured and not disabled for this session.
+func (m *chatTUI) mcpStillWanted(name string) bool {
+	if m.mcpDisabled[name] {
+		return false
 	}
-	m.notice(fmt.Sprintf("connected %s — %d tools (available next message)", v.Name, n))
-	return m, nil
+	return slices.Contains(m.ctrl.ConfiguredMCPNames(), name)
 }
 
 func (m chatTUI) disableSelectedMCP(v mcpServerView) (tea.Model, tea.Cmd) {
@@ -83,7 +141,7 @@ func (m chatTUI) disableSelectedMCP(v mcpServerView) (tea.Model, tea.Cmd) {
 	}
 	m.mcpDisabled[v.Name] = true
 	m.ctrl.DisconnectMCPServer(v.Name)
-	m.host = m.ctrl.Host()
+	m.refreshHostAndInvalidateSlashCatalog()
 	m.refreshMCPManager()
 	if m.mcp != nil {
 		m.mcp.stage = mcpStageDetail
@@ -116,7 +174,7 @@ func (m chatTUI) removeSelectedMCP() (tea.Model, tea.Cmd) {
 	if m.mcpDisabled != nil {
 		delete(m.mcpDisabled, v.Name)
 	}
-	m.host = m.ctrl.Host()
+	m.refreshHostAndInvalidateSlashCatalog()
 	m.refreshMCPManager()
 	if m.mcp != nil {
 		m.mcp.stage = mcpStageList
@@ -135,20 +193,21 @@ func (m chatTUI) applyMCPMode(tier string) (tea.Model, tea.Cmd) {
 	if !ok {
 		return m, nil
 	}
-	cfg, err := config.Load()
+	workspace := m.mcpWorkspaceRoot()
+	cfg, err := config.LoadForRoot(workspace)
 	if err != nil {
 		m.notice("mcp mode: " + err.Error())
 		return m, nil
 	}
 	found := false
 	var selected config.PluginEntry
-	for i := range cfg.Plugins {
-		if cfg.Plugins[i].Name == v.Name {
-			cfg.Plugins[i].Tier = normalizeMCPTierForCLI(tier)
-			if !cfg.Plugins[i].ShouldAutoStart() {
-				cfg.Plugins[i].AutoStart = mcpBoolPtr(true)
+	for _, entry := range cfg.Plugins {
+		if entry.Name == v.Name {
+			entry.Tier = normalizeMCPTierForCLI(tier)
+			if !entry.ShouldAutoStart() {
+				entry.AutoStart = mcpBoolPtr(true)
 			}
-			selected = cfg.Plugins[i]
+			selected = entry
 			found = true
 			break
 		}
@@ -157,19 +216,16 @@ func (m chatTUI) applyMCPMode(tier string) (tea.Model, tea.Cmd) {
 		m.notice(fmt.Sprintf("mcp mode: no configured MCP server named %q", v.Name))
 		return m, nil
 	}
-	if err := cfg.Save(); err != nil {
+	if _, err := config.UpsertPluginKeepingDecision(workspace, selected); err != nil {
 		m.notice("mcp mode: " + err.Error())
 		return m, nil
 	}
 	if m.mcpDisabled != nil {
 		delete(m.mcpDisabled, v.Name)
 	}
+	var connect tea.Cmd
 	if m.ctrl != nil && !mcpConnected(m.ctrl, v.Name) {
-		if _, err := m.ctrl.ConnectConfiguredMCPServer(v.Name); err != nil {
-			recordMCPModePluginFailure(m.ctrl, selected, err)
-			m.notice("saved connection mode, but connect failed: " + err.Error())
-		}
-		m.host = m.ctrl.Host()
+		connect = m.startMCPConnect(v.Name, mcpConnectMode, &selected)
 	}
 	m.refreshMCPManager()
 	if m.mcp != nil {
@@ -177,7 +233,7 @@ func (m chatTUI) applyMCPMode(tier string) (tea.Model, tea.Cmd) {
 		m.mcp.selectName(v.Name)
 	}
 	m.notice("updated connection mode for " + v.Name)
-	return m, nil
+	return m, connect
 }
 
 func recordMCPModePluginFailure(ctrl control.Capabilities, e config.PluginEntry, err error) {
@@ -196,14 +252,12 @@ func recordMCPModePluginFailure(ctrl control.Capabilities, e config.PluginEntry,
 	}, err)
 }
 
-func (m chatTUI) openMCPConfig() (tea.Model, tea.Cmd) {
-	path := ""
-	if m.mcp != nil {
-		path = m.mcp.snapshot.configPath
+func (m chatTUI) openMCPConfig(v mcpServerView) (tea.Model, tea.Cmd) {
+	fallback := config.UserConfigPath()
+	if m.mcp != nil && strings.TrimSpace(m.mcp.snapshot.configPath) != "" {
+		fallback = m.mcp.snapshot.configPath
 	}
-	if strings.TrimSpace(path) == "" {
-		path = mcpConfigLocation()
-	}
+	path := mcpConfigPathForView(v, fallback)
 	launch, err := mcpEditConfigLaunchCommand(path, exec.LookPath)
 	if err != nil {
 		m.notice("edit config: " + err.Error())
@@ -220,19 +274,37 @@ func (m chatTUI) openMCPConfig() (tea.Model, tea.Cmd) {
 }
 
 func (m chatTUI) authenticateMCP(v mcpServerView) (tea.Model, tea.Cmd) {
-	u := mcpAuthURL(v)
-	if u == "" {
-		m.notice("mcp auth: no authorization URL was returned; view logs for details")
+	if mcpAuthStatus(v) != mcpdiag.AuthRequired {
+		m.notice("mcp auth: this server is not requesting OAuth authorization")
 		return m, nil
 	}
-	cmd, err := mcpOpenCommand(u)
+	executable, err := os.Executable()
 	if err != nil {
 		m.notice("mcp auth: " + err.Error())
 		return m, nil
 	}
+	cmd := exec.Command(executable, "mcp", "auth", v.Name)
+	cmd.Dir = m.mcpWorkspaceRoot()
 	return m, tea.ExecProcess(cmd, func(err error) tea.Msg {
-		return mcpExternalDoneMsg{label: "authorization page", target: u, err: err}
+		return mcpExternalDoneMsg{label: "MCP authorization", target: v.Name, server: v.Name, err: err}
 	})
+}
+
+func (m *chatTUI) handleMCPExternalDone(msg mcpExternalDoneMsg) tea.Cmd {
+	if msg.err != nil {
+		m.notice(msg.label + ": " + msg.err.Error())
+		return nil
+	}
+	if msg.server == "" || m.ctrl == nil {
+		if msg.target != "" {
+			m.notice(msg.label + ": " + msg.target)
+		}
+		return nil
+	}
+	if m.mcpConnectBusy(msg.server) {
+		return nil
+	}
+	return m.startMCPConnect(msg.server, mcpConnectAuth, nil)
 }
 
 func (m chatTUI) clearSelectedMCPAuthentication() (tea.Model, tea.Cmd) {
@@ -252,7 +324,20 @@ func (m chatTUI) clearMCPAuthentication(v mcpServerView) (tea.Model, tea.Cmd) {
 		m.notice("managed MCP servers do not store authentication")
 		return m, nil
 	}
-	_, changed, _, err := config.ClearPluginAuthenticationInSource(v.Name)
+	workspace := m.mcpWorkspaceRoot()
+	if _, err := plugin.ClearHTTPMCPOAuth(plugin.Spec{
+		Name:     v.Name,
+		StateDir: plugin.MCPStateDir(config.ReasonixHomeDir(), workspace, v.Name),
+	}); err != nil {
+		m.notice("clear authentication: " + err.Error())
+		return m, nil
+	}
+	var changed bool
+	err := config.KeepMCPDecisionAcross(workspace, v.Name, func() (config.PluginEntry, error) {
+		updated, didChange, _, cerr := config.ClearPluginAuthenticationInSourceForRoot(workspace, v.Name)
+		changed = didChange
+		return updated, cerr
+	})
 	if err != nil {
 		m.notice("clear authentication: " + err.Error())
 		return m, nil
@@ -262,7 +347,7 @@ func (m chatTUI) clearMCPAuthentication(v mcpServerView) (tea.Model, tea.Cmd) {
 		if h := m.ctrl.Host(); h != nil {
 			h.ClearFailure(v.Name)
 		}
-		m.host = m.ctrl.Host()
+		m.refreshHostAndInvalidateSlashCatalog()
 	}
 	m.refreshMCPManager()
 	if m.mcp != nil {
@@ -298,19 +383,6 @@ func normalizeMCPTierForCLI(tier string) string {
 	default:
 		return "background"
 	}
-}
-
-func mcpConfigLocation() string {
-	if path := config.SourcePath(); path != "" {
-		return path
-	}
-	if _, err := os.Stat(".mcp.json"); err == nil {
-		return ".mcp.json"
-	}
-	if path := config.UserConfigPath(); path != "" {
-		return path
-	}
-	return "reasonix.toml"
 }
 
 type mcpEditConfigLaunch struct {
@@ -385,23 +457,21 @@ func mcpOpenCommand(target string) (*exec.Cmd, error) {
 	}
 }
 
-func mcpAuthURL(v mcpServerView) string {
-	auth := mcpAuthDiagnosis(v)
-	if auth.Status != mcpdiag.AuthRequired {
-		return ""
-	}
-	return strings.TrimSpace(auth.URL)
-}
-
 func mcpAuthStatus(v mcpServerView) string {
 	return mcpAuthDiagnosis(v).Status
 }
 
 func mcpAuthDiagnosis(v mcpServerView) mcpdiag.AuthDiagnosis {
+	var diagnosis mcpdiag.AuthDiagnosis
 	if v.AuthStatus != "" {
-		return mcpdiag.AuthDiagnosis{Status: v.AuthStatus, URL: v.AuthURL}
+		diagnosis = mcpdiag.AuthDiagnosis{Status: v.AuthStatus, URL: v.AuthURL}
+	} else {
+		diagnosis = mcpdiag.DiagnoseAuth(v.Transport, v.Status, v.Error, v.URL, v.authConfigured)
 	}
-	return mcpdiag.DiagnoseAuth(v.Transport, v.Status, v.Error, v.URL, v.authConfigured)
+	if diagnosis.Status != mcpdiag.AuthNone && !mcpdiag.CanUseHTTPMCPOAuth(v.Transport, v.URL, v.authConfigured) {
+		return mcpdiag.AuthDiagnosis{Status: mcpdiag.AuthNone}
+	}
+	return diagnosis
 }
 
 func mcpCanClearAuth(v mcpServerView) bool {

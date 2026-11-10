@@ -5,13 +5,14 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"os"
+	"maps"
 	"strings"
 	"sync"
 	"time"
 
 	"reasonix/internal/agent"
 	"reasonix/internal/control"
+	"reasonix/internal/secrets"
 )
 
 // deferredRebuildRetryInterval is how often the retry loop probes a held
@@ -20,20 +21,43 @@ var deferredRebuildRetryInterval = 2 * time.Second
 
 const deferredStartupBuildLabel = "__startup__"
 
+// deferredRuntimeReloadLabel marks a queued ReloadRuntime in the pending map.
+// Like the startup label it is not a user setting name; the retry loop routes
+// it to the boot.Rebuild reload path instead of a settings rebuild.
+const deferredRuntimeReloadLabel = "__reload__"
+
 // deferredRebuildState tracks tabs whose settings were saved to disk but whose
 // runtime could not refresh, plus tabs whose initial startup failed, because
 // the session lease was held by another Reasonix process. A single background
 // loop probes the lease and replays the rebuild once the other side releases
-// it. The loop only runs after enableDeferredRebuildRetry (the wails startup
+// it. The loop only runs after enableDeferredRebuildRetry (the startup
 // hook); tests that never call it get the pending bookkeeping without a
 // background goroutine.
 type deferredRebuildState struct {
 	mu      sync.Mutex
-	pending map[string]string // tab ID -> setting label for notices
+	pending map[string]deferredRebuildRequest
+	next    uint64
 	enabled bool
 	running bool
 	stopped bool
 	stop    chan struct{}
+}
+
+type deferredRebuildReason uint8
+
+const (
+	deferredSettingsReason deferredRebuildReason = iota
+	deferredStartupReason
+	deferredReloadReason
+)
+
+type deferredRebuildRequest struct {
+	reason    deferredRebuildReason
+	label     string
+	target    *WorkspaceTab
+	runtimeID string
+	revision  string
+	sequence  uint64
 }
 
 // enableDeferredRebuildRetry arms the retry loop; called from startup.
@@ -67,6 +91,24 @@ func (a *App) scheduleDeferredRebuild(tabID, setting string) {
 	if tabID == "" {
 		return
 	}
+	a.mu.RLock()
+	tab := a.tabs[tabID]
+	request := deferredRebuildRequest{label: setting, target: tab}
+	var snapshot modelSettingsSnapshot
+	if tab != nil {
+		request.runtimeID = tab.runtimeID
+		snapshot, _ = tab.Ctrl.(modelSettingsSnapshot)
+	}
+	a.mu.RUnlock()
+	if snapshot != nil {
+		_, request.revision, _ = snapshot.ModelSettingsState()
+	}
+	switch setting {
+	case deferredStartupBuildLabel:
+		request.reason = deferredStartupReason
+	case deferredRuntimeReloadLabel:
+		request.reason = deferredReloadReason
+	}
 	d := &a.deferredRebuild
 	d.mu.Lock()
 	defer d.mu.Unlock()
@@ -74,9 +116,11 @@ func (a *App) scheduleDeferredRebuild(tabID, setting string) {
 		return
 	}
 	if d.pending == nil {
-		d.pending = map[string]string{}
+		d.pending = map[string]deferredRebuildRequest{}
 	}
-	d.pending[tabID] = setting
+	d.next++
+	request.sequence = d.next
+	d.pending[tabID] = request
 	a.startDeferredRebuildLoopLocked()
 }
 
@@ -84,15 +128,20 @@ func (a *App) scheduleDeferredStartupBuild(tabID string) {
 	a.scheduleDeferredRebuild(tabID, deferredStartupBuildLabel)
 }
 
-func isDeferredStartupBuild(setting string) bool {
-	return setting == deferredStartupBuildLabel
-}
-
-func (a *App) clearDeferredRebuild(tabID string) {
+func (a *App) deferredRebuildSequence(tabID string) uint64 {
 	d := &a.deferredRebuild
 	d.mu.Lock()
-	delete(d.pending, tabID)
-	d.mu.Unlock()
+	defer d.mu.Unlock()
+	return d.pending[tabID].sequence
+}
+
+func (a *App) clearDeferredRebuildVersion(tabID string, sequence uint64) {
+	d := &a.deferredRebuild
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if sequence != 0 && d.pending[tabID].sequence == sequence {
+		delete(d.pending, tabID)
+	}
 }
 
 func (a *App) deferredRebuildPending(tabID string) bool {
@@ -153,14 +202,12 @@ func (a *App) deferredRebuildTick(markIdle bool) bool {
 		d.mu.Unlock()
 		return true
 	}
-	pending := make(map[string]string, len(d.pending))
-	for id, setting := range d.pending {
-		pending[id] = setting
-	}
+	pending := make(map[string]deferredRebuildRequest, len(d.pending))
+	maps.Copy(pending, d.pending)
 	d.mu.Unlock()
 
-	for tabID, setting := range pending {
-		a.retryDeferredRebuild(tabID, setting)
+	for tabID, request := range pending {
+		a.retryDeferredRebuild(tabID, request)
 	}
 	return false
 }
@@ -174,18 +221,25 @@ func (a *App) kickDeferredRebuildRetry() {
 	})
 }
 
-func (a *App) retryDeferredRebuild(tabID, setting string) {
+func (a *App) retryDeferredRebuild(tabID string, request deferredRebuildRequest) {
 	if a.ctx == nil {
 		return
 	}
 	tab := a.tabByID(tabID)
-	if tab == nil || tab.ID != tabID {
+	a.mu.RLock()
+	valid := tab != nil && tab == request.target && tab.runtimeID == request.runtimeID
+	a.mu.RUnlock()
+	if !valid {
 		// The tab is gone; nothing left to refresh.
-		a.clearDeferredRebuild(tabID)
+		a.clearDeferredRebuildVersion(tabID, request.sequence)
 		return
 	}
-	if isDeferredStartupBuild(setting) {
-		a.retryDeferredStartupBuild(tabID, tab)
+	if request.reason == deferredStartupReason {
+		a.retryDeferredStartupBuild(tabID, tab, request.sequence)
+		return
+	}
+	if request.reason == deferredReloadReason {
+		a.retryDeferredRuntimeReload(tabID, tab, request.sequence)
 		return
 	}
 	// Hold the rebuild mutex across probe + rebuild: the probe briefly acquires
@@ -193,25 +247,29 @@ func (a *App) retryDeferredRebuild(tabID, setting string) {
 	// would see that probe as "held by another runtime" and spuriously defer.
 	a.runtimeRebuildMu.Lock()
 	defer a.runtimeRebuildMu.Unlock()
-	// rebuildSettingLocked refreshes the active tab only. Wait until the user
-	// is back on this tab so we refresh the runtime the pending setting was
-	// meant for, not whichever tab happens to be focused.
-	if a.activeTab() != tab {
-		return
-	}
+	tab.turnStartMu.Lock()
+	defer tab.turnStartMu.Unlock()
 	ctrl := a.controllerForTab(tab)
 	if ctrl == nil {
 		// Mid-(re)build on another path (provider retarget, workspace repair);
 		// racing a second build+swap against it is what this loop must avoid.
 		return
 	}
-	if controllerHasActiveRuntimeWork(ctrl) {
+	if request.label == "saved model settings" {
+		pending, err := modelSettingsNeedApply(ctrl)
+		if err == nil && !pending {
+			a.clearDeferredRebuildVersion(tabID, request.sequence)
+			return
+		}
+	}
+	if (request.label == "saved model settings" && control.ModelReplacementBlocked(ctrl)) || (request.label != "saved model settings" && controllerHasActiveRuntimeWork(ctrl)) {
 		return
 	}
 	if !a.deferredRebuildLeaseLooksFree(tab) {
 		return
 	}
-	err := a.rebuildSettingLocked(setting)
+	setting := request.label
+	err := a.rebuildSettingTurnLocked(setting, tab, false, setting == "saved model settings")
 	if err == nil {
 		// rebuildSettingLocked already cleared the pending entry for the tab it
 		// refreshed; just announce it.
@@ -227,16 +285,92 @@ func (a *App) retryDeferredRebuild(tabID, setting string) {
 	}
 	// Anything else will not resolve by waiting; give up loudly instead of
 	// retrying forever.
-	a.clearDeferredRebuild(tabID)
+	a.clearDeferredRebuildVersion(tabID, request.sequence)
+	if setting == "saved model settings" {
+		a.mu.Lock()
+		if a.ownsRuntimeTabLocked(tab) && tab.Ctrl == ctrl {
+			tab.modelApplication.failure = &modelSettingsApplyFailure{ctrl, request.revision, modelSettingsIssue("apply_failed", err).Message}
+		}
+		a.mu.Unlock()
+	}
 	slog.Warn("desktop: deferred settings rebuild failed", "setting", setting, "tab", tabID, "err", err)
 	a.warnForTab(tabID, fmt.Sprintf("%s was saved but the session could not refresh: %s", setting, err.Error()))
 }
 
-func (a *App) retryDeferredStartupBuild(tabID string, tab *WorkspaceTab) {
+// retryDeferredRuntimeReload drives one queued ReloadRuntime pass. The
+// probing contract mirrors retryDeferredRebuild: wait for the tab to be
+// active and idle and for its lease to look free, then run the boot.Rebuild
+// reload; busy/lease answers keep waiting, anything else gives up loudly.
+func (a *App) retryDeferredRuntimeReload(tabID string, tab *WorkspaceTab, queuedSequence ...uint64) {
+	sequence := a.deferredRebuildSequence(tabID)
+	if len(queuedSequence) > 0 {
+		sequence = queuedSequence[0]
+	}
+	// Hold the rebuild mutex across probe + reload: the probe briefly
+	// acquires the session lease, and a concurrent rebuild's ensure lease
+	// would read that probe as "held by another runtime" and spuriously
+	// defer (same contract as retryDeferredRebuild).
+	a.runtimeRebuildMu.Lock()
+	defer a.runtimeRebuildMu.Unlock()
+	ctrl := a.controllerForTab(tab)
+	if ctrl == nil {
+		// Mid-(re)build on another path; racing a second build+swap against it
+		// is what this loop must avoid.
+		return
+	}
+	if controllerHasActiveRuntimeWork(ctrl) {
+		return
+	}
+	if !a.deferredRebuildLeaseLooksFree(tab) {
+		return
+	}
+	err := a.reloadRuntimeTurnLocked(tab)
+	if err == nil {
+		// rebuildSettingTurnLocked already cleared the pending entry for the
+		// tab it refreshed; just announce it.
+		a.noticeForTab(tabID, "runtime reloaded after the session went idle")
+		return
+	}
+	if errors.Is(err, agent.ErrSessionLeaseHeld) {
+		return // grabbed back before we could reload; keep waiting
+	}
+	var busy *rebuildBusyError
+	if errors.As(err, &busy) {
+		return // a turn started meanwhile; retry once it finishes
+	}
+	// Anything else will not resolve by waiting; give up loudly instead of
+	// retrying forever. The error may come from provider/config plumbing and
+	// carry credential-shaped values (passwords, resolved API keys) — the
+	// tested helper redacts before the text reaches logs or the frontend.
+	a.clearDeferredRebuildVersion(tabID, sequence)
+	failure := deferredReloadFailedText(err)
+	slog.Warn("desktop: "+failure, "tab", tabID)
+	a.warnForTab(tabID, failure)
+}
+
+// deferredReloadFailedText is the failure line for an unrecoverable deferred
+// reload — the single formatter both the log and the tab warning use, so a
+// credential-shaped error can never reach either sink unredacted.
+func deferredReloadFailedText(err error) string {
+	return "runtime reload failed: " + secrets.RedactCredentials(err.Error())
+}
+
+func (a *App) retryDeferredStartupBuild(tabID string, tab *WorkspaceTab, queuedSequence ...uint64) {
+	sequence := a.deferredRebuildSequence(tabID)
+	if len(queuedSequence) > 0 {
+		sequence = queuedSequence[0]
+	}
 	a.runtimeRebuildMu.Lock()
 	defer a.runtimeRebuildMu.Unlock()
 	if !a.tabHasRetryableStartupLeaseError(tab) {
-		a.clearDeferredRebuild(tabID)
+		a.clearDeferredRebuildVersion(tabID, sequence)
+		return
+	}
+	a.mu.RLock()
+	path := strings.TrimSpace(tab.SessionPath)
+	a.mu.RUnlock()
+	if path != "" && a.attachExistingSessionRuntime(tab, path, a.ctx) {
+		a.clearDeferredRebuildVersion(tabID, sequence)
 		return
 	}
 	if !a.deferredRebuildLeaseLooksFree(tab) {
@@ -244,13 +378,13 @@ func (a *App) retryDeferredStartupBuild(tabID string, tab *WorkspaceTab) {
 	}
 	err := a.rebuildStartupTabLocked(tab)
 	if err == nil {
-		a.clearDeferredRebuild(tabID)
+		a.clearDeferredRebuildVersion(tabID, sequence)
 		return
 	}
 	if errors.Is(err, agent.ErrSessionLeaseHeld) {
 		return
 	}
-	a.clearDeferredRebuild(tabID)
+	a.clearDeferredRebuildVersion(tabID, sequence)
 	slog.Warn("desktop: deferred session startup failed", "tab", tabID, "err", err)
 }
 
@@ -260,7 +394,7 @@ func (a *App) tabHasRetryableStartupLeaseError(tab *WorkspaceTab) bool {
 	}
 	a.mu.RLock()
 	defer a.mu.RUnlock()
-	return a.tabs[tab.ID] == tab && !tab.removed && tab.Ctrl == nil && tab.StartupErrLeaseHeld
+	return a.tabs[tab.ID] == tab && !tab.removed && tab.Ctrl == nil && (tab.StartupErrLeaseHeld || tab.modelApplication.startupRetry)
 }
 
 func (a *App) rebuildStartupTabLocked(tab *WorkspaceTab) error {
@@ -276,7 +410,7 @@ func (a *App) rebuildStartupTabLocked(tab *WorkspaceTab) error {
 		cancel()
 		return nil
 	}
-	if !tab.StartupErrLeaseHeld {
+	if !tab.StartupErrLeaseHeld && !tab.modelApplication.startupRetry {
 		a.mu.Unlock()
 		cancel()
 		return nil
@@ -289,6 +423,7 @@ func (a *App) rebuildStartupTabLocked(tab *WorkspaceTab) error {
 	tab.buildCancel = cancel
 	tab.Ready = false
 	clearTabStartupError(tab)
+	a.setSessionRuntimePhaseLocked(tab, sessionRuntimeStarting, nil)
 	tab.ActivityStatus = ""
 	if tab.sink == nil {
 		tab.sink = &tabEventSink{tabID: tab.ID, app: a, ctx: a.ctx}
@@ -328,6 +463,7 @@ func (a *App) tryRecoverStartupLeaseHeldTab(tab *WorkspaceTab) bool {
 	}
 	a.runtimeRebuildMu.Lock()
 	defer a.runtimeRebuildMu.Unlock()
+	sequence := a.deferredRebuildSequence(tab.ID)
 	if !a.tabHasRetryableStartupLeaseError(tab) {
 		return a.controllerForTab(tab) != nil
 	}
@@ -336,13 +472,13 @@ func (a *App) tryRecoverStartupLeaseHeldTab(tab *WorkspaceTab) bool {
 	}
 	err := a.rebuildStartupTabLocked(tab)
 	if err == nil {
-		a.clearDeferredRebuild(tab.ID)
+		a.clearDeferredRebuildVersion(tab.ID, sequence)
 		return a.controllerForTab(tab) != nil
 	}
 	if errors.Is(err, agent.ErrSessionLeaseHeld) {
 		a.scheduleDeferredStartupBuild(tab.ID)
 	} else {
-		a.clearDeferredRebuild(tab.ID)
+		a.clearDeferredRebuildVersion(tab.ID, sequence)
 	}
 	return false
 }
@@ -366,16 +502,25 @@ func (a *App) deferredRebuildLeaseLooksFree(tab *WorkspaceTab) bool {
 	if path == "" {
 		return true // nothing to probe; let the rebuild decide
 	}
-	lease, err := agent.TryAcquireSessionLease(sessionRuntimeKey(path))
+	key := sessionRuntimeKey(path)
+	a.mu.RLock()
+	rt := a.runtimeBySessionKey[key]
+	ownedByTab := rt != nil && rt.Owner == tab
+	ownedByOther := rt != nil && rt.Owner != nil && rt.Owner != tab && a.runtimeOwnerLiveLocked(rt)
+	a.mu.RUnlock()
+	if ownedByOther {
+		return false
+	}
+	if ownedByTab && tab.sessionLeaseRuntimeKey() == key {
+		return true
+	}
+	lease, err := agent.TryAcquireSessionLease(key)
 	if err != nil {
-		var leaseErr *agent.SessionLeaseError
-		if errors.As(err, &leaseErr) && leaseErr.Info != nil && leaseErr.Info.PID == os.Getpid() {
-			if host, _ := os.Hostname(); leaseErr.Info.Hostname == host {
-				// This process (usually this very tab) holds the probed path;
-				// the blocking lease is some other path. Attempt the rebuild
-				// and let its own lease checks decide.
-				return true
-			}
+		if sameCurrentProcessLease(err) {
+			// The registry ruled out a live sibling owner above, so this is an
+			// orphaned current-process lease. Let the rebuild helper reclaim it
+			// under runtimeRebuildMu instead of looping against our own marker.
+			return true
 		}
 		return !errors.Is(err, agent.ErrSessionLeaseHeld)
 	}

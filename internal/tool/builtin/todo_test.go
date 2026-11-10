@@ -5,184 +5,79 @@ import (
 	"encoding/json"
 	"strings"
 	"testing"
-
-	"reasonix/internal/evidence"
 )
 
-func TestTodoWriteAcceptsLevels(t *testing.T) {
-	args := json.RawMessage(`{"todos":[` +
-		`{"content":"Phase","status":"in_progress","level":0},` +
-		`{"content":"sub","status":"pending","level":1}]}`)
-	if _, err := (todoWrite{}).Execute(context.Background(), args); err != nil {
-		t.Fatalf("levels 0/1 should be accepted: %v", err)
+func executeTodos(t *testing.T, raw string) (todoWriteResponse, error) {
+	t.Helper()
+	out, err := (todoWrite{}).Execute(context.Background(), json.RawMessage(raw))
+	if err != nil {
+		return todoWriteResponse{}, err
+	}
+	var response todoWriteResponse
+	if err := json.Unmarshal([]byte(out), &response); err != nil {
+		t.Fatalf("decode result %q: %v", out, err)
+	}
+	return response, nil
+}
+
+func TestTodoWriteAcceptsWholeListReplacementShapes(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		raw  string
+	}{
+		{"empty", `{"todos":[]}`},
+		{"only pending", `{"todos":[{"content":"one","status":"pending"},{"content":"two","status":"pending"}]}`},
+		{"parallel", `{"todos":[{"content":"one","status":"in_progress"},{"content":"two","status":"in_progress"}]}`},
+		{"out of order", `{"todos":[{"content":"later","status":"completed"},{"content":"earlier","status":"pending"}]}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := executeTodos(t, tc.raw); err != nil {
+				t.Fatalf("replacement rejected: %v", err)
+			}
+		})
 	}
 }
 
-func TestTodoWriteRejectsBadLevel(t *testing.T) {
-	args := json.RawMessage(`{"todos":[{"content":"x","status":"pending","level":2}]}`)
-	_, err := (todoWrite{}).Execute(context.Background(), args)
-	if err == nil || !strings.Contains(err.Error(), "level") {
-		t.Fatalf("level 2 should be rejected with a level error, got %v", err)
+func TestTodoWriteReturnsCanonicalListAndCounts(t *testing.T) {
+	got, err := executeTodos(t, `{"todos":[{"content":"  inspect  ","status":"completed"},{"content":"ship","status":"in_progress"}]}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Todos) != 2 || got.Todos[0].Content != "inspect" || got.Counts.Total != 2 || got.Counts.Completed != 1 || got.Counts.InProgress != 1 {
+		t.Fatalf("canonical response = %+v", got)
 	}
 }
 
-func TestTodoWriteRejectsNewCompletedWithoutCompleteStepReceipt(t *testing.T) {
-	ledger := evidence.NewLedger()
-	ledger.Record(evidence.Receipt{
-		ToolName: "todo_write",
-		Success:  true,
-		Todos:    []evidence.TodoItem{{Content: "Add parser", Status: "in_progress"}},
-	})
-	ctx := evidence.WithLedger(context.Background(), ledger)
-	args := json.RawMessage(`{"todos":[{"content":"Add parser","status":"completed"}]}`)
-
-	_, err := (todoWrite{}).Execute(ctx, args)
-	if err == nil || !strings.Contains(err.Error(), "complete_step") {
-		t.Fatalf("new completion without complete_step should be rejected, got %v", err)
+func TestTodoWriteValidationIsStrictAndNonMutating(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		raw  string
+		want string
+	}{
+		{"unknown item field", `{"todos":[{"content":"one","status":"pending","step_id":"old"}]}`, "unknown field"},
+		{"unknown root field", `{"todos":[],"activeForm":"old"}`, "unknown field"},
+		{"null item", `{"todos":[null]}`, "todos[0] must be an object"},
+		{"missing content", `{"todos":[{"status":"pending"}]}`, "todos[0].content"},
+		{"null content", `{"todos":[{"content":null,"status":"pending"}]}`, "todos[0].content"},
+		{"missing status", `{"todos":[{"content":"one"}]}`, "todos[0].status"},
+		{"null status", `{"todos":[{"content":"one","status":null}]}`, "todos[0].status"},
+		{"blank", `{"todos":[{"content":"  ","status":"pending"}]}`, "todos[0].content"},
+		{"duplicate after trim", `{"todos":[{"content":"one","status":"pending"},{"content":" one ","status":"completed"}]}`, "duplicates"},
+		{"bad status", `{"todos":[{"content":"one","status":"running"}]}`, "todos[0].status"},
+		{"trailing value", `{"todos":[]} {}`, "multiple JSON values"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := executeTodos(t, tc.raw)
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("error = %v, want %q", err, tc.want)
+			}
+		})
 	}
 }
 
-func TestTodoWriteAcceptsNewCompletedWithCompleteStepReceipt(t *testing.T) {
-	ledger := evidence.NewLedger()
-	ledger.Record(evidence.Receipt{
-		ToolName: "todo_write",
-		Success:  true,
-		Todos:    []evidence.TodoItem{{Content: "Add parser", Status: "in_progress"}},
-	})
-	ledger.Record(evidence.Receipt{ToolName: "complete_step", Success: true, Step: "Add parser"})
-	ctx := evidence.WithLedger(context.Background(), ledger)
-	args := json.RawMessage(`{"todos":[{"content":"Add parser","status":"completed"}]}`)
-
-	if _, err := (todoWrite{}).Execute(ctx, args); err != nil {
-		t.Fatalf("matching complete_step should authorize new completion: %v", err)
-	}
-}
-
-func TestTodoWriteAllowsInitialCompletedWithoutBaseline(t *testing.T) {
-	ctx := evidence.WithLedger(context.Background(), evidence.NewLedger())
-	args := json.RawMessage(`{"todos":[{"content":"Add parser","status":"completed"}]}`)
-
-	if _, err := (todoWrite{}).Execute(ctx, args); err != nil {
-		t.Fatalf("initial completed todo without baseline should preserve existing behavior: %v", err)
-	}
-}
-
-func TestTodoWriteRejectsFailedCompleteStepReceipt(t *testing.T) {
-	ledger := evidence.NewLedger()
-	ledger.Record(evidence.Receipt{
-		ToolName: "todo_write",
-		Success:  true,
-		Todos:    []evidence.TodoItem{{Content: "Add parser", Status: "in_progress"}},
-	})
-	ledger.Record(evidence.Receipt{ToolName: "complete_step", Success: false, Step: "Add parser"})
-	ctx := evidence.WithLedger(context.Background(), ledger)
-	args := json.RawMessage(`{"todos":[{"content":"Add parser","status":"completed"}]}`)
-
-	_, err := (todoWrite{}).Execute(ctx, args)
-	if err == nil || !strings.Contains(err.Error(), "complete_step") {
-		t.Fatalf("failed complete_step without proof-bearing recovery should not authorize completion, got %v", err)
-	}
-}
-
-func TestTodoWriteRejectsFailedCompleteStepWithoutProof(t *testing.T) {
-	ledger := evidence.NewLedger()
-	ledger.Record(evidence.Receipt{
-		ToolName: "todo_write",
-		Success:  true,
-		Todos:    []evidence.TodoItem{{Content: "Run project script", Status: "in_progress"}},
-	})
-	ledger.Record(evidence.Receipt{
-		ToolName: "bash",
-		Success:  true,
-		Command:  `python "script.py"`,
-	})
-	ledger.Record(evidence.ReceiptFromToolCall("complete_step", json.RawMessage(`{
-		"step":"Run project script",
-		"result":"script ran",
-		"evidence":[]
-	}`), false, true))
-	ctx := evidence.WithLedger(context.Background(), ledger)
-	args := json.RawMessage(`{"todos":[{"content":"Run project script","status":"completed"}]}`)
-
-	_, err := (todoWrite{}).Execute(ctx, args)
-	if err == nil || !strings.Contains(err.Error(), "complete_step") {
-		t.Fatalf("failed complete_step without proof should not authorize completion, got %v", err)
-	}
-}
-
-func TestTodoWriteRejectsFailedCompleteStepMissingResult(t *testing.T) {
-	ledger := evidence.NewLedger()
-	ledger.Record(evidence.Receipt{
-		ToolName: "todo_write",
-		Success:  true,
-		Todos:    []evidence.TodoItem{{Content: "Run project script", Status: "in_progress"}},
-	})
-	ledger.Record(evidence.Receipt{
-		ToolName: "bash",
-		Success:  true,
-		Command:  `python "script.py"`,
-	})
-	ledger.Record(evidence.ReceiptFromToolCall("complete_step", json.RawMessage(`{
-		"step":"Run project script",
-		"evidence":[{"kind":"manual","summary":"checked manually"}]
-	}`), false, true))
-	ctx := evidence.WithLedger(context.Background(), ledger)
-	args := json.RawMessage(`{"todos":[{"content":"Run project script","status":"completed"}]}`)
-
-	_, err := (todoWrite{}).Execute(ctx, args)
-	if err == nil || !strings.Contains(err.Error(), "complete_step") {
-		t.Fatalf("failed complete_step without result should not authorize completion, got %v", err)
-	}
-}
-
-func TestTodoWriteRecoversAfterFailedCompleteStepWithProgressReceipt(t *testing.T) {
-	ledger := evidence.NewLedger()
-	ledger.Record(evidence.Receipt{
-		ToolName: "todo_write",
-		Success:  true,
-		Todos:    []evidence.TodoItem{{Content: "Run project script", Status: "in_progress"}},
-	})
-	ledger.Record(evidence.Receipt{
-		ToolName: "bash",
-		Success:  true,
-		Command:  `python "script.py"`,
-	})
-	ledger.Record(evidence.ReceiptFromToolCall("complete_step", json.RawMessage(`{
-		"step":"Run project script",
-		"result":"script ran",
-		"evidence":[{"kind":"verification","summary":"script completed","command":"python script.py"}]
-	}`), false, true))
-	ctx := evidence.WithLedger(context.Background(), ledger)
-	args := json.RawMessage(`{"todos":[{"content":"Run project script","status":"completed"}]}`)
-
-	if _, err := (todoWrite{}).Execute(ctx, args); err != nil {
-		t.Fatalf("matching failed complete_step with progress receipt should recover todo completion: %v", err)
-	}
-}
-
-func TestTodoWriteRejectsRecoveryWhenProgressIsAfterFailedCompleteStep(t *testing.T) {
-	ledger := evidence.NewLedger()
-	ledger.Record(evidence.Receipt{
-		ToolName: "todo_write",
-		Success:  true,
-		Todos:    []evidence.TodoItem{{Content: "Run project script", Status: "in_progress"}},
-	})
-	ledger.Record(evidence.ReceiptFromToolCall("complete_step", json.RawMessage(`{
-		"step":"Run project script",
-		"result":"script ran",
-		"evidence":[{"kind":"verification","summary":"script completed","command":"python other.py"}]
-	}`), false, true))
-	ledger.Record(evidence.Receipt{
-		ToolName: "write_file",
-		Success:  true,
-		Paths:    []string{"docs/notes.md"},
-		Write:    true,
-	})
-	ctx := evidence.WithLedger(context.Background(), ledger)
-	args := json.RawMessage(`{"todos":[{"content":"Run project script","status":"completed"}]}`)
-
-	_, err := (todoWrite{}).Execute(ctx, args)
-	if err == nil || !strings.Contains(err.Error(), "complete_step") {
-		t.Fatalf("progress after a failed complete_step should not authorize recovery, got %v", err)
+func TestCompleteStepTombstoneIsActionable(t *testing.T) {
+	_, err := (completeStep{}).Execute(context.Background(), json.RawMessage(`{"result":"done"}`))
+	if err == nil || !strings.Contains(err.Error(), "retired") || !strings.Contains(err.Error(), "todo_write") {
+		t.Fatalf("retirement error = %v", err)
 	}
 }

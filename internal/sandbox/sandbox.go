@@ -1,65 +1,14 @@
 // Package sandbox wraps a shell command in an OS-level jail so the model's
-// `bash` calls are confined: it may read almost freely but write only inside
-// the writable roots (workspace, configured extras, plus temp and toolchain
-// caches), with optional forbid-read roots, and reach the network only when
-// allowed. This is the *enforcement* layer beneath the permission rules
-// (*policy*): a permitted command still cannot escape the box.
-//
-// macOS uses Seatbelt via sandbox-exec, Linux uses bubblewrap when available,
-// and Windows uses Reasonix's bundled native helper: AppContainer for read-only
-// commands, a low-integrity token for writable commands, and a kill-on-close
-// Job Object. When enforce is requested but no OS sandbox backend is available,
-// the bash tool fails closed instead of running the command unwrapped.
-// Confining the in-process file-writer built-ins is handled separately, in
-// package tool/builtin.
+// `bash` calls are confined: reads stay mostly free, writes stay inside the
+// writable roots (workspace, extras, temp and toolchain caches), forbid-read
+// roots are hidden, and network egress is optional. It is the *enforcement*
+// layer beneath the permission rules: a permitted command still cannot escape.
+// macOS uses Seatbelt and Linux uses bubblewrap; where a backend is missing,
+// restricted presets fail closed. Windows has no OS-level shell sandbox (see
+// OSSandboxSupported). File-writer built-ins are confined in tool/builtin.
 package sandbox
 
-import (
-	"crypto/sha256"
-	"encoding/hex"
-	"runtime"
-	"sync/atomic"
-	"time"
-)
-
-// WindowsHelperCommand is an internal CLI subcommand used only by the Windows
-// sandbox wrapper. It is intentionally obscure so it does not collide with
-// public commands.
-const WindowsHelperCommand = "__reasonix_windows_sandbox"
-
-// helperDispatchRegistered records that this binary's entry point routes
-// WindowsHelperCommand to RunWindowsSandboxHelper. The Windows wrapper
-// relaunches os.Executable() as the sandbox helper, so a host binary without
-// that route swallows every sandboxed command: a Wails desktop build, for
-// example, would start a second GUI instance that forwards to the running app
-// and exits 0 with no output (#6051, #6067, #6072). Registration turns that
-// mistake into a fail-closed refusal with a clear error instead of silent
-// empty output: Available() stays false until the entry point registers.
-var helperDispatchRegistered atomic.Bool
-
-// RegisterHelperDispatch declares that the current binary's entry point routes
-// WindowsHelperCommand to RunWindowsSandboxHelper before any other startup
-// work. Every main() that can host the bash tool must add the route and call
-// this; on Windows, enforce mode fails closed without it.
-func RegisterHelperDispatch() { helperDispatchRegistered.Store(true) }
-
-const windowsSandboxFailureMarkerPrefix = "__reasonix_windows_sandbox_failure__:"
-
-// WindowsSandboxFailureMarker returns the helper-only marker printed when the
-// native Windows sandbox backend fails before starting the child command.
-func WindowsSandboxFailureMarker(payload string) string {
-	sum := sha256.Sum256([]byte(payload))
-	return windowsSandboxFailureMarkerPrefix + hex.EncodeToString(sum[:])
-}
-
-// WindowsSandboxFailureMarkerFromCommand extracts the marker expected from a
-// Windows sandbox helper argv produced by Command/CommandArgs.
-func WindowsSandboxFailureMarkerFromCommand(argv []string) (string, bool) {
-	if len(argv) < 4 || argv[1] != WindowsHelperCommand || argv[2] == "" || argv[3] != "--" {
-		return "", false
-	}
-	return WindowsSandboxFailureMarker(argv[2]), true
-}
+import "runtime"
 
 // Spec describes how to confine one command. The zero value (Mode == "") does
 // not enforce, so an unconfigured caller runs commands unchanged.
@@ -67,40 +16,57 @@ type Spec struct {
 	// Mode is "enforce" to wrap the command, anything else (incl. "off" and "")
 	// to run it unwrapped.
 	Mode string
+	// ReadOnly removes every ordinary writable mount/allowance. It is distinct
+	// from an empty WriteRoots slice, whose historical meaning is unconfigured.
+	ReadOnly bool
 	// WriteRoots are directories the command may write to (the workspace root
 	// plus any configured extras). Platforms may add command-scoped temp/cache
 	// roots so builds and package managers keep working without broad writes.
 	WriteRoots []string
-	// ForbidReadRoots are directories the command may not read from when
-	// confined. The OS sandbox denies access to these paths (macOS Seatbelt
-	// deny file-read* rules, Linux bubblewrap --tmpfs overlays); on other
-	// platforms the in-process tools enforce this instead.
+	// ForbidReadRoots are files or directories the command may not read from
+	// when confined. The OS sandbox denies access to these paths (macOS Seatbelt
+	// deny file-read* rules, Linux bubblewrap masks); on other platforms the
+	// in-process tools enforce this instead.
 	ForbidReadRoots []string
 	// Network allows network egress from inside the sandbox. Off blocks it so a
 	// command cannot exfiltrate or fetch; many dev commands (module/package
 	// downloads) need it, so it defaults on at the config layer.
 	Network bool
+	// MinimalWrites omits the broad build-tool cache write allowances used by
+	// the bash sandbox. MCP profiles set it and explicitly provide only their
+	// private state/temp directories (plus approved writer roots).
+	MinimalWrites bool
 	// Shell is the interpreter the bash tool runs under. A zero value (empty
 	// Path) means the tool resolves one itself; the composition root sets it from
 	// [tools.shell] so the configured choice rides along with the spec.
 	Shell Shell
-	// WindowsLockWait bounds how long a Windows-sandboxed run may queue behind
-	// another sandboxed command on the same workspace before failing with a
-	// clear error naming the holder. Zero uses the short interactive default (a
-	// blocked foreground command should fail fast, not hang its turn); the bash
-	// tool passes a longer budget for background jobs, which nobody is blocked
-	// on. Other platforms ignore it. WINDOWS_SANDBOX_LOCK_MS overrides both.
-	WindowsLockWait time.Duration
+	// SessionTemp is the absolute path of the logical-session private temporary
+	// directory for this command. When set, Linux bubblewrap binds it at /tmp
+	// (instead of a fresh tmpfs), and all platforms export TMPDIR/TMP/TEMP so
+	// consecutive Bash calls in the same session share temporary files. Empty
+	// keeps the platform default (ephemeral tmpfs on Linux bwrap, host temp
+	// elsewhere). MCP and other independent sandboxes leave this empty.
+	SessionTemp string
+	// ProtectedWriteRoots are Reasonix session/state paths that stay read-only
+	// even when a broader WriteRoot such as the user's home directory would
+	// otherwise cover them.
+	ProtectedWriteRoots []string
 }
 
 // Enforce reports whether the spec asks for confinement.
 func (s Spec) Enforce() bool { return s.Mode == "enforce" }
 
-// UnavailableMessage explains why an enforced bash sandbox cannot run and gives
-// the user the two durable fixes: install an OS sandbox backend, or opt into the
-// older unconfined behavior explicitly.
+// OSSandboxSupported reports whether this platform can confine shell commands
+// at the OS level. Windows cannot: its restricted-token backend is retired
+// (same-user ACL denies locked hosts out; the token broke common toolchains).
+func OSSandboxSupported() bool { return osSandboxSupportedForGOOS(runtime.GOOS) }
+
+func osSandboxSupportedForGOOS(goos string) bool { return goos != "windows" }
+
+// UnavailableMessage explains why an enforced shell sandbox cannot run and gives
+// the platform-specific remediation.
 func UnavailableMessage() string {
-	return "bash sandbox requested but unavailable on this host; refusing to run unconfined. " + UnavailableRemediation()
+	return "shell sandbox requested but unavailable on this host; refusing to run unconfined. " + UnavailableRemediation()
 }
 
 // UnavailableRemediation is split out so status surfaces can append the same
@@ -108,12 +74,27 @@ func UnavailableMessage() string {
 func UnavailableRemediation() string {
 	switch runtime.GOOS {
 	case "linux":
-		return "Install bubblewrap (`bwrap`) or set [sandbox] bash = \"off\" in config.toml / Settings -> Sandbox to restore pre-1.16 unconfined shell execution."
+		return "Install bubblewrap (`bwrap`), or explicitly select Full access for an unconfined session."
 	case "darwin":
-		return "Ensure `sandbox-exec` is available on PATH or set [sandbox] bash = \"off\" in config.toml / Settings -> Sandbox to restore pre-1.16 unconfined shell execution."
+		return "Ensure `sandbox-exec` is installed and usable (the host must allow `sandbox_apply`), or explicitly select Full access for an unconfined session."
 	case "windows":
-		return "The native Windows sandbox backend (AppContainer) is unavailable on this host; set [sandbox] bash = \"off\" in config.toml / Settings -> Sandbox to run shell commands unconfined."
+		return "Windows has no OS-level shell sandbox. Permission presets are enforced by Reasonix file tools and shell commands run as the current OS user; select Full access only when ordinary approval prompts should also be skipped."
 	default:
-		return "Set [sandbox] bash = \"off\" in config.toml / Settings -> Sandbox to run shell commands unconfined on this platform."
+		return "Restricted permission presets are unavailable on this platform; explicitly select Full access only when unconfined execution is intended."
+	}
+}
+
+// BackendUnavailableReason is safe diagnostic copy for subsystems such as MCP
+// that intentionally continue unconfined when the OS backend is missing.
+func BackendUnavailableReason() string {
+	switch runtime.GOOS {
+	case "linux":
+		return "bubblewrap (bwrap) is unavailable on PATH"
+	case "darwin":
+		return "sandbox-exec is missing from PATH or unusable (sandbox_apply is restricted)"
+	case "windows":
+		return "Reasonix does not ship an OS-level sandbox on Windows"
+	default:
+		return "this platform has no supported Reasonix sandbox backend"
 	}
 }

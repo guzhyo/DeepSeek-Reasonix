@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"reasonix/internal/control"
+	"reasonix/internal/sandbox"
 )
 
 // approvalBlockingController is a botController whose RunTurn blocks the way a
@@ -15,10 +16,10 @@ import (
 // RunTurn until Approve is called. Every other method is a harmless stub so the
 // gateway's turn/approve path can drive it without a real controller.
 type approvalBlockingController struct {
-	botController // embedded nil interface: unused methods panic if ever called
-	started       chan struct{}
-	released      chan struct{}
-	approved      chan struct{}
+	stubBotController
+	started  chan struct{}
+	released chan struct{}
+	approved chan struct{}
 }
 
 func newApprovalBlockingController() *approvalBlockingController {
@@ -41,6 +42,11 @@ func (c *approvalBlockingController) RunTurn(ctx context.Context, input string) 
 	case <-ctx.Done():
 		return ctx.Err()
 	}
+}
+
+func (c *approvalBlockingController) ResolveApproval(id string, allow bool, scope sandbox.ApprovalScope) error {
+	c.Approve(id, allow, scope != sandbox.ApprovalScopeOnce, scope == sandbox.ApprovalScopeProject)
+	return nil
 }
 
 func (c *approvalBlockingController) Approve(id string, allow, session, persist bool) {
@@ -89,8 +95,7 @@ func TestGatewayApprovalReplyUnblocksTurnOffDispatchGoroutine(t *testing.T) {
 	// building a real one via boot.Build.
 	gw.controllers[key] = &sessionState{ctrl: ctrl, sink: &sessionEventSink{}}
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 	go gw.dispatchLoop(ctx, binding)
 
 	// First message: a normal turn that will block on approval inside RunTurn.

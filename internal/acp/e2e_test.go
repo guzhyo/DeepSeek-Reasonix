@@ -58,9 +58,10 @@ func (p *scriptedProvider) Stream(ctx context.Context, _ provider.Request) (<-ch
 
 // fakeTool is a no-op tool whose read-only flag and output the test controls.
 type fakeTool struct {
-	name string
-	ro   bool
-	out  string
+	name     string
+	ro       bool
+	out      string
+	executed chan struct{}
 }
 
 func (t fakeTool) Name() string            { return t.name }
@@ -68,6 +69,9 @@ func (t fakeTool) Description() string     { return "fake tool" }
 func (t fakeTool) Schema() json.RawMessage { return json.RawMessage(`{"type":"object"}`) }
 func (t fakeTool) ReadOnly() bool          { return t.ro }
 func (t fakeTool) Execute(context.Context, json.RawMessage) (string, error) {
+	if t.executed != nil {
+		close(t.executed)
+	}
 	return t.out, nil
 }
 
@@ -78,6 +82,7 @@ type e2eFactory struct {
 	tool       tool.Tool
 	policy     permission.Policy
 	sessionDir string
+	options    *agent.Options
 }
 
 func (f *e2eFactory) SessionDir() string { return f.sessionDir }
@@ -85,8 +90,12 @@ func (f *e2eFactory) SessionDir() string { return f.sessionDir }
 func (f *e2eFactory) NewSession(_ context.Context, p SessionParams) (*control.Controller, error) {
 	reg := tool.NewRegistry()
 	reg.Add(f.tool)
+	opts := agent.Options{MaxSteps: 5}
+	if f.options != nil {
+		opts = *f.options
+	}
 	executor := agent.New(f.prov, reg, agent.NewSession("you are a test agent"),
-		agent.Options{MaxSteps: 5}, p.Sink)
+		opts, p.Sink)
 	return control.New(control.Options{
 		Runner:     executor,
 		Executor:   executor,
@@ -95,6 +104,96 @@ func (f *e2eFactory) NewSession(_ context.Context, p SessionParams) (*control.Co
 		Label:      "fake-model",
 		SessionDir: f.sessionDir,
 	}), nil
+}
+
+func TestE2EExplicitMaxStepsReturnsSuccessfulPause(t *testing.T) {
+	responses := [][]provider.Chunk{
+		{toolCallChunk("c1", "peek", `{}`), {Type: provider.ChunkDone}},
+		{toolCallChunk("c2", "peek", `{}`), {Type: provider.ChunkDone}},
+		{toolCallChunk("c3", "peek", `{}`), {Type: provider.ChunkDone}},
+		{toolCallChunk("c4", "peek", `{}`), {Type: provider.ChunkDone}},
+		{toolCallChunk("c5", "peek", `{}`), {Type: provider.ChunkDone}},
+		{{Type: provider.ChunkText, Text: "Saved progress summary."}, {Type: provider.ChunkDone}},
+	}
+	assertE2ERunPause(t, responses, nil, StopMaxTurnRequests, "paused after 5 tool-call rounds")
+}
+
+func TestE2ETaskBudgetReturnsSuccessfulPause(t *testing.T) {
+	responses := [][]provider.Chunk{
+		{
+			toolCallChunk("c1", "peek", `{}`),
+			{Type: provider.ChunkUsage, Usage: &provider.Usage{PromptTokens: 100, CacheMissTokens: 100}},
+			{Type: provider.ChunkDone},
+		},
+		{{Type: provider.ChunkText, Text: "Saved budget summary."}, {Type: provider.ChunkDone}},
+	}
+	options := &agent.Options{
+		Pricing:    &provider.Pricing{Input: 1, Currency: "USD"},
+		TaskBudget: agent.TaskBudget{Cost: 0.000001},
+	}
+	assertE2ERunPause(t, responses, options, StopEndTurn, "paused after reaching this task's cost budget")
+}
+
+func assertE2ERunPause(t *testing.T, responses [][]provider.Chunk, options *agent.Options, wantStop StopReason, wantWarning string) {
+	t.Helper()
+	factory := &e2eFactory{
+		prov:       &scriptedProvider{name: "fake", responses: responses},
+		tool:       fakeTool{name: "peek", ro: true, out: "ok"},
+		policy:     permission.New("ask", nil, nil, nil),
+		sessionDir: t.TempDir(),
+		options:    options,
+	}
+	client, stop := startServer(t, factory)
+	defer stop()
+
+	sid := openSession(t, client)
+	promptCh := client.callAsync("session/prompt", SessionPromptParams{
+		SessionID: sid,
+		Prompt:    []ContentBlock{{Type: "text", Text: "keep working"}},
+	})
+	notifications, resp := drainPrompt(t, client, promptCh)
+	if resp.Error != nil {
+		t.Fatalf("controlled pause returned JSON-RPC error: %+v", resp.Error)
+	}
+	var result SessionPromptResult
+	if err := json.Unmarshal(resp.Result, &result); err != nil {
+		t.Fatalf("prompt result: %v", err)
+	}
+	if result.StopReason != wantStop {
+		t.Errorf("stopReason = %q, want %q", result.StopReason, wantStop)
+	}
+
+	var warned, paused bool
+	for _, notification := range notifications {
+		if notification.Method == sessionStatusUpdateMethod {
+			var update ReasonixStatusUpdate
+			if err := json.Unmarshal(notification.Params, &update); err != nil {
+				t.Fatalf("status update: %v", err)
+			}
+			if update.Event == "pause" && update.Status.TurnOutcome.Kind == "paused" {
+				paused = true
+			}
+		}
+		var params SessionUpdateParams
+		if err := json.Unmarshal(notification.Params, &params); err != nil {
+			continue
+		}
+		update, ok := params.Update.(map[string]any)
+		if !ok || update["sessionUpdate"] != "agent_message_chunk" {
+			continue
+		}
+		content, _ := update["content"].(map[string]any)
+		text, _ := content["text"].(string)
+		if strings.Contains(text, "[warning]") && strings.Contains(text, wantWarning) {
+			warned = true
+		}
+	}
+	if !warned {
+		t.Fatalf("missing controlled-pause warning containing %q", wantWarning)
+	}
+	if !paused {
+		t.Fatal("missing paused status outcome")
+	}
 }
 
 func toolCallChunk(id, name, args string) provider.Chunk {
@@ -345,8 +444,17 @@ func TestE2ESessionListResumeAndDelete(t *testing.T) {
 	}
 	select {
 	case n := <-client2.notifs:
-		t.Fatalf("session/resume replayed an unexpected notification: %+v", n)
-	default:
+		// Resume publishes current host state after its response. This is
+		// not transcript replay: the saved conversation has no active plan.
+		requirePlanFrame(t, n)
+		var params struct {
+			Update planUpdate `json:"update"`
+		}
+		if err := json.Unmarshal(n.Params, &params); err != nil || len(params.Update.Entries) != 0 {
+			t.Fatalf("resumed plan = %+v, err = %v; want an empty current plan", params, err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("session/resume did not publish current plan state")
 	}
 
 	deleteResp := client2.call(t, "session/delete", SessionDeleteParams{SessionID: nr.SessionID})
@@ -425,11 +533,7 @@ func TestE2EDeleteActiveSessionDoesNotRecreateFiles(t *testing.T) {
 		Prompt:    []ContentBlock{{Type: "text", Text: "delete me while running"}},
 	})
 
-	select {
-	case <-started:
-	case <-time.After(2 * time.Second):
-		t.Fatal("tool never started")
-	}
+	waitForACPToolStart(t, started, promptCh)
 	deleteResp := client.call(t, "session/delete", SessionDeleteParams{SessionID: sid})
 	if deleteResp.Error != nil {
 		t.Fatalf("session/delete errored: %+v", deleteResp.Error)
@@ -471,10 +575,11 @@ func TestE2EDeleteActiveSessionDoesNotRecreateFiles(t *testing.T) {
 // the controller raises an ApprovalRequest, the sink forwards it as
 // session/request_permission, the client allows it, and the tool then runs.
 func TestE2EApprovalRoundTrip(t *testing.T) {
+	toolExecuted := make(chan struct{})
 	prov := &scriptedProvider{name: "fake", responses: [][]provider.Chunk{
 		{
 			{Type: provider.ChunkText, Text: "Writing."},
-			toolCallChunk("w1", "writeit", `{"path":"out"}`),
+			toolCallChunk("w1", "writeit", `{"path":"README.md"}`),
 			{Type: provider.ChunkDone},
 		},
 		{
@@ -484,7 +589,7 @@ func TestE2EApprovalRoundTrip(t *testing.T) {
 	}}
 	factory := &e2eFactory{
 		prov:       prov,
-		tool:       fakeTool{name: "writeit", ro: false, out: "written ok"},
+		tool:       fakeTool{name: "writeit", ro: false, out: "written ok", executed: toolExecuted},
 		policy:     permission.New("ask", nil, nil, nil),
 		sessionDir: t.TempDir(),
 	}
@@ -492,44 +597,52 @@ func TestE2EApprovalRoundTrip(t *testing.T) {
 	defer stop()
 
 	sid := openSession(t, client)
+	if resp := client.call(t, "session/set_config_option", SetSessionConfigOptionParams{
+		SessionID: sid,
+		ConfigID:  "tool_approval",
+		Value:     control.ToolApprovalReadOnly,
+	}); resp.Error != nil {
+		t.Fatalf("set read-only permission: %+v", resp.Error)
+	}
 	promptCh := client.callAsync("session/prompt", SessionPromptParams{
 		SessionID: sid,
-		Prompt:    []ContentBlock{{Type: "text", Text: "write out"}},
+		Prompt:    []ContentBlock{{Type: "text", Text: "write README.md"}},
 	})
 
-	// Answer the permission request the write tool raises, capturing it to assert.
-	reqSeen := make(chan PermissionRequestParams, 1)
-	go func() {
-		req := <-client.reqs
-		var pr PermissionRequestParams
-		json.Unmarshal(req.Params, &pr)
-		reqSeen <- pr
-		if _, ok := invalidACPv1PermissionOptionKind(pr.Options); ok {
-			client.replyError(req.ID, ErrInvalidParams, "Invalid params")
-			return
-		}
+	// Answer the permission request while the prompt is still in flight. The
+	// turn cannot finish until this round-trip completes.
+	var req frame
+	select {
+	case req = <-client.reqs:
+	case early := <-promptCh:
+		t.Fatalf("prompt returned before requesting permission: error=%+v result=%s", early.Error, early.Result)
+	case <-time.After(10 * time.Second):
+		t.Fatal("no permission request was raised before the ACP hang guard")
+	}
+	var pr PermissionRequestParams
+	if err := json.Unmarshal(req.Params, &pr); err != nil {
+		t.Fatalf("permission params: %v", err)
+	}
+	if pr.SessionID != sid {
+		t.Errorf("permission sessionId = %q, want %q", pr.SessionID, sid)
+	}
+	if pr.ToolCall.Kind != "edit" {
+		t.Errorf("permission kind = %q, want edit", pr.ToolCall.Kind)
+	}
+	if !strings.Contains(pr.ToolCall.Title, "writeit") {
+		t.Errorf("permission title = %q, want it to mention writeit", pr.ToolCall.Title)
+	}
+	assertACPv1PermissionOptionKinds(t, pr.Options)
+	if _, ok := invalidACPv1PermissionOptionKind(pr.Options); ok {
+		client.replyError(req.ID, ErrInvalidParams, "Invalid params")
+	} else {
 		client.reply(req.ID, PermissionRequestResult{
 			Outcome: PermissionOutcome{Outcome: "selected", OptionID: string(OptAllowOnce)},
 		})
-	}()
-
-	notifs, resp := drainPrompt(t, client, promptCh)
-
-	select {
-	case pr := <-reqSeen:
-		if pr.SessionID != sid {
-			t.Errorf("permission sessionId = %q, want %q", pr.SessionID, sid)
-		}
-		if pr.ToolCall.Kind != "edit" {
-			t.Errorf("permission kind = %q, want edit", pr.ToolCall.Kind)
-		}
-		if !strings.Contains(pr.ToolCall.Title, "writeit") {
-			t.Errorf("permission title = %q, want it to mention writeit", pr.ToolCall.Title)
-		}
-		assertACPv1PermissionOptionKinds(t, pr.Options)
-	case <-time.After(2 * time.Second):
-		t.Fatal("no permission request was raised")
 	}
+
+	waitForACPToolExecution(t, toolExecuted, promptCh)
+	notifs, resp := drainPromptWithin(t, client, promptCh, 10*time.Second)
 
 	// The allowed tool ran: a completed tool_call_update with its output.
 	var ran bool
@@ -549,7 +662,7 @@ func TestE2EApprovalRoundTrip(t *testing.T) {
 		}
 		json.Unmarshal(n.Params, &p)
 		if p.Update.Status == "completed" && len(p.Update.Content) > 0 &&
-			p.Update.Content[0].Content.Text == "written ok" {
+			strings.HasPrefix(p.Update.Content[0].Content.Text, "written ok") {
 			ran = true
 		}
 	}
@@ -557,10 +670,26 @@ func TestE2EApprovalRoundTrip(t *testing.T) {
 		t.Error("approved tool did not run to completion")
 	}
 
-	var pr SessionPromptResult
-	json.Unmarshal(resp.Result, &pr)
-	if pr.StopReason != StopEndTurn {
-		t.Errorf("stopReason = %q, want end_turn", pr.StopReason)
+	var result SessionPromptResult
+	json.Unmarshal(resp.Result, &result)
+	// Adaptive standard execution may pause the turn for missing readiness
+	// after a write; controlled readiness pauses use ACP v1 end_turn.
+	if result.StopReason != StopEndTurn {
+		t.Errorf("stopReason = %q, want end_turn", result.StopReason)
+	}
+}
+
+// waitForACPToolExecution separates permission-delivery correctness from the
+// status and transcript work that follows a completed tool call.
+func waitForACPToolExecution(t *testing.T, executed <-chan struct{}, prompt <-chan frame) {
+	t.Helper()
+	select {
+	case <-executed:
+		return
+	case early := <-prompt:
+		t.Fatalf("prompt returned before the approved tool executed: error=%+v result=%s", early.Error, early.Result)
+	case <-time.After(10 * time.Second):
+		t.Fatal("approved tool did not execute before the ACP hang guard")
 	}
 }
 
@@ -569,6 +698,8 @@ func TestE2EApprovalRoundTrip(t *testing.T) {
 func TestE2ECancelMidTurn(t *testing.T) {
 	releaseTool := make(chan struct{})
 	started := make(chan struct{})
+	cancelled := make(chan struct{})
+	defer close(releaseTool) // always let the tool goroutine unwind on failure
 	prov := &scriptedProvider{name: "fake", responses: [][]provider.Chunk{
 		{
 			{Type: provider.ChunkText, Text: "Starting."},
@@ -579,7 +710,7 @@ func TestE2ECancelMidTurn(t *testing.T) {
 	}}
 	factory := &e2eFactory{
 		prov:       prov,
-		tool:       blockingTool{started: started, release: releaseTool},
+		tool:       blockingTool{started: started, cancelled: cancelled, release: releaseTool},
 		policy:     permission.New("ask", nil, nil, nil),
 		sessionDir: t.TempDir(),
 	}
@@ -592,12 +723,9 @@ func TestE2ECancelMidTurn(t *testing.T) {
 		Prompt:    []ContentBlock{{Type: "text", Text: "go"}},
 	})
 
-	select {
-	case <-started:
-	case <-time.After(2 * time.Second):
-		t.Fatal("tool never started")
-	}
+	waitForACPToolStart(t, started, promptCh)
 	client.notify("session/cancel", SessionCancelParams{SessionID: sid})
+	waitForACPToolCancellation(t, cancelled, promptCh)
 
 	select {
 	case resp := <-promptCh:
@@ -606,17 +734,50 @@ func TestE2ECancelMidTurn(t *testing.T) {
 		if pr.StopReason != StopCancelled {
 			t.Errorf("stopReason = %q, want cancelled", pr.StopReason)
 		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("cancel did not end the turn")
+	case <-time.After(10 * time.Second):
+		t.Fatal("turn did not finish after the tool observed cancellation")
 	}
-	close(releaseTool) // let the tool goroutine unwind
+}
+
+// waitForACPToolStart distinguishes a blocked turn from a provider/RPC error
+// that completed the prompt before tool execution. The ten-second branch is a
+// hang guard, not an ordering assertion; ordering is proved by the started and
+// prompt result events themselves. Windows full-package CI has measured more
+// than two seconds of scheduler delay while the same focused test stays fast.
+func waitForACPToolStart(t *testing.T, started <-chan struct{}, prompt <-chan frame) {
+	t.Helper()
+	select {
+	case <-started:
+		return
+	case early := <-prompt:
+		t.Fatalf("prompt returned before the tool started: error=%+v result=%s", early.Error, early.Result)
+	case <-time.After(10 * time.Second):
+		t.Fatal("tool did not start before the ACP hang guard")
+	}
+}
+
+// waitForACPToolCancellation proves that the notification reached the running
+// tool before waiting for the prompt response. This separates cancellation
+// delivery from the slower status/transcript finalization that follows it on
+// loaded Windows runners.
+func waitForACPToolCancellation(t *testing.T, cancelled <-chan struct{}, prompt <-chan frame) {
+	t.Helper()
+	select {
+	case <-cancelled:
+		return
+	case early := <-prompt:
+		t.Fatalf("prompt returned before the tool observed cancellation: error=%+v result=%s", early.Error, early.Result)
+	case <-time.After(10 * time.Second):
+		t.Fatal("tool did not observe cancellation before the ACP hang guard")
+	}
 }
 
 // blockingTool blocks in Execute until released or ctx is cancelled, signalling
 // when it has started so the test can cancel mid-execution.
 type blockingTool struct {
-	started chan struct{}
-	release chan struct{}
+	started   chan struct{}
+	cancelled chan struct{}
+	release   chan struct{}
 }
 
 func (t blockingTool) Name() string            { return "slow" }
@@ -627,6 +788,9 @@ func (t blockingTool) Execute(ctx context.Context, _ json.RawMessage) (string, e
 	close(t.started)
 	select {
 	case <-ctx.Done():
+		if t.cancelled != nil {
+			close(t.cancelled)
+		}
 		return "", ctx.Err()
 	case <-t.release:
 		return "released", nil

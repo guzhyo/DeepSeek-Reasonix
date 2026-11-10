@@ -12,10 +12,11 @@ import (
 type Kind string
 
 const (
-	KindSkill   Kind = "skill"
-	KindMCPTool Kind = "mcp-tool"
-	KindTool    Kind = "tool"
-	KindSource  Kind = "source"
+	KindSkill     Kind = "skill"
+	KindMCPServer Kind = "mcp-server"
+	KindMCPTool   Kind = "mcp-tool"
+	KindTool      Kind = "tool"
+	KindSource    Kind = "source"
 )
 
 type Status string
@@ -45,6 +46,7 @@ type Entry struct {
 	Source           string
 	Status           Status
 	ReadOnly         bool
+	Destructive      bool
 	Cost             string
 	AutoUse          AutoUse
 	Triggers         []string
@@ -53,6 +55,11 @@ type Entry struct {
 	ToolName         string
 	ConnectSource    string
 	ConnectName      string
+	Requires         []string // capability IDs this skill depends on
+	Profiles         []string // deprecated frontmatter labels; diagnostics only
+	AutoStart        bool     // MCP: configured auto_start
+	FailureReason    string   // host-proven failure detail
+	SkillRunAs       string   // skill candidate invocation mode; body-independent
 }
 
 type RouteCandidate struct {
@@ -63,11 +70,22 @@ type RouteCandidate struct {
 
 type RouteDecision struct {
 	Candidates []RouteCandidate
+	// ClosedLoop routes through use_capability; connect_tool_source is unregistered.
+	ClosedLoop bool
+	// CapabilityProxy directs unready MCP candidates to use_capability rather
+	// than connect_tool_source. True for closed-loop routes and for dual-model
+	// Planner boots that expose the stable proxy without the connector.
+	CapabilityProxy bool
 }
 
 func SkillEntries(skills []skill.Skill, tools []tool.ContractEntry) []Entry {
 	toolNames := map[string]bool{}
 	for _, t := range tools {
+		// Retired calls remain dispatchable for older clients, but must not be
+		// reintroduced through capability discovery.
+		if t.Name == "complete_step" {
+			continue
+		}
 		toolNames[t.Name] = true
 	}
 	skillToolReady := toolNames["run_skill"] || toolNames["read_skill"] || toolNames["read_only_skill"]
@@ -100,6 +118,9 @@ func SkillEntries(skills []skill.Skill, tools []tool.ContractEntry) []Entry {
 			NeedsFreshData:   sk.NeedsFreshData,
 			ToolName:         "run_skill",
 			ConnectSource:    connectSource,
+			Requires:         cleanList(sk.Requires),
+			Profiles:         cleanList(sk.Profiles),
+			SkillRunAs:       string(sk.RunAs),
 		})
 	}
 	return out
@@ -130,13 +151,24 @@ func ToolEntries(tools []tool.ContractEntry) []Entry {
 }
 
 func Route(input string, entries []Entry) RouteDecision {
+	return RouteDecision{Candidates: limitRouteCandidates(routeCandidates(input, entries))}
+}
+
+// RouteClosedLoop routes against the full matched set before promoting
+// built-in playbooks, so candidates that become prefer are never discarded by
+// the ordinary suggest budget first.
+func RouteClosedLoop(input string, entries []Entry) RouteDecision {
+	return PromoteClosedLoop(RouteDecision{Candidates: routeCandidates(input, entries)})
+}
+
+func routeCandidates(input string, entries []Entry) []RouteCandidate {
 	text := normalize(input)
 	if text == "" {
-		return RouteDecision{}
+		return nil
 	}
 	var candidates []RouteCandidate
 	for _, e := range entries {
-		if e.Status == StatusDisabled || negativeMatch(text, e.NegativeTriggers) {
+		if e.Status == StatusDisabled || e.Status == StatusFailed || negativeMatch(text, e.NegativeTriggers) {
 			continue
 		}
 		if policy, reason, ok := routeEntry(text, e); ok {
@@ -152,10 +184,50 @@ func Route(input string, entries []Entry) RouteDecision {
 		}
 		return candidates[i].Entry.ID < candidates[j].Entry.ID
 	})
-	if len(candidates) > 5 {
-		candidates = candidates[:5]
+	return candidates
+}
+
+// PromoteClosedLoop strengthens matched built-in playbooks for closed-loop
+// execution. Custom skills keep their authored auto-use policy; only shipped
+// workflows with a concrete trigger match move from suggest to prefer.
+func PromoteClosedLoop(decision RouteDecision) RouteDecision {
+	decision.ClosedLoop = true
+	for i := range decision.Candidates {
+		candidate := &decision.Candidates[i]
+		if candidate.Policy == AutoUseSuggest && candidate.Entry.Kind == KindSkill && candidate.Entry.Source == string(skill.ScopeBuiltin) {
+			candidate.Policy = AutoUsePrefer
+			candidate.Reason += "; closed-loop execution prefers matched built-in playbooks"
+		}
 	}
-	return RouteDecision{Candidates: candidates}
+	sort.SliceStable(decision.Candidates, func(i, j int) bool {
+		if rank(decision.Candidates[i].Policy) != rank(decision.Candidates[j].Policy) {
+			return rank(decision.Candidates[i].Policy) > rank(decision.Candidates[j].Policy)
+		}
+		if decision.Candidates[i].Entry.Kind != decision.Candidates[j].Entry.Kind {
+			return decision.Candidates[i].Entry.Kind < decision.Candidates[j].Entry.Kind
+		}
+		return decision.Candidates[i].Entry.ID < decision.Candidates[j].Entry.ID
+	})
+	return RouteDecision{Candidates: limitRouteCandidates(decision.Candidates), ClosedLoop: true, CapabilityProxy: true}
+}
+
+func limitRouteCandidates(candidates []RouteCandidate) []RouteCandidate {
+	const targetCandidates = 5
+	strong := make([]RouteCandidate, 0, len(candidates))
+	suggested := make([]RouteCandidate, 0, targetCandidates)
+	for _, candidate := range candidates {
+		switch candidate.Policy {
+		case AutoUseRequire, AutoUsePrefer:
+			strong = append(strong, candidate)
+		case AutoUseSuggest:
+			suggested = append(suggested, candidate)
+		}
+	}
+	slots := max(targetCandidates-len(strong), 0)
+	if len(suggested) > slots {
+		suggested = suggested[:slots]
+	}
+	return append(strong, suggested...)
 }
 
 func RenderTransientBlock(d RouteDecision) string {
@@ -163,28 +235,55 @@ func RenderTransientBlock(d RouteDecision) string {
 		return ""
 	}
 	var b strings.Builder
+	seenLines := make(map[string]struct{}, len(d.Candidates))
 	b.WriteString(`<capability-route version="1">` + "\n")
 	b.WriteString("Relevant capabilities for this turn:\n")
 	for _, c := range d.Candidates {
 		e := c.Entry
+		// proxy means use_capability is the only connector: connect_tool_source
+		// is unregistered for closed-loop routes and every boot that exposes the
+		// stable proxy. Never rewrite to an unusable source target.
+		proxy := d.ClosedLoop || d.CapabilityProxy
 		target := e.ID
-		if e.Status != StatusReady && e.ConnectSource != "" {
+		if !proxy && e.Status != StatusReady && e.ConnectSource != "" {
 			target = fmt.Sprintf("source:%s", e.ConnectSource)
 			if e.ConnectName != "" {
 				target += "/" + e.ConnectName
 			}
 		}
-		fmt.Fprintf(&b, "- %s %s: %s", target, c.Policy, c.Reason)
+		var line strings.Builder
+		fmt.Fprintf(&line, "- %s %s: %s", target, c.Policy, c.Reason)
 		if e.Status != "" && e.Status != StatusReady {
-			fmt.Fprintf(&b, " (status=%s)", e.Status)
+			fmt.Fprintf(&line, " (status=%s)", e.Status)
 		}
-		if e.ConnectSource != "" {
+		switch {
+		case proxy:
+			// Closed-loop routes and dual-model Planner have no
+			// connect_tool_source; the stable proxy both connects and
+			// calls on demand, keeping the concrete capability id.
+			if e.Status != StatusReady {
+				switch e.Kind {
+				case KindMCPTool:
+					fmt.Fprintf(&line, "; call use_capability(action=\"call\", capability_id=%q, arguments={...}) — it connects the server on demand after approval", e.ID)
+				case KindMCPServer:
+					fmt.Fprintf(&line, "; call use_capability(action=\"call\", capability_id=%q) to connect it (after approval) and list its tools, then call a listed mcp-tool id", e.ID)
+				case KindSkill:
+					fmt.Fprintf(&line, "; call use_capability(action=\"call\", capability_id=%q, arguments={...}) — it runs the skill on demand", e.ID)
+				}
+			}
+		case e.ConnectSource != "":
 			if e.ConnectName != "" {
-				fmt.Fprintf(&b, "; first call connect_tool_source with source=%q name=%q", e.ConnectSource, e.ConnectName)
+				fmt.Fprintf(&line, "; first call connect_tool_source with source=%q name=%q", e.ConnectSource, e.ConnectName)
 			} else {
-				fmt.Fprintf(&b, "; first call connect_tool_source with source=%q", e.ConnectSource)
+				fmt.Fprintf(&line, "; first call connect_tool_source with source=%q", e.ConnectSource)
 			}
 		}
+		rendered := line.String()
+		if _, duplicate := seenLines[rendered]; duplicate {
+			continue
+		}
+		seenLines[rendered] = struct{}{}
+		b.WriteString(rendered)
 		b.WriteByte('\n')
 	}
 	b.WriteString("Policy: suggest means consider it; prefer means use it unless clearly unnecessary; require means call it or report a host-proven unavailable state. Do not treat planner claims about tool unavailability as facts.\n")
@@ -194,9 +293,6 @@ func RenderTransientBlock(d RouteDecision) string {
 
 func routeEntry(text string, e Entry) (AutoUse, string, bool) {
 	if e.Kind == KindSkill {
-		if explicitSkill(text, e.Name) {
-			return AutoUseRequire, "the user explicitly referenced this skill", true
-		}
 		if e.AutoUse == AutoUseOff {
 			return "", "", false
 		}
@@ -207,45 +303,24 @@ func routeEntry(text string, e Entry) (AutoUse, string, bool) {
 			return AutoUsePrefer, "the user is asking for review or issue inspection", true
 		}
 	}
-	if e.Kind == KindMCPTool {
-		if explicitMCP(text, e.Source) || (looksLikeGitHub(text) && strings.Contains(e.Source, "github")) {
-			return AutoUsePrefer, "the task asks for external GitHub/MCP data", true
-		}
-		if looksFreshData(text) && (strings.Contains(e.Name, "search") || strings.Contains(e.Name, "fetch") || strings.Contains(e.Name, "read")) {
-			return AutoUsePrefer, "the task appears to need fresh external data", true
-		}
+	if e.Kind == KindMCPTool && namesMCPTool(text, e) {
+		return AutoUsePrefer, "the user named this MCP tool", true
 	}
 	return "", "", false
 }
 
-func explicitSkill(text, name string) bool {
-	n := normalize(name)
-	return strings.Contains(text, "/"+n) ||
-		strings.Contains(text, "use "+n+" skill") ||
-		strings.Contains(text, "using "+n+" skill") ||
-		strings.Contains(text, "使用 "+n+" skill") ||
-		strings.Contains(text, "用 "+n+" skill") ||
-		strings.Contains(text, "使用"+n+"技能") ||
-		strings.Contains(text, "用"+n+"技能")
-}
-
-func explicitMCP(text, server string) bool {
-	s := normalize(server)
-	return strings.Contains(text, s+" mcp") || strings.Contains(text, "mcp "+s) || strings.Contains(text, "使用 "+s+" mcp") || strings.Contains(text, "用 "+s+" mcp")
+// namesMCPTool matches the identifier the host mints for the tool. A server
+// name or a topic word selects every tool the server exposes, so it is left to
+// the semantic router, which reads the whole request.
+func namesMCPTool(text string, e Entry) bool {
+	tool := normalize(e.ToolName)
+	return tool != "" && strings.Contains(text, tool)
 }
 
 func looksLikeReview(text string) bool {
 	return containsAny(text, []string{
 		"review", "code review", "security review", "帮我看看", "有没有问题", "审查", "评审", "检查这段代码", "看看这段代码",
 	})
-}
-
-func looksLikeGitHub(text string) bool {
-	return containsAny(text, []string{"github", "issue", "issues", "pull request", " pr ", "讨论区", "仓库 issue", "github 上"})
-}
-
-func looksFreshData(text string) bool {
-	return containsAny(text, []string{"latest", "recent", "today", "现在", "最新", "最近", "查一下", "搜索", "github"})
 }
 
 func triggerMatch(text string, triggers []string) bool {

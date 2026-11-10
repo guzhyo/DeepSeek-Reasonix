@@ -6,12 +6,13 @@
 package outputstyle
 
 import (
-	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 
+	fileencoding "reasonix/internal/fileutil/encoding"
 	"reasonix/internal/frontmatter"
 )
 
@@ -66,13 +67,13 @@ func Dirs() []string {
 	var dirs []string
 	if os.Getenv("REASONIX_HOME") == "" {
 		if home, err := os.UserHomeDir(); err == nil {
-			for i := len(conventionDirs) - 1; i >= 0; i-- {
-				dirs = append(dirs, filepath.Join(home, conventionDirs[i], "output-styles"))
+			for _, v := range slices.Backward(conventionDirs) {
+				dirs = append(dirs, filepath.Join(home, v, "output-styles"))
 			}
 		}
 	}
-	for i := len(conventionDirs) - 1; i >= 0; i-- {
-		dirs = append(dirs, filepath.Join(".", conventionDirs[i], "output-styles"))
+	for _, v := range slices.Backward(conventionDirs) {
+		dirs = append(dirs, filepath.Join(".", v, "output-styles"))
 	}
 	return dirs
 }
@@ -148,7 +149,7 @@ func Apply(base string, st OutputStyle) string {
 // stem; frontmatter supplies description and keep-coding-instructions; the body
 // is the prompt text.
 func parseFile(path string) (OutputStyle, bool) {
-	b, err := os.ReadFile(path)
+	b, err := fileencoding.ReadFileUTF8(path)
 	if err != nil {
 		return OutputStyle{}, false
 	}
@@ -180,21 +181,4 @@ func isFalse(s string) bool {
 		return true
 	}
 	return false
-}
-
-// DescribeList renders the available styles as a short listing for /output-style.
-func DescribeList(styles []OutputStyle, active string) string {
-	var b strings.Builder
-	for _, st := range styles {
-		marker := "  "
-		if strings.EqualFold(st.Name, active) {
-			marker = "* "
-		}
-		scope := "builtin"
-		if !st.Builtin {
-			scope = "custom"
-		}
-		fmt.Fprintf(&b, "%s%s (%s) — %s\n", marker, st.Name, scope, st.Description)
-	}
-	return strings.TrimRight(b.String(), "\n")
 }

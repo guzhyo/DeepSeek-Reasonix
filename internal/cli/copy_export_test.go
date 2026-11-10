@@ -22,7 +22,7 @@ func newTestChatTUIWithMessages(t *testing.T, workspaceRoot string, msgs ...prov
 		sess.Add(msg)
 	}
 	exec := agent.New(nil, nil, sess, agent.Options{}, event.Discard)
-	ctrl := control.New(control.Options{Executor: exec, WorkspaceRoot: workspaceRoot})
+	ctrl := newOwnedTestController(t, control.Options{Executor: exec, WorkspaceRoot: workspaceRoot})
 	return newChatTUI(ctrl, "", make(chan event.Event, 1), 80)
 }
 
@@ -31,10 +31,19 @@ func requireClipboardCommand(t *testing.T, cmd tea.Cmd, want string) {
 	if cmd == nil {
 		t.Fatal("expected clipboard command, got nil")
 	}
-	gotMsg := cmd()
-	wantMsg := tea.SetClipboard(want)()
-	if !reflect.DeepEqual(gotMsg, wantMsg) {
-		t.Fatalf("clipboard command = %#v, want %#v", gotMsg, wantMsg)
+	t.Setenv("SSH_CONNECTION", "")
+	t.Setenv("SSH_CLIENT", "")
+	t.Setenv("SSH_TTY", "")
+	previous := writeNativeClipboardText
+	defer func() { writeNativeClipboardText = previous }()
+	var written string
+	writeNativeClipboardText = func(text string) error {
+		written = text
+		return nil
+	}
+	gotMsg, ok := cmd().(clipboardCopyMsg)
+	if !ok || gotMsg.text != want || written != want || gotMsg.err != nil || gotMsg.osc52 {
+		t.Fatalf("clipboard command = %#v, native write = %q, want %q", gotMsg, written, want)
 	}
 }
 
@@ -106,6 +115,7 @@ func TestSlashExportFiltersInternalAndReferencedContext(t *testing.T) {
 		"<file path=\"auth_private.go\">\nconst hiddenReference = true\n</file>\n\n" +
 		"please explain @auth_private.go"
 	m := newTestChatTUIWithMessages(t, dir,
+		provider.Message{Role: provider.RoleUser, Origin: provider.MessageOriginHost, Content: "<pinned_context_revision>private pinned body</pinned_context_revision>"},
 		provider.Message{Role: provider.RoleUser, Content: expandedReference},
 		provider.Message{Role: provider.RoleUser, Content: agent.MidTurnSteerPrefix + "\ninternal steer should not export"},
 		provider.Message{
@@ -148,6 +158,7 @@ func TestSlashExportFiltersInternalAndReferencedContext(t *testing.T) {
 		"Referenced context:",
 		"<file path=",
 		"hiddenReference",
+		"private pinned body",
 		"internal steer should not export",
 		"private thinking should not export",
 		"private-tool-input.txt",
@@ -156,6 +167,17 @@ func TestSlashExportFiltersInternalAndReferencedContext(t *testing.T) {
 		if strings.Contains(got, unwanted) {
 			t.Fatalf("export leaked %q:\n%s", unwanted, got)
 		}
+	}
+}
+
+func TestSlashCopyIgnoresTrailingPinnedRevision(t *testing.T) {
+	msgs := []provider.Message{
+		{Role: provider.RoleUser, Content: "current prompt"},
+		{Role: provider.RoleAssistant, Content: "current answer"},
+		{Role: provider.RoleUser, Origin: provider.MessageOriginHost, Content: "<pinned_context_revision>private pinned body</pinned_context_revision>"},
+	}
+	if got := copyAssistantParts(msgs); !reflect.DeepEqual(got, []string{"current answer"}) {
+		t.Fatalf("copyAssistantParts() = %#v, want current answer", got)
 	}
 }
 

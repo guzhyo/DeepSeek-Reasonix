@@ -14,6 +14,7 @@ import (
 
 	"reasonix/internal/config"
 	"reasonix/internal/fileutil"
+	fileencoding "reasonix/internal/fileutil/encoding"
 )
 
 const (
@@ -296,7 +297,7 @@ func removePairingCode(code string) (PairingRequest, error) {
 
 func loadPairingFile(path string) (pairingFile, error) {
 	var store pairingFile
-	data, err := os.ReadFile(path)
+	data, err := fileencoding.ReadFileUTF8(path)
 	if errors.Is(err, os.ErrNotExist) {
 		return store, nil
 	}
@@ -342,7 +343,7 @@ func pairingRequestMatches(req PairingRequest, msg InboundMessage) bool {
 func newPairingCode() (string, error) {
 	var b strings.Builder
 	max := big.NewInt(int64(len(pairingAlphabet)))
-	for i := 0; i < 8; i++ {
+	for range 8 {
 		n, err := rand.Int(rand.Reader, max)
 		if err != nil {
 			return "", err

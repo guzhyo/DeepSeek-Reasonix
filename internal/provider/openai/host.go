@@ -2,7 +2,10 @@ package openai
 
 import (
 	"net/url"
+	"slices"
 	"strings"
+
+	"reasonix/internal/provider"
 )
 
 // matchesVendorHost reports whether baseURL points at one of the canonical
@@ -22,10 +25,8 @@ func matchesVendorHost(baseURL, apex string, canonical ...string) bool {
 		return false
 	}
 	host := strings.ToLower(u.Hostname())
-	for _, c := range canonical {
-		if host == c {
-			return true
-		}
+	if slices.Contains(canonical, host) {
+		return true
 	}
 	return strings.HasSuffix(host, "."+apex)
 }
@@ -34,6 +35,129 @@ func matchesVendorHost(baseURL, apex string, canonical ...string) bool {
 // (api.deepseek.com or any *.deepseek.com subdomain).
 func IsDeepSeek(baseURL string) bool {
 	return matchesVendorHost(baseURL, "deepseek.com", "api.deepseek.com")
+}
+
+// OfficialDeepSeekVisionModel has built-in image support. Unknown models need
+// capability metadata or an explicit declaration, not a name-based guess.
+const OfficialDeepSeekVisionModel = provider.OfficialDeepSeekVisionModel
+
+// IsOfficialDeepSeekVisionModel reports whether model is the pinned official
+// DeepSeek vision SKU. Matching is case-insensitive and trims surrounding space.
+func IsOfficialDeepSeekVisionModel(model string) bool {
+	return strings.EqualFold(strings.TrimSpace(model), OfficialDeepSeekVisionModel)
+}
+
+// The official DeepSeek model lists live in the provider package so the local
+// model catalog can consult them without an openai import cycle.
+func IsOfficialDeepSeekImageModel(model string) bool {
+	return provider.IsOfficialDeepSeekImageModel(model)
+}
+
+func IsOfficialDeepSeekTextModel(model string) bool {
+	return provider.IsOfficialDeepSeekTextModel(model)
+}
+
+// DeepSeekImageInputAllowed applies the official endpoint hard limit after a
+// provider has resolved its configured or catalog-derived image capability.
+func DeepSeekImageInputAllowed(officialBase bool, requestURL, model string, metadataProvided, enabled bool) bool {
+	if !officialBase && !IsDeepSeek(requestURL) {
+		return enabled
+	}
+	if IsOfficialDeepSeekTextModel(model) {
+		return false
+	}
+	return enabled || (!metadataProvided && IsOfficialDeepSeekImageModel(model))
+}
+
+// OfficialDeepSeekAllowsVision reports whether this official DeepSeek endpoint
+// may serialize image parts for the selected model. Custom gateways never match.
+func OfficialDeepSeekAllowsVision(baseURL, model string) bool {
+	return IsDeepSeek(baseURL) && IsOfficialDeepSeekImageModel(model)
+}
+
+// IsOpenAI reports whether baseURL points at OpenAI's official API host. Keep
+// this exact-host so a compatible gateway under another openai.com subdomain
+// cannot accidentally receive the official max_completion_tokens wire shape.
+func IsOpenAI(baseURL string) bool {
+	u, err := url.Parse(baseURL)
+	if err != nil {
+		return false
+	}
+	return strings.EqualFold(u.Hostname(), "api.openai.com")
+}
+
+// deepSeekPrefixChatURL returns the official Beta chat endpoint that enables
+// assistant-prefix completion. Derive it only from a URL already hosted by
+// DeepSeek: custom gateways may opt into the DeepSeek reasoning wire shape, but
+// must never be bypassed by an automatic request to the vendor's direct API.
+func deepSeekPrefixChatURL(chatURL string) string {
+	if !IsDeepSeek(chatURL) {
+		return ""
+	}
+	u, err := url.Parse(strings.TrimSpace(chatURL))
+	if err != nil || u.Scheme == "" || u.Host == "" {
+		return ""
+	}
+	u.Path = "/beta/chat/completions"
+	u.RawPath = ""
+	u.RawQuery = ""
+	u.Fragment = ""
+	return u.String()
+}
+
+// IsGeminiAPI reports whether baseURL points at Google's Gemini Developer API.
+// Keep this exact-host: other googleapis.com services do not share Gemini's
+// model resource-name compatibility quirk.
+func IsGeminiAPI(baseURL string) bool {
+	u, err := url.Parse(baseURL)
+	if err != nil {
+		return false
+	}
+	return strings.EqualFold(u.Hostname(), "generativelanguage.googleapis.com")
+}
+
+// usesGeminiThoughtSignatures reports whether the current endpoint/model speaks
+// Gemini's OpenAI-compatible thought-signature extension. The official endpoint
+// is authoritative even when a custom model alias is used; compatible gateways
+// are detected from the model ID they route (for example google/gemini-3-pro).
+// Keeping this decision on the current client prevents a Gemini-authored history
+// from leaking extra_content.google fields after a same-session provider switch.
+func usesGeminiThoughtSignatures(baseURL, model string) bool {
+	if IsGeminiAPI(baseURL) {
+		return true
+	}
+	for _, segment := range strings.FieldsFunc(strings.ToLower(strings.TrimSpace(model)), func(r rune) bool {
+		return r == '/' || r == ':'
+	}) {
+		if segment == "gemini" || strings.HasPrefix(segment, "gemini-") || strings.HasPrefix(segment, "gemini_") {
+			return true
+		}
+	}
+	return false
+}
+
+// normalizeModelID converts Gemini's resource-form model names returned by some
+// /models responses into the bare IDs required by OpenAI-compatible chat calls.
+// Other providers and already-normalized Gemini IDs pass through unchanged.
+func normalizeModelID(baseURL, model string) string {
+	model = strings.TrimSpace(model)
+	if IsGeminiAPI(baseURL) {
+		model = strings.TrimPrefix(model, "models/")
+	}
+	return model
+}
+
+// Explicit official beta alias verified against Chat Completions. Keep
+// configuration identity exact; never case-fold arbitrary IDs or gateway calls.
+func deepSeekChatWireModel(endpoint, model string) string {
+	u, err := url.Parse(endpoint)
+	if err == nil && u.Scheme == "https" && u.Host == "api.deepseek.com" &&
+		u.User == nil && u.RawQuery == "" && u.Fragment == "" &&
+		(u.Path == "/chat/completions" || u.Path == "/v1/chat/completions") &&
+		model == "DeepSeek-V4.1-Flash-Expires-On-0910" {
+		return "deepseek-v4.1-flash-expires-on-0910"
+	}
+	return model
 }
 
 // IsMiniMax reports whether baseURL points at MiniMax's OpenAI-compatible
@@ -49,7 +173,7 @@ func IsMiniMax(baseURL string) bool {
 // MiMo follows the OpenAI chat shape but authenticates with an `api-key` header
 // instead of the usual Authorization bearer header.
 func IsMiMo(baseURL string) bool {
-	return matchesVendorHost(baseURL, "xiaomimimo.com", "api.xiaomimimo.com")
+	return provider.IsMiMoEndpoint(baseURL)
 }
 
 // IsZhipu reports whether baseURL points at Zhipu's OpenAI-compatible endpoint
@@ -63,11 +187,38 @@ func IsZhipu(baseURL string) bool {
 		matchesVendorHost(baseURL, "z.ai", "api.z.ai")
 }
 
+// IsTokenRhythm reports whether baseURL points at Token Rhythm's official
+// OpenAI-compatible gateway. Keep this exact-host: model-aware protocol
+// upgrades must not affect unrelated subdomains or similarly named relays.
+func IsTokenRhythm(baseURL string) bool {
+	u, err := url.Parse(baseURL)
+	if err != nil {
+		return false
+	}
+	return strings.EqualFold(u.Hostname(), "tokenrhythm.studio")
+}
+
 // IsLongCat reports whether baseURL points at LongCat's OpenAI-compatible API.
 // LongCat uses the OpenAI chat shape, but gates thinking with thinking.type
 // enabled|disabled rather than the generic reasoning_effort field.
 func IsLongCat(baseURL string) bool {
 	return matchesVendorHost(baseURL, "longcat.chat", "api.longcat.chat")
+}
+
+// IsKimiAPI reports whether baseURL is one of Moonshot's official Kimi direct
+// API endpoints. Gate Kimi-specific wire compatibility on the exact API hosts
+// so OpenAI-compatible relays carrying the same model ID remain untouched.
+func IsKimiAPI(baseURL string) bool {
+	u, err := url.Parse(baseURL)
+	if err != nil {
+		return false
+	}
+	switch strings.ToLower(u.Hostname()) {
+	case "api.moonshot.cn", "api.moonshot.ai":
+		return true
+	default:
+		return false
+	}
 }
 
 // IsOllamaCloud reports whether baseURL points at Ollama Cloud's hosted

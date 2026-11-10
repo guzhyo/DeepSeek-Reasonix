@@ -8,6 +8,20 @@
 
 const HEX = "0123456789abcdef";
 
+const ordinaryFileSources = new WeakMap<File, string>();
+
+// File metadata cannot distinguish two different pathless files with the same
+// name, size and timestamp. Keep object identity without reading their bytes.
+export function ordinaryFileSource(file: File, nativePath: string): string {
+  if (nativePath) return `path:${nativePath}`;
+  let source = ordinaryFileSources.get(file);
+  if (!source) {
+    source = `file:${crypto.randomUUID()}`;
+    ordinaryFileSources.set(file, source);
+  }
+  return source;
+}
+
 function bytesToHex(bytes: Uint8Array): string {
   let out = "";
   for (let i = 0; i < bytes.length; i++) {
@@ -18,7 +32,7 @@ function bytesToHex(bytes: Uint8Array): string {
 }
 
 // sha256 returns the hex SHA-256 of `blob`. The Web Crypto Subtle API
-// is available in Wails' WebView (Chromium / WebKitGTK 4.1+); we
+// is available in the Chromium shell; we
 // don't fall back to a JS implementation because a no-op (returning
 // "") would silently disable dedup, which is worse than no dedup
 // at all. The caller checks the empty-string return and skips the

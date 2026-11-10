@@ -4,25 +4,15 @@ import { JSDOM } from "jsdom";
 import React from "react";
 import { act } from "react";
 import { createRoot } from "react-dom/client";
-import gsap from "gsap";
 import { ApprovalModal } from "../components/ApprovalModal";
-import { LocaleProvider } from "../lib/i18n";
+import { activeFileReferenceToken, pickInlineFileReference } from "../components/FileReferenceMenu";
+import { LocaleProvider, preloadDetectedLocale } from "../lib/i18n";
 import type { AppBindings } from "../lib/bridge";
 import type { WireApproval } from "../lib/types";
+import { installDesktopHostStub } from "./desktopHostStub";
 
 let passed = 0;
 let failed = 0;
-
-type GsapToOptions = { onComplete?: () => void };
-const gsapForTests = (typeof gsap.to === "function" ? gsap : (gsap as unknown as { default?: typeof gsap }).default) as unknown as {
-  to?: (target: unknown, vars: GsapToOptions) => unknown;
-};
-if (typeof gsapForTests.to === "function") {
-  gsapForTests.to = (_target: unknown, vars: GsapToOptions) => {
-    vars.onComplete?.();
-    return {};
-  };
-}
 
 function ok(value: boolean, label: string) {
   if (value) {
@@ -82,16 +72,19 @@ function installDom(language = "en-US") {
 }
 
 function mockApp(methods: Partial<AppBindings>) {
-  window.go = {
+  installDesktopHostStub(({
     main: {
       App: {
         ...methods,
+        ListDirForTab: methods.ListDirForTab ?? (async (_tabId: string, rel: string) => methods.ListDir?.(rel) ?? []),
+        SearchFileRefsForTab: methods.SearchFileRefsForTab ?? (async (_tabId: string, query: string) => methods.SearchFileRefs?.(query) ?? []),
       } as Partial<AppBindings> as AppBindings,
     },
-  };
+  }).main.App);
 }
 
 async function renderApproval(props: Partial<Parameters<typeof ApprovalModal>[0]> = {}) {
+  await preloadDetectedLocale();
   const rootEl = document.getElementById("root");
   if (!rootEl) throw new Error("missing root");
   const root = createRoot(rootEl);
@@ -105,6 +98,7 @@ async function renderApproval(props: Partial<Parameters<typeof ApprovalModal>[0]
   let currentProps: Parameters<typeof ApprovalModal>[0] = {
     approval,
     cwd: "/repo",
+    tabId: "tab-a",
     onAnswer: () => undefined,
     onRevisePlan: (text) => revisions.push(text),
     onExitPlan: () => undefined,
@@ -127,23 +121,63 @@ async function renderApproval(props: Partial<Parameters<typeof ApprovalModal>[0]
   return { root, revisions, activeStates, rerender: paint };
 }
 
+function actionButton(label: string): HTMLButtonElement {
+  const button = Array.from(document.querySelectorAll(".prompt-shelf__actions .prompt-action")).find((el) =>
+    el.textContent?.includes(label),
+  ) as HTMLButtonElement | undefined;
+  if (!button) throw new Error(`action button not found: ${label}`);
+  return button;
+}
+
+function confirmButton(): HTMLButtonElement {
+  const button = document.querySelector(".decision-confirm-bar__confirm") as HTMLButtonElement | null;
+  if (!button) throw new Error("confirm button did not render");
+  return button;
+}
+
+async function selectAndConfirm(label: string) {
+  await act(async () => {
+    actionButton(label).click();
+    await flushTimers();
+  });
+  await act(async () => {
+    confirmButton().click();
+    await flushTimers(220);
+  });
+}
+
+async function clickImmediateAction(label: string) {
+  await act(async () => {
+    actionButton(label).click();
+    await flushTimers();
+  });
+}
+
 console.log("\napproval modal file references");
 
 {
+  const token = activeFileReferenceToken("please inspect @README\n");
+  eq(token?.raw, "README", "plan revision file trigger ignores an invisible trailing newline");
+  eq(
+    pickInlineFileReference("please inspect @README\n", token?.raw ?? null, token?.dir ?? "", { name: "README.md", isDir: false }),
+    "please inspect @README.md ",
+    "plan revision file selection removes an invisible trailing newline",
+  );
+}
+
+{
   const dom = installDom("en-US");
+  const fileScopeCalls: string[] = [];
   mockApp({
-    ListDir: async () => [{ name: "src", isDir: true }, { name: "README.md", isDir: false }],
-    SearchFileRefs: async () => [],
+    ListDirForTab: async (tabId) => {
+      fileScopeCalls.push(tabId);
+      return [{ name: "src", isDir: true }, { name: "README.md", isDir: false }];
+    },
+    SearchFileRefsForTab: async () => [],
   });
   const { root, revisions, rerender } = await renderApproval();
 
-  const reviseButton = Array.from(document.querySelectorAll("button")).find((button) => button.textContent?.includes("Revise plan")) as HTMLButtonElement | undefined;
-  if (!reviseButton) throw new Error("revise button did not render");
-
-  await act(async () => {
-    reviseButton.click();
-    await flushTimers();
-  });
+  await clickImmediateAction("Revise plan");
 
   const textarea = document.querySelector(".plan-revision__input") as HTMLTextAreaElement | null;
   if (!textarea) throw new Error("plan revision textarea did not render");
@@ -152,6 +186,7 @@ console.log("\napproval modal file references");
   await waitFor("plan revision @ text opens file suggestions", () => document.body.textContent?.includes("README.md") === true);
 
   ok(document.body.textContent?.includes("README.md") === true, "plan revision @ text opens file suggestions");
+  ok(fileScopeCalls.every((tabId) => tabId === "tab-a"), "plan revision file suggestions stay scoped to the active tab");
 
   const readmeButton = Array.from(document.querySelectorAll(".slashmenu__item")).find((button) => button.textContent?.includes("README.md")) as HTMLButtonElement | undefined;
   if (!readmeButton) throw new Error("README file suggestion did not render");
@@ -190,17 +225,43 @@ console.log("\napproval modal file references");
       id: "sandbox-escape-approval-zh",
       tool: "sandbox_escape",
       subject: "run unconfined once: go test ./...",
-      reason: "Windows sandbox failed while starting this command. Run it unconfined one time? This bypasses the OS sandbox for this command only.",
+      reason: "Windows does not provide an OS-level Bash sandbox for this command. Run it unconfined one time? This bypasses OS isolation for this command only.",
     },
   });
 
   const text = document.body.textContent ?? "";
-  ok(text.includes("仅本次不进沙箱运行：go test ./..."), "sandbox escape approval localizes subject in Chinese UI");
-  ok(text.includes("Windows 沙箱启动这条命令时失败"), "sandbox escape approval localizes English backend reason in Chinese UI");
+  ok(text.includes("go test ./..."), "sandbox escape approval keeps the command visible in Chinese UI");
+  ok(!text.includes("仅本次不进沙箱运行："), "sandbox escape approval removes the redundant scope prefix from the command block");
+  eq((text.match(/go test \.\/\.\.\./g) ?? []).length, 1, "sandbox escape approval renders the command once");
+  ok(text.includes("Windows 不提供这条命令所需的 OS 级 Bash 沙箱"), "sandbox escape approval localizes the retired Windows backend reason in Chinese UI");
   ok(text.includes("允许一次"), "sandbox escape Chinese approval shows allow once");
   ok(text.includes("本会话使用真实环境"), "sandbox escape Chinese approval shows session grant");
   ok(text.includes("拒绝"), "sandbox escape Chinese approval shows deny");
   ok(!text.includes("总是允许"), "sandbox escape Chinese approval hides persistent grant");
+
+  await act(async () => {
+    root.unmount();
+  });
+  dom.window.close();
+}
+
+{
+  const dom = installDom("zh-CN");
+  mockApp({
+    ListDir: async () => [],
+    SearchFileRefs: async () => [],
+  });
+  const { root } = await renderApproval({
+    approval: {
+      id: "sandbox-escape-runtime-approval-zh",
+      tool: "sandbox_escape",
+      subject: "run unconfined once: go test ./...",
+      reason: "The OS sandbox could not start this command. Run it unconfined one time? This bypasses OS isolation for this command only.",
+    },
+  });
+
+  const text = document.body.textContent ?? "";
+  ok(text.includes("OS 沙箱无法启动这条命令"), "sandbox escape approval localizes the runtime failure reason in Chinese UI");
 
   await act(async () => {
     root.unmount();
@@ -244,15 +305,79 @@ console.log("\napproval modal file references");
       id: "plan-mode-read-only-command-zh",
       tool: "plan_mode_read_only_command",
       subject: "Trust \"gh issue view\" as a read-only command prefix while planning\nCommand: gh issue view 5867 --json title",
-      reason: "This bash command is not in Reasonix's built-in read-only set. Confirm only if this exact prefix is read-only for planning and research. Auto/YOLO approval cannot answer this trust prompt.",
+      reason: "This bash command is not in Reasonix's built-in read-only set. Confirm only if this exact prefix is read-only for planning and research. Permission presets cannot answer this trust prompt.",
     },
   });
 
   const text = document.body.textContent ?? "";
   ok(text.includes("计划模式只读命令"), "plan-mode read-only command approval localizes tool label in Chinese UI");
   ok(text.includes("在计划模式中信任 \"gh issue view\" 为只读命令前缀"), "plan-mode read-only command approval localizes subject in Chinese UI");
-  ok(text.includes("不在 Reasonix 内置只读集合中"), "plan-mode read-only command approval localizes reason in Chinese UI");
+  ok(text.includes("当前权限模式之外"), "plan-mode read-only command approval localizes reason in Chinese UI");
 
+  await act(async () => {
+    root.unmount();
+  });
+  dom.window.close();
+}
+
+{
+  const dom = installDom("zh-CN");
+  mockApp({
+    ListDir: async () => [],
+    SearchFileRefs: async () => [],
+  });
+  const { root } = await renderApproval({
+    approval: {
+      id: "dynamic-bash-zh",
+      tool: "bash",
+      subject: "python3 -c \"print('hello')\"",
+      reason: "Matched permission rule: ask Bash(python3:*)\nThis command requests access outside the active permission preset. Review the target and approve only the precise scope required.",
+    },
+  });
+
+  const text = document.body.textContent ?? "";
+  ok(text.includes("命中权限规则：ask Bash(python3:*)"), "approval identifies the exact matched permission rule");
+  ok(text.includes("当前权限模式之外"), "Bash approval explains the active permission boundary in Chinese");
+  ok(text.includes("精确范围"), "Bash approval tells the user to grant only the required scope");
+
+  await act(async () => {
+    root.unmount();
+  });
+  dom.window.close();
+}
+
+{
+  const dom = installDom();
+  mockApp({
+    ListDir: async () => [],
+    SearchFileRefs: async () => [],
+  });
+  const { root, rerender } = await renderApproval();
+
+  await clickImmediateAction("Revise plan");
+
+  const textarea = document.querySelector(".plan-revision__input") as HTMLTextAreaElement | null;
+  if (!textarea) throw new Error("plan revision textarea did not render");
+  ok(textarea === document.activeElement, "opening plan revision focuses its textarea once");
+
+  const transcriptText = document.createElement("p");
+  transcriptText.tabIndex = -1;
+  transcriptText.textContent = "copy this plan text";
+  document.body.appendChild(transcriptText);
+  transcriptText.focus();
+  const range = document.createRange();
+  range.selectNodeContents(transcriptText);
+  const selection = document.getSelection();
+  selection?.removeAllRanges();
+  selection?.addRange(range);
+
+  // App refreshes tab metadata periodically; emulate callback churn from a parent rerender.
+  await rerender({ onRevisionActiveChange: () => undefined });
+
+  ok(document.activeElement === transcriptText, "parent rerender does not return focus to plan revision");
+  eq(document.getSelection()?.toString(), "copy this plan text", "parent rerender preserves transcript text selection");
+
+  transcriptText.remove();
   await act(async () => {
     root.unmount();
   });
@@ -267,13 +392,7 @@ console.log("\napproval modal file references");
   });
   const { root, activeStates, rerender } = await renderApproval();
 
-  const reviseButton = Array.from(document.querySelectorAll("button")).find((button) => button.textContent?.includes("Revise plan")) as HTMLButtonElement | undefined;
-  if (!reviseButton) throw new Error("revise button did not render");
-
-  await act(async () => {
-    reviseButton.click();
-    await flushTimers();
-  });
+  await clickImmediateAction("Revise plan");
 
   const textarea = document.querySelector(".plan-revision__input") as HTMLTextAreaElement | null;
   if (!textarea) throw new Error("plan revision textarea did not render");
@@ -310,7 +429,33 @@ console.log("\napproval modal file references");
     "npm run build\n\nRun the build command to verify frontend artifacts.",
     "default-open tool approval keeps the complete subject visible",
   );
-  ok(document.body.textContent?.includes("Hide") === true, "tool approval details start expanded");
+  eq(
+    (document.body.textContent?.match(/npm run build/g) ?? []).length,
+    1,
+    "tool approval renders the command once instead of repeating it in header metadata",
+  );
+  ok(document.querySelector(".prompt-shelf__meta") == null, "tool approval omits duplicate subject metadata");
+  // Subject is always visible; reason expands when short enough / via Details.
+  const actions = [...document.querySelectorAll(".prompt-shelf__actions .prompt-action")] as HTMLElement[];
+  eq(actions.length, 3, "ordinary tool approval exposes once, session, and deny options");
+  ok(actions[0]?.classList.contains("prompt-action--selected"), "default selection is allow once");
+  eq(
+    actions[1]?.getAttribute("title"),
+    "Allow matching calls until this session ends; resets on restart.",
+    "session option carries a native title fallback",
+  );
+  ok(document.querySelector(".decision-confirm-bar__confirm") != null, "decision surface shows an explicit confirm button");
+
+  await act(async () => {
+    actions[1].click();
+    await flushTimers();
+  });
+  ok(actions[1]?.classList.contains("prompt-action--selected"), "clicking an option only changes selection");
+  eq(
+    document.querySelectorAll(".prompt-action--selected").length >= 1,
+    true,
+    "selection state updates without submitting",
+  );
 
   await act(async () => {
     root.unmount();
@@ -337,23 +482,26 @@ console.log("\napproval modal file references");
   const text = document.body.textContent ?? "";
   ok(text.includes("Allow once"), "fresh-human approval shows allow once");
   ok(text.includes("Deny"), "fresh-human approval shows deny");
-  ok(!text.includes("Allow for session"), "fresh-human approval hides session grant");
-  ok(!text.includes("Always allow"), "fresh-human approval hides persistent grant");
+  ok(!text.includes("Allow matching for this session"), "fresh-human approval hides session grant");
+  ok(!text.includes("Always allow matching"), "fresh-human approval hides persistent grant");
   eq(
     Array.from(document.querySelectorAll(".prompt-shelf__actions button")).map((button) => button.textContent).join("|"),
-    "1Allow once|2Deny",
-    "fresh-human approval keeps conventional allow/deny shortcut keys",
+    "1Allow onceAllow this call only; the next one asks again.|2DenyReject this call; the model sees the refusal and continues.",
+    "fresh-human approval keeps conventional allow/deny shortcut keys with inline consequences",
   );
 
-  const allowButton = Array.from(document.querySelectorAll("button")).find((button) => button.textContent?.includes("Allow once")) as HTMLButtonElement | undefined;
-  if (!allowButton) throw new Error("allow once button did not render");
-
   await act(async () => {
-    allowButton.click();
+    actionButton("Allow once").click();
     await flushTimers();
   });
+  eq(JSON.stringify(answers), "[]", "clicking allow once only selects; does not approve yet");
 
-  eq(JSON.stringify(answers), JSON.stringify([[true, false, false]]), "fresh-human approval allows only once");
+  await act(async () => {
+    confirmButton().click();
+    await flushTimers(220);
+  });
+
+  eq(JSON.stringify(answers), JSON.stringify([[true, false, false]]), "fresh-human approval allows only once after confirm");
 
   await act(async () => {
     root.unmount();
@@ -381,8 +529,14 @@ console.log("\napproval modal file references");
     document.dispatchEvent(new window.KeyboardEvent("keydown", { key: "2", bubbles: true, cancelable: true }));
     await flushTimers();
   });
+  eq(JSON.stringify(answers), "[]", "fresh-human numeric 2 only selects deny");
 
-  eq(JSON.stringify(answers), JSON.stringify([[false, false, false]]), "fresh-human numeric 2 denies");
+  await act(async () => {
+    document.dispatchEvent(new window.KeyboardEvent("keydown", { key: "Enter", bubbles: true, cancelable: true }));
+    await flushTimers(220);
+  });
+
+  eq(JSON.stringify(answers), JSON.stringify([[false, false, false]]), "fresh-human Enter after digit 2 denies");
 
   await act(async () => {
     root.unmount();
@@ -412,20 +566,16 @@ console.log("\napproval modal file references");
   ok(text.includes("Allow once"), "sandbox escape approval shows allow once");
   ok(text.includes("Use real environment for this session"), "sandbox escape approval shows session grant");
   ok(text.includes("Deny"), "sandbox escape approval shows deny");
-  ok(!text.includes("Always allow"), "sandbox escape approval hides persistent grant");
-  eq(
-    Array.from(document.querySelectorAll(".prompt-shelf__actions button")).map((button) => button.textContent).join("|"),
-    "1Allow once|2Use real environment for this session|3Deny",
-    "sandbox escape approval keeps conventional allow once/session/deny shortcut keys",
-  );
+  ok(!text.includes("Always allow matching"), "sandbox escape approval hides persistent grant");
+  eq(document.querySelectorAll(".prompt-shelf__actions .prompt-action").length, 3, "sandbox escape keeps three options");
 
   await act(async () => {
-    document.dispatchEvent(new window.KeyboardEvent("keydown", { key: "ArrowRight", bubbles: true, cancelable: true }));
+    document.dispatchEvent(new window.KeyboardEvent("keydown", { key: "ArrowDown", bubbles: true, cancelable: true }));
     await flushTimers();
   });
   await act(async () => {
     document.dispatchEvent(new window.KeyboardEvent("keydown", { key: "Enter", bubbles: true, cancelable: true }));
-    await flushTimers();
+    await flushTimers(220);
   });
   eq(JSON.stringify(answers), JSON.stringify([{ allow: true, session: true, persist: false }]), "sandbox escape Enter on selected session action grants session");
 
@@ -456,7 +606,46 @@ console.log("\napproval modal file references");
     document.dispatchEvent(new window.KeyboardEvent("keydown", { key: "3", bubbles: true, cancelable: true }));
     await flushTimers();
   });
-  eq(JSON.stringify(answers), JSON.stringify([{ allow: false, session: false, persist: false }]), "sandbox escape numeric 3 denies");
+  eq(JSON.stringify(answers), "[]", "sandbox escape numeric 3 only selects deny");
+  await act(async () => {
+    document.dispatchEvent(new window.KeyboardEvent("keydown", { key: "Enter", bubbles: true, cancelable: true }));
+    await flushTimers(220);
+  });
+  eq(JSON.stringify(answers), JSON.stringify([{ allow: false, session: false, persist: false }]), "sandbox escape Enter after digit 3 denies");
+
+  await act(async () => {
+    root.unmount();
+  });
+  dom.window.close();
+}
+
+{
+  const dom = installDom("en-US");
+  const pending: Array<(entries: Array<{ name: string; isDir: boolean }>) => void> = [];
+  mockApp({
+    ListDirForTab: async () => new Promise((resolve) => pending.push(resolve)),
+    SearchFileRefsForTab: async () => [],
+  });
+  const { root, rerender } = await renderApproval({ workspaceScopeKey: "session-a" });
+
+  await clickImmediateAction("Revise plan");
+  await rerender({ insertRequest: { id: 20, text: "inspect @" } });
+  await waitFor("initial approval session scope request", () => pending.length === 1);
+  await rerender({ workspaceScopeKey: "session-b" });
+  await waitFor("next approval session scope request", () => pending.length === 2);
+
+  await act(async () => {
+    pending[1]([{ name: "current-plan-file.ts", isDir: false }]);
+    await flushTimers();
+  });
+  await waitFor("current approval session file result", () => document.body.textContent?.includes("current-plan-file.ts") === true);
+
+  await act(async () => {
+    pending[0]([{ name: "stale-plan-file.ts", isDir: false }]);
+    await flushTimers();
+  });
+  ok(document.body.textContent?.includes("current-plan-file.ts") === true, "current approval session file refs stay visible");
+  ok(document.body.textContent?.includes("stale-plan-file.ts") === false, "late approval session file refs are ignored");
 
   await act(async () => {
     root.unmount();

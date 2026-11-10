@@ -20,6 +20,9 @@ import (
 const acpTestProviderKind = "acp-test-provider"
 
 func init() {
+	provider.RegisterReasoning(acpTestProviderKind, func(cfg provider.Config) provider.ReasoningCapability {
+		return provider.DeclaredReasoning(cfg, provider.ReasoningOptions(""))
+	})
 	provider.Register(acpTestProviderKind, func(cfg provider.Config) (provider.Provider, error) {
 		return &acpTestProvider{cfg: cfg}, nil
 	})
@@ -30,7 +33,6 @@ func TestACPBuiltinToolsKeepSessionLevelBuiltins(t *testing.T) {
 	tools := toolMap(acpBuiltinTools(&config.Config{}, dir, []string{dir}))
 	for _, name := range []string{
 		"todo_write",
-		"complete_step",
 		"bash_output",
 		"kill_shell",
 		"wait",
@@ -40,6 +42,9 @@ func TestACPBuiltinToolsKeepSessionLevelBuiltins(t *testing.T) {
 		if tools[name] == nil {
 			t.Fatalf("ACP workspace tools missing %q; got %v", name, toolNames(tools))
 		}
+	}
+	if tools["complete_step"] != nil || tools["review_report"] != nil {
+		t.Fatalf("ACP exposed retired proof tools; got %v", toolNames(tools))
 	}
 }
 
@@ -69,6 +74,102 @@ func TestACPInitializesWithoutAPIKey(t *testing.T) {
 	}
 }
 
+func TestACPRejectsInvalidSupervisorFlags(t *testing.T) {
+	for _, args := range [][]string{
+		{"--planner=maybe"},
+		{"--sandbox-network=maybe"},
+		{"--sandbox-bash=maybe"},
+	} {
+		if rc := acpCommand(args, "test-version"); rc != 2 {
+			t.Fatalf("acpCommand(%v) rc = %d, want 2", args, rc)
+		}
+	}
+}
+
+func TestACPSupervisorRuntimeStateUsesHardOverrides(t *testing.T) {
+	isolateCLIConfigHome(t)
+	project := t.TempDir()
+	if err := os.WriteFile(filepath.Join(project, "reasonix.toml"), []byte(`
+[agent]
+planner_model = "configured-planner"
+
+[sandbox]
+network = true
+bash = "off"
+
+allow_write = ["../outside"]
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	approveWorkspace(t, project)
+	off := false
+	factory := &acpFactory{
+		plannerOff: true, networkOverride: &off, bashOverride: "enforce", workspaceOnly: true,
+	}
+	state, err := factory.SessionRuntimeState(context.Background(), acp.SessionRuntimeStateParams{
+		Cwd: project, Model: "configured-planner", RuntimeProfile: "balanced",
+	})
+	if err != nil {
+		t.Fatalf("SessionRuntimeState: %v", err)
+	}
+	if state.PlannerMode != "off" || state.Sandbox.Mode != "enforce" || state.Sandbox.NetworkEnabled {
+		t.Fatalf("runtime overrides = %+v", state)
+	}
+	if len(state.Sandbox.WriteRoots) != 1 || state.Sandbox.WriteRoots[0] != project || state.Sandbox.WorkspaceRoot != project {
+		t.Fatalf("workspace confinement = %+v", state.Sandbox)
+	}
+}
+
+func TestACPSupervisorRuntimeStateDegradesWhenSandboxIsUnavailable(t *testing.T) {
+	isolateCLIConfigHome(t)
+	project := t.TempDir()
+	if err := os.WriteFile(filepath.Join(project, "reasonix.toml"), []byte("[sandbox]\nbash = \"enforce\"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	approveWorkspace(t, project)
+	unavailable := func() bool { return false }
+	params := acp.SessionRuntimeStateParams{Cwd: project, RuntimeProfile: "balanced"}
+
+	state, err := (&acpFactory{
+		bashOverride: "enforce", sandboxAvailable: unavailable,
+	}).SessionRuntimeState(context.Background(), params)
+	if err != nil {
+		t.Fatalf("default ACP startup must report unavailable sandbox instead of failing: %v", err)
+	}
+	if state.Sandbox.Mode != "enforce" || state.Sandbox.Available {
+		t.Fatalf("degraded sandbox state = %+v", state.Sandbox)
+	}
+
+	_, err = (&acpFactory{
+		bashOverride: "enforce", requireSandbox: true, sandboxAvailable: unavailable,
+	}).SessionRuntimeState(context.Background(), params)
+	if err == nil || !strings.Contains(err.Error(), "sandbox unavailable") {
+		t.Fatalf("explicit enforce must fail closed, got %v", err)
+	}
+}
+
+func TestEffectiveACPPlannerModeIsIndependentOfExecutionMode(t *testing.T) {
+	cfg := config.Default()
+	cfg.Agent.PlannerModel = "planner/planner-model"
+	cfg.Providers = []config.ProviderEntry{
+		{Name: "executor", Kind: "openai", Model: "executor-model"},
+		{Name: "planner", Kind: "openai", Model: "planner-model"},
+	}
+	if got := effectiveACPPlannerMode(cfg, false, "executor/executor-model"); got != "on" {
+		t.Fatalf("split-model planner mode = %q, want on", got)
+	}
+	if got := effectiveACPPlannerMode(cfg, true, "executor/executor-model"); got != "off" {
+		t.Fatalf("disabled planner mode = %q, want off", got)
+	}
+	if got := effectiveACPPlannerMode(cfg, false, "planner/planner-model"); got != "off" {
+		t.Fatalf("same-model planner mode = %q, want off", got)
+	}
+	cfg.Agent.PlannerModel = ""
+	if got := effectiveACPPlannerMode(cfg, false, "executor/executor-model"); got != "off" {
+		t.Fatalf("missing planner model = %q, want off", got)
+	}
+}
+
 func TestACPFactoryLoadsSessionCwdProjectConfig(t *testing.T) {
 	home := isolateCLIConfigHome(t)
 	if _, err := config.SetCredential("REASONIX_TEST_KEY", "test-key"); err != nil {
@@ -87,6 +188,7 @@ api_key_env = "REASONIX_TEST_KEY"
 `), 0o644); err != nil {
 		t.Fatal(err)
 	}
+	approveWorkspace(t, project)
 	cmdDir := filepath.Join(project, ".reasonix", "commands")
 	if err := os.MkdirAll(cmdDir, 0o755); err != nil {
 		t.Fatal(err)
@@ -112,7 +214,7 @@ api_key_env = "REASONIX_TEST_KEY"
 	t.Fatalf("ACP session did not load project command from cwd; commands=%v", ctrl.Commands())
 }
 
-func TestACPFactoryClearsEffortOverrideForUnsupportedModel(t *testing.T) {
+func TestACPFactoryRejectsExplicitEffortForUnsupportedModel(t *testing.T) {
 	isolateCLIConfigHome(t)
 	if _, err := config.SetCredential("REASONIX_TEST_KEY", "test-key"); err != nil {
 		t.Fatalf("SetCredential: %v", err)
@@ -139,6 +241,7 @@ effort = "high"
 `), 0o644); err != nil {
 		t.Fatal(err)
 	}
+	approveWorkspace(t, project)
 
 	high := "high"
 	state, err := (&acpFactory{}).SessionConfigState(context.Background(), acp.SessionConfigStateParams{
@@ -158,14 +261,51 @@ effort = "high"
 		Model:          "plain/plain-model",
 		EffortOverride: &high,
 	})
+	if err == nil {
+		t.Fatal("explicit unsupported selection was silently cleared")
+	}
+}
+
+func TestACPFactoryPinsRuntimeProfileAndOmitsWorkMode(t *testing.T) {
+	isolateCLIConfigHome(t)
+	if _, err := config.SetCredential("REASONIX_TEST_KEY", "test-key"); err != nil {
+		t.Fatalf("SetCredential: %v", err)
+	}
+	project := t.TempDir()
+	if err := os.WriteFile(filepath.Join(project, "reasonix.toml"), []byte(`
+default_model = "local"
+
+[[providers]]
+name = "local"
+kind = "acp-test-provider"
+base_url = "http://example.invalid"
+model = "fake-model"
+api_key_env = "REASONIX_TEST_KEY"
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	approveWorkspace(t, project)
+
+	state, err := (&acpFactory{}).SessionConfigState(context.Background(), acp.SessionConfigStateParams{
+		Cwd:            project,
+		RuntimeProfile: "delivery",
+	})
 	if err != nil {
-		t.Fatalf("plain SessionConfigState: %v", err)
+		t.Fatalf("SessionConfigState: %v", err)
 	}
-	if _, ok := findACPConfigOption(state.ConfigOptions, "effort"); ok {
-		t.Fatalf("plain model should not advertise effort option: %+v", state.ConfigOptions)
+	if _, ok := findACPConfigOption(state.ConfigOptions, "work_mode"); ok {
+		t.Fatalf("work_mode should not be advertised: %+v", state.ConfigOptions)
 	}
-	if state.EffortOverride == nil || *state.EffortOverride != "" {
-		t.Fatalf("plain effort override = %v, want explicit empty override", state.EffortOverride)
+	if state.RuntimeProfile != "balanced" {
+		t.Fatalf("RuntimeProfile = %q, want pinned balanced", state.RuntimeProfile)
+	}
+
+	state, err = (&acpFactory{}).SessionConfigState(context.Background(), acp.SessionConfigStateParams{Cwd: project})
+	if err != nil {
+		t.Fatalf("default SessionConfigState: %v", err)
+	}
+	if state.RuntimeProfile != "balanced" {
+		t.Fatalf("default RuntimeProfile = %q, want balanced", state.RuntimeProfile)
 	}
 }
 
@@ -214,7 +354,7 @@ func TestACPSubagentProviderResolverHonorsProfile(t *testing.T) {
 	}
 
 	resolve := newACPSubagentProviderResolver(cfg, parent, netclient.ProxySpec{})
-	prov, _, ctxWin, err := resolve("sub/sub-model", "HIGH")
+	prov, _, ctxWin, err := resolve("sub/sub-model", "high")
 	if err != nil {
 		t.Fatalf("resolve sub profile: %v", err)
 	}

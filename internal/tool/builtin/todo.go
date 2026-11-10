@@ -1,50 +1,58 @@
 package builtin
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
+	"strings"
 
-	"reasonix/internal/evidence"
 	"reasonix/internal/tool"
 )
 
 func init() { tool.RegisterBuiltin(todoWrite{}) }
 
-// todoWrite records the agent's running task list. It has no host side effects —
-// the full list lives in the call's args (the model re-sends it whole on every
-// update), which a frontend renders as a checklist. Execute just validates the
-// shape and acks with a count, so the model gets a stable confirmation. The agent
-// keeps one item in_progress at a time and flips each to completed as it finishes.
+// todoWrite replaces the current turn's complete, flat task list. The list is
+// model-managed progress UI; it is deliberately independent from Plan and Goal
+// authorization and from delivery evidence.
 type todoWrite struct{}
 
 type todoItem struct {
-	Content    string `json:"content"`
-	Status     string `json:"status"`
-	ActiveForm string `json:"activeForm,omitempty"`
-	Level      int    `json:"level,omitempty"`
+	Content string `json:"content"`
+	Status  string `json:"status"`
+}
+
+type todoWriteResponse struct {
+	Todos  []todoItem `json:"todos"`
+	Counts struct {
+		Total      int `json:"total"`
+		Pending    int `json:"pending"`
+		InProgress int `json:"in_progress"`
+		Completed  int `json:"completed"`
+	} `json:"counts"`
 }
 
 func (todoWrite) Name() string { return "todo_write" }
 
 func (todoWrite) Description() string {
-	return "Record and update a structured task list for the current work. Send the COMPLETE list every call — it replaces the previous one. Use it to plan multi-step work and show progress: keep exactly one item in_progress at a time, and flip an item to completed the moment it's done (don't batch completions). Skip it for trivial single-step tasks. The list is two-level: a `level` 0 item is a PHASE (a milestone) and the `level` 1 items after it are its concrete sub-steps; omit `level` (0) for a flat list. Each item has `content` (imperative, e.g. \"Add the parser\"), `status` (pending|in_progress|completed), `activeForm` (present-continuous shown while in progress, e.g. \"Adding the parser\"), and optional `level` (0 phase | 1 sub-step)."
+	return "Replace the current turn's complete task list. Send the full flat list on every call; an empty list clears it. Items may be reordered, removed, replanned, or have any number in progress. Each item contains only content and status (pending|in_progress|completed)."
 }
 
 func (todoWrite) Schema() json.RawMessage {
 	return json.RawMessage(`{
 "type":"object",
+"additionalProperties":false,
 "properties":{
   "todos":{
     "type":"array",
-    "description":"The complete task list, in order. Replaces any previous list.",
+    "description":"The complete flat task list for this turn. Replaces the previous list; [] clears it.",
     "items":{
       "type":"object",
+      "additionalProperties":false,
       "properties":{
-        "content":{"type":"string","description":"Imperative description of the task."},
-        "status":{"type":"string","enum":["pending","in_progress","completed"],"description":"Task state. Keep at most one in_progress."},
-        "activeForm":{"type":"string","description":"Present-continuous form shown while the task is in progress (e.g. \"Running tests\")."},
-        "level":{"type":"integer","enum":[0,1],"description":"Nesting level: 0 = phase/milestone, 1 = a sub-step of the phase above it. Omit for a flat list."}
+        "content":{"type":"string","minLength":1,"description":"Task text. Leading and trailing whitespace is removed."},
+        "status":{"type":"string","enum":["pending","in_progress","completed"]}
       },
       "required":["content","status"]
     }
@@ -54,70 +62,74 @@ func (todoWrite) Schema() json.RawMessage {
 }`)
 }
 
-// ReadOnly is true: todo_write only records a list (no filesystem or process
-// effect), so it never needs approval and stays available in plan mode — where
-// laying out a plan as todos is exactly the point.
 func (todoWrite) ReadOnly() bool { return true }
 
-func (todoWrite) Execute(ctx context.Context, args json.RawMessage) (string, error) {
+func (todoWrite) Execute(_ context.Context, args json.RawMessage) (string, error) {
 	var p struct {
-		Todos []todoItem `json:"todos"`
+		Todos *[]json.RawMessage `json:"todos"`
 	}
-	if err := json.Unmarshal(args, &p); err != nil {
-		return "", fmt.Errorf("invalid args: %w", err)
+	dec := json.NewDecoder(bytes.NewReader(args))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&p); err != nil {
+		return "", fmt.Errorf("invalid todo_write arguments: %w; send only {todos:[{content,status}]}", err)
 	}
-	var done, active, pending int
-	for i, t := range p.Todos {
-		if t.Content == "" {
-			return "", fmt.Errorf("todo %d: content is required", i+1)
+	if err := ensureJSONEnd(dec); err != nil {
+		return "", fmt.Errorf("invalid todo_write arguments: %w", err)
+	}
+	if p.Todos == nil {
+		return "", fmt.Errorf("todos is required and must be an array")
+	}
+
+	rawTodos := *p.Todos
+	response := todoWriteResponse{Todos: make([]todoItem, len(rawTodos))}
+	seen := make(map[string]int, len(rawTodos))
+	for i, raw := range rawTodos {
+		if bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+			return "", fmt.Errorf("todos[%d] must be an object with content and status", i)
 		}
-		if t.Level < 0 || t.Level > 1 {
-			return "", fmt.Errorf("todo %d: invalid level %d (want 0 phase | 1 sub-step)", i+1, t.Level)
+		var item todoItem
+		itemDecoder := json.NewDecoder(bytes.NewReader(raw))
+		itemDecoder.DisallowUnknownFields()
+		if err := itemDecoder.Decode(&item); err != nil {
+			return "", fmt.Errorf("todos[%d] is invalid: %w; use only content and status", i, err)
 		}
-		switch t.Status {
-		case "completed":
-			done++
+		if err := ensureJSONEnd(itemDecoder); err != nil {
+			return "", fmt.Errorf("todos[%d] is invalid: %w", i, err)
+		}
+		item.Content = strings.TrimSpace(item.Content)
+		if item.Content == "" {
+			return "", fmt.Errorf("todos[%d].content must be non-empty after trimming", i)
+		}
+		if previous, ok := seen[item.Content]; ok {
+			return "", fmt.Errorf("todos[%d].content duplicates todos[%d].content %q; merge or rename one item", i, previous, item.Content)
+		}
+		seen[item.Content] = i
+		switch item.Status {
+		case "pending":
+			response.Counts.Pending++
 		case "in_progress":
-			active++
-		case "pending", "":
-			pending++
+			response.Counts.InProgress++
+		case "completed":
+			response.Counts.Completed++
 		default:
-			return "", fmt.Errorf("todo %d: invalid status %q (want pending|in_progress|completed)", i+1, t.Status)
+			return "", fmt.Errorf("todos[%d].status %q is invalid; use pending, in_progress, or completed", i, item.Status)
 		}
+		response.Todos[i] = item
 	}
-	if err := verifyTodoCompletionTransitions(ctx, p.Todos); err != nil {
-		return "", err
+	response.Counts.Total = len(response.Todos)
+	out, err := json.Marshal(response)
+	if err != nil {
+		return "", fmt.Errorf("encode todo_write result: %w", err)
 	}
-	return fmt.Sprintf("Todos updated: %d total — %d completed, %d in progress, %d pending.",
-		len(p.Todos), done, active, pending), nil
+	return string(out), nil
 }
 
-func verifyTodoCompletionTransitions(ctx context.Context, todos []todoItem) error {
-	ledger, ok := evidence.FromContext(ctx)
-	if !ok {
+func ensureJSONEnd(dec *json.Decoder) error {
+	var extra any
+	if err := dec.Decode(&extra); err == io.EOF {
 		return nil
+	} else if err != nil {
+		return err
 	}
-	missing, hasBaseline := ledger.UnverifiedCompletedTodos(toEvidenceTodos(todos))
-	if !hasBaseline || len(missing) == 0 {
-		return nil
-	}
-	const hint = "; sign each finished item off with complete_step first, then re-send this todo_write"
-	if len(missing) == 1 {
-		m := missing[0]
-		return fmt.Errorf("todo %d %q is newly completed but has no matching successful complete_step receipt in this turn%s", m.Index, m.Content, hint)
-	}
-	return fmt.Errorf("%d todos are newly completed but have no matching successful complete_step receipts in this turn%s", len(missing), hint)
-}
-
-func toEvidenceTodos(todos []todoItem) []evidence.TodoItem {
-	out := make([]evidence.TodoItem, 0, len(todos))
-	for _, t := range todos {
-		out = append(out, evidence.TodoItem{
-			Content:    t.Content,
-			Status:     t.Status,
-			ActiveForm: t.ActiveForm,
-			Level:      t.Level,
-		})
-	}
-	return out
+	return fmt.Errorf("multiple JSON values are not allowed")
 }

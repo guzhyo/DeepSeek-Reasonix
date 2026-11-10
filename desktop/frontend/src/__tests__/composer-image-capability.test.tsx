@@ -8,7 +8,8 @@ import { Composer } from "../components/Composer";
 import { UserMessage } from "../components/Message";
 import { LocaleProvider } from "../lib/i18n";
 import { ToastProvider } from "../lib/toast";
-import type { CollaborationMode, TokenMode, ToolApprovalMode } from "../lib/types";
+import type { CollaborationMode, ToolApprovalMode } from "../lib/types";
+import { installDesktopHostStub } from "./desktopHostStub";
 
 let passed = 0;
 let failed = 0;
@@ -91,16 +92,29 @@ function installDom() {
 }
 
 function installBridgeApp(methods: Record<string, unknown>) {
-  (window as unknown as { go: { main: { App: Record<string, unknown> } } }).go = {
-    main: {
-      App: {
-        Commands: async () => [],
-        Models: async () => [],
-        ModelsForTab: async () => [],
-        ...methods,
-      },
-    },
-  };
+	const legacySave = methods.SavePastedImageForTarget as ((token: string, dataURL: string) => Promise<string>) | undefined;
+	const legacyPreview = methods.AttachmentDataURLForTarget as ((token: string, path: string) => Promise<string>) | undefined;
+	const unscopedPreview = methods.AttachmentDataURL as ((path: string) => Promise<string>) | undefined;
+  return installDesktopHostStub({
+    Commands: async () => [],
+    Models: async () => [],
+    ModelsForTab: async () => [],
+		CaptureAttachmentTarget: async () => ({ token: "test-attachment-target", capabilities: ["attachments-v2"] }),
+		ReleaseAttachmentTarget: async () => {},
+		StageImageForTarget: async (token: string, _operationID: string, displayName: string, mime: string, dataURL: string) => ({
+			draftId: "",
+			path: legacySave ? await legacySave(token, dataURL) : ".reasonix/attachments/mock.png",
+			displayName,
+			mime,
+			width: 1,
+			height: 1,
+			bytes: dataURL.length,
+		}),
+		ReadDraftImageForTarget: async () => "data:image/png;base64,iVBORw0KGgo=",
+		AttachmentDataURLForTarget: legacyPreview ?? (async () => "data:image/png;base64,iVBORw0KGgo="),
+		AttachmentDataURLForTab: async (_tabID: string, path: string) => unscopedPreview ? unscopedPreview(path) : "data:image/png;base64,iVBORw0KGgo=",
+    ...methods,
+  });
 }
 
 async function renderComposer(props: Partial<Parameters<typeof Composer>[0]> = {}) {
@@ -111,7 +125,7 @@ async function renderComposer(props: Partial<Parameters<typeof Composer>[0]> = {
     running: false,
     collaborationMode: "normal",
     toolApprovalMode: "ask" as ToolApprovalMode,
-    tokenMode: "full" as TokenMode,
+
     goal: "",
     cwd: "/repo",
     modelLabel: "DeepSeek-R1",
@@ -119,16 +133,15 @@ async function renderComposer(props: Partial<Parameters<typeof Composer>[0]> = {
     tabId: "single-surface-tab",
     sessionKey: "session:project:/repo:topic-a:session-a",
     onSend: () => {},
-    onCancel: () => undefined,
+    onCancel: async () => ({ discardedItemIds: [] }),
     onCycleMode: () => {},
     onSetMode: () => {},
     onSetCollaborationMode: (_mode: CollaborationMode) => {},
     onSetToolApprovalMode: () => {},
-    onToggleYoloApprovalMode: () => {},
-    onClearGoal: () => {},
+        onClearGoal: () => {},
     onSwitchModel: () => {},
     onSetEffort: () => {},
-    onSetTokenMode: () => {},
+
     ready: true,
     ...props,
   };
@@ -211,15 +224,75 @@ function renderUserMessage(text: string, props: Partial<Parameters<typeof UserMe
 
 console.log("\ncomposer image capability");
 
+async function verifyUnsupportedAttachmentCapability(
+  overrides: Record<string, unknown>,
+  file: File | undefined,
+  label: string,
+) {
+  const dom = installDom();
+  let unhandled = 0;
+  const onUnhandled = (event: PromiseRejectionEvent) => {
+    unhandled += 1;
+    event.preventDefault();
+  };
+  window.addEventListener("unhandledrejection", onUnhandled);
+  installBridgeApp(overrides);
+  const { root } = await renderComposer({
+    imageInputEnabled: true,
+    insertRequest: { id: 1, text: "keep this draft", mode: "replace" },
+  });
+  const event = imagePasteEvent(file ?? new File([], "", { type: "" }));
+  if (!file) {
+    Object.defineProperty(event, "clipboardData", {
+      configurable: true,
+      value: { files: [], items: [{ kind: "file", type: "image/png", getAsFile: () => null }], types: ["image/png"], getData: () => "" },
+    });
+  }
+  await act(async () => {
+    textarea().dispatchEvent(event);
+    await flushTimers();
+    await flushTimers();
+  });
+  await waitFor(() => toastText() !== "");
+  eq(textarea().value, "keep this draft", `${label} keeps draft text`);
+  eq(contextItemCount(), 0, `${label} does not add a partial attachment`);
+  ok(toastText().length > 0, `${label} reports an explicit attachment error`);
+  eq(unhandled, 0, `${label} produces no unhandled rejection`);
+  window.removeEventListener("unhandledrejection", onUnhandled);
+  await act(async () => root.unmount());
+  dom.window.close();
+}
+
+await verifyUnsupportedAttachmentCapability(
+  { CaptureAttachmentTarget: undefined },
+  new File(["img"], "photo.png", { type: "image/png", lastModified: 1 }),
+  "missing target capture",
+);
+await verifyUnsupportedAttachmentCapability(
+  { StageImageForTarget: undefined },
+  new File(["img"], "photo.png", { type: "image/png", lastModified: 1 }),
+  "missing image staging",
+);
+await verifyUnsupportedAttachmentCapability(
+  { SavePastedFileForTarget: undefined },
+  new File(["pdf"], "document.pdf", { type: "application/pdf", lastModified: 1 }),
+  "missing pasted-file save",
+);
+await verifyUnsupportedAttachmentCapability(
+  { SaveClipboardImageForTarget: undefined },
+  undefined,
+  "missing native clipboard image read",
+);
+
 {
   const dom = installDom();
   let saveCalls = 0;
   installBridgeApp({
-    SavePastedImage: async () => {
+    SavePastedImageForTarget: async () => {
       saveCalls += 1;
       return ".reasonix/attachments/mock.png";
     },
-    AttachmentDataURL: async () => "data:image/png;base64,iVBORw0KGgo=",
+    AttachmentDataURLForTarget: async () => "data:image/png;base64,iVBORw0KGgo=",
   });
   const { root } = await renderComposer({ imageInputEnabled: false });
   const file = new File(["img"], "photo.png", { type: "image/png", lastModified: 1 });
@@ -246,8 +319,8 @@ console.log("\ncomposer image capability");
   const dom = installDom();
   const sent: Array<{ display: string; submit?: string }> = [];
   installBridgeApp({
-    SavePastedImage: async () => ".reasonix/attachments/mock.png",
-    AttachmentDataURL: async () => "data:image/png;base64,iVBORw0KGgo=",
+    SavePastedImageForTarget: async () => ".reasonix/attachments/mock.png",
+    AttachmentDataURLForTarget: async () => "data:image/png;base64,iVBORw0KGgo=",
   });
   const { root, rerender } = await renderComposer({
     imageInputEnabled: true,
@@ -271,7 +344,7 @@ console.log("\ncomposer image capability");
   });
 
   eq(sent.length, 1, "switching to a text-only model still sends the image ref for tool use");
-  ok(toastText().includes("will not receive images directly"), "text-only send warns about direct image input without blocking");
+  ok(toastText().includes("image-understanding model") || toastText().includes("图片理解模型"), "text-only send points to the image-understanding setting");
   eq(document.querySelector(".composer__prompt") === null, true, "image-input warning does not render inside the composer layout");
   ok(sent[0]?.submit?.includes("@.reasonix/attachments/mock.png") === true, "submitted text retains the local image attachment ref");
 
@@ -283,9 +356,42 @@ console.log("\ncomposer image capability");
 
 {
   const dom = installDom();
+  const sent: string[] = [];
   installBridgeApp({
-    SavePastedImage: async () => ".reasonix/attachments/mock.png",
-    AttachmentDataURL: async () => "data:image/png;base64,iVBORw0KGgo=",
+    SavePastedImageForTarget: async () => ".reasonix/attachments/mock.png",
+    AttachmentDataURLForTarget: async () => "data:image/png;base64,iVBORw0KGgo=",
+  });
+  const { root } = await renderComposer({
+    imageInputEnabled: false,
+    imageUnderstandingEnabled: true,
+    onSend: (display) => sent.push(display),
+  });
+  const file = new File(["img"], "photo.png", { type: "image/png", lastModified: 1 });
+
+  await act(async () => {
+    textarea().dispatchEvent(imagePasteEvent(file));
+    await flushTimers();
+    await flushTimers();
+  });
+  await waitFor(() => contextItemCount() === 1);
+  await act(async () => {
+    sendButton().click();
+    await flushTimers();
+  });
+  eq(sent.length, 1, "configured image-understanding fallback still sends the image turn");
+  eq(toastText(), "", "configured image-understanding fallback suppresses the obsolete warning");
+
+  await act(async () => {
+    root.unmount();
+  });
+  dom.window.close();
+}
+
+{
+  const dom = installDom();
+  installBridgeApp({
+    SavePastedImageForTarget: async () => ".reasonix/attachments/mock.png",
+    AttachmentDataURLForTarget: async () => "data:image/png;base64,iVBORw0KGgo=",
   });
   const { root } = await renderComposer({ imageInputEnabled: true });
   const file = new File(["img"], "photo.png", { type: "image/png", lastModified: 1 });
@@ -357,25 +463,18 @@ console.log("\ncomposer image capability");
   });
   const { root, paint } = renderUserMessage("check @[photo.png](.reasonix/attachments/mock.png)", {
     turn: 1,
-    onEdit: () => true,
   });
   await paint();
   await waitFor(() => Boolean(document.querySelector(".msg-attachment--image img")));
-  const edit = document.querySelector("button.msg-meta__btn:not(.msg-meta__copy)") as HTMLButtonElement | null;
-  if (!edit) throw new Error("missing message edit button");
-  await act(async () => {
-    edit.click();
-    await flushTimers();
-  });
-  await waitFor(() => Boolean(document.querySelector(".msg-edit .composer-context__thumb img")));
-  const thumb = document.querySelector(".msg-edit .composer-context__thumb") as HTMLElement | null;
-  if (!thumb) throw new Error("missing edit image thumbnail");
+  ok(!document.querySelector("button.msg-meta__btn:not(.msg-meta__copy)"), "sent messages expose copy without the retired edit entry");
+  const thumb = document.querySelector(".msg-attachment--image") as HTMLElement | null;
+  if (!thumb) throw new Error("missing sent image thumbnail");
   await act(async () => {
     thumb.click();
     await flushTimers();
   });
   await waitFor(imageViewerOpen);
-  ok(imageViewerOpen(), "edit message image thumbnail opens the image viewer");
+  ok(imageViewerOpen(), "sent image thumbnail remains previewable without message editing");
 
   await act(async () => {
     root.unmount();

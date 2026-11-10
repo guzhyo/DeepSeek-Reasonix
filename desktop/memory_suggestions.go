@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"hash/fnv"
 	"path/filepath"
 	"strings"
 	"time"
@@ -32,6 +33,7 @@ type MemorySuggestion struct {
 	Title       string   `json:"title"`
 	Description string   `json:"description"`
 	Type        string   `json:"type"`
+	Scope       string   `json:"scope"`
 	Body        string   `json:"body"`
 	Reason      string   `json:"reason"`
 	Evidence    []string `json:"evidence"`
@@ -82,11 +84,7 @@ func (a *App) MemorySuggestions() MemorySuggestionsView {
 // MemorySuggestionsForTab scans recent local history for the selected tab's
 // session directory and workspace, instead of whichever tab is currently active.
 func (a *App) MemorySuggestionsForTab(tabID string) MemorySuggestionsView {
-	view := MemorySuggestionsView{
-		Memories:    []MemorySuggestion{},
-		Skills:      []SkillSuggestion{},
-		GeneratedAt: time.Now().UTC().Format(time.RFC3339),
-	}
+	view := emptyMemorySuggestionsView()
 
 	a.mu.RLock()
 	tab := a.tabByIDLocked(tabID)
@@ -120,6 +118,14 @@ func (a *App) MemorySuggestionsForTab(tabID string) MemorySuggestionsView {
 	return view
 }
 
+func emptyMemorySuggestionsView() MemorySuggestionsView {
+	return MemorySuggestionsView{
+		Memories:    []MemorySuggestion{},
+		Skills:      []SkillSuggestion{},
+		GeneratedAt: time.Now().UTC().Format(time.RFC3339),
+	}
+}
+
 // AcceptMemorySuggestion persists a previously previewed memory candidate.
 func (a *App) AcceptMemorySuggestion(in MemorySuggestion) (string, error) {
 	return a.AcceptMemorySuggestionForTab("", in)
@@ -137,12 +143,13 @@ func (a *App) AcceptMemorySuggestionForTab(tabID string, in MemorySuggestion) (s
 	if desc == "" || body == "" {
 		return "", fmt.Errorf("memory suggestion requires description and body")
 	}
-	name := suggestionName(in.Name, desc, "memory-candidate")
+	name := acceptedSuggestionName(in.Name, desc)
 	return ctrl.SaveMemory(memory.Memory{
 		Name:        name,
 		Title:       oneLine(in.Title),
 		Description: desc,
 		Type:        memory.NormalizeType(in.Type),
+		Scope:       memory.NormalizeFactScope(in.Scope),
 		Body:        body,
 	})
 }
@@ -176,7 +183,11 @@ func (a *App) AcceptSkillSuggestionForTab(tabID string, in SkillSuggestion) (str
 	if strings.TrimSpace(in.Scope) == "global" || !st.HasProjectScope() {
 		scope = skill.ScopeGlobal
 	}
-	content := renderSkillSuggestionFile(name, desc, body)
+	// skill.RenderSkillFile yaml-escapes the free-text description; the old
+	// local string-concatenation helper produced unparseable frontmatter for a
+	// description containing ": ", which loads back as an EMPTY field map (the
+	// skill then surfaces with no description and default run semantics).
+	content := skill.RenderSkillFile(skill.SkillFileOptions{Name: name, Description: desc, Body: body})
 	return st.CreateWithContent(name, scope, content)
 }
 
@@ -217,10 +228,10 @@ func suggestMemories(set *memory.Set, sessions []suggestionSession) []MemorySugg
 	var out []MemorySuggestion
 	for _, sess := range sessions {
 		for _, msg := range sess.Messages {
-			if msg.Role != provider.RoleUser {
+			if !agent.IsUserAuthoredTurnMessage(msg) {
 				continue
 			}
-			statement, reason := extractMemoryStatement(msg.Content)
+			statement, reason := extractMemoryStatement(agent.UserMessageText(msg))
 			if statement == "" {
 				continue
 			}
@@ -229,7 +240,7 @@ func suggestMemories(set *memory.Set, sessions []suggestionSession) []MemorySugg
 				continue
 			}
 			seen[key] = true
-			name := suggestionName("", statement, fmt.Sprintf("memory-candidate-%d", len(out)+1))
+			name := stableSuggestionName(statement, "memory-candidate")
 			title := suggestionTitle(statement, "Memory candidate")
 			typ := inferMemoryType(statement)
 			out = append(out, MemorySuggestion{
@@ -238,6 +249,7 @@ func suggestMemories(set *memory.Set, sessions []suggestionSession) []MemorySugg
 				Title:       title,
 				Description: oneLine(statement),
 				Type:        string(typ),
+				Scope:       string(memory.FactScopeProject),
 				Body:        memoryCandidateBody(statement, reason, sess),
 				Reason:      reason,
 				Evidence:    []string{sessionEvidence(sess, statement)},
@@ -290,7 +302,7 @@ func existingMemoryText(set *memory.Set) []string {
 	for _, d := range set.Docs {
 		out = append(out, normalizeSuggestionKey(d.Body))
 	}
-	for _, f := range set.Store.List() {
+	for _, f := range set.Store.ListAll() {
 		out = append(out, normalizeSuggestionKey(strings.Join([]string{f.Name, f.Title, f.Description, f.Body}, " ")))
 	}
 	return out
@@ -431,10 +443,10 @@ func workflowEvidence(cat workflowCategory, sessions []suggestionSession) []stri
 	var evidence []string
 	for _, sess := range sessions {
 		for _, msg := range sess.Messages {
-			if msg.Role != provider.RoleUser {
+			if !agent.IsUserAuthoredTurnMessage(msg) {
 				continue
 			}
-			text := oneLine(msg.Content)
+			text := oneLine(agent.UserMessageText(msg))
 			if text == "" || !hasAny(strings.ToLower(text), cat.Keywords...) {
 				continue
 			}
@@ -473,22 +485,24 @@ func skillCandidateBody(cat workflowCategory, evidence []string) string {
 func skillStoreForWorkspace(workspaceRoot string) *skill.Store {
 	cfg, err := config.LoadForRoot(workspaceRoot)
 	var custom, excluded []string
+	var pluginPaths map[string][]string
+	var pluginAgentPaths map[string][]string
 	maxDepth := 3
 	if err == nil && cfg != nil {
 		custom = cfg.SkillCustomPaths()
 		excluded = cfg.SkillExcludedPaths()
+		pluginPaths = cfg.PluginPackageSkillOwners()
+		pluginAgentPaths = cfg.PluginPackageAgentOwners()
 		maxDepth = cfg.SkillMaxDepth()
 	}
 	return skill.New(skill.Options{
-		ProjectRoot:   strings.TrimSpace(workspaceRoot),
-		CustomPaths:   custom,
-		ExcludedPaths: excluded,
-		MaxDepth:      maxDepth,
+		ProjectRoot:      strings.TrimSpace(workspaceRoot),
+		CustomPaths:      custom,
+		PluginPaths:      pluginPaths,
+		PluginAgentPaths: pluginAgentPaths,
+		ExcludedPaths:    excluded,
+		MaxDepth:         maxDepth,
 	})
-}
-
-func renderSkillSuggestionFile(name, desc, body string) string {
-	return "---\nname: " + name + "\ndescription: " + desc + "\n---\n\n" + strings.TrimSpace(body) + "\n"
 }
 
 func suggestionName(given, source, fallback string) string {
@@ -502,6 +516,66 @@ func suggestionName(given, source, fallback string) string {
 		return name
 	}
 	return "candidate"
+}
+
+// acceptedSuggestionName preserves the candidate name generated at suggestion
+// time. Re-running asciiSlug here would truncate back to 56 chars and strip
+// the uniqueness hash suffix, re-colliding long common-prefix candidates at
+// save time even though their generated Name/ID differed. A well-formed slug
+// is kept verbatim (memory.Store.Save's own slug pass cleans but never
+// truncates); anything else falls back to deriving from the description as
+// before.
+func acceptedSuggestionName(given, desc string) string {
+	if isWellFormedSlug(given) {
+		return given
+	}
+	return suggestionName("", desc, "memory-candidate")
+}
+
+// isWellFormedSlug reports whether s already matches asciiSlug's output shape
+// (lowercase ASCII letters/digits separated by single dashes), possibly with a
+// hash suffix beyond asciiSlug's 56-char cap.
+func isWellFormedSlug(s string) bool {
+	if s == "" || len(s) > 128 || s[0] == '-' || s[len(s)-1] == '-' {
+		return false
+	}
+	prevDash := false
+	for _, r := range s {
+		switch {
+		case r >= 'a' && r <= 'z', r >= '0' && r <= '9':
+			prevDash = false
+		case r == '-':
+			if prevDash {
+				return false
+			}
+			prevDash = true
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+// stableSuggestionName returns a slug that is unique per source text and stable
+// across suggestion refreshes. asciiSlug drops non-ASCII runes and truncates to
+// 56 chars, so two CJK-only statements (or long English statements sharing a
+// prefix) can collide — colliding Names make Store.Save overwrite the earlier
+// memory, and colliding IDs cross-wire the frontend's accepted-state map.
+//
+// When the ASCII slug is short enough that truncation cannot have caused a
+// collision, it is returned as-is for backward compatibility with old-version
+// candidate names. The hash suffix is only appended when the slug fell back to
+// the fallback (non-ASCII source) or when the slug hit the 56-char truncation
+// boundary.
+func stableSuggestionName(source, fallback string) string {
+	slug := asciiSlug(source)
+	if slug != "" && len(slug) < 56 {
+		return slug
+	}
+	base := suggestionName("", source, fallback)
+	h := fnv.New32a()
+	_, _ = h.Write([]byte(source))
+	return fmt.Sprintf("%s-%08x", base, h.Sum32())
 }
 
 func asciiSlug(s string) string {

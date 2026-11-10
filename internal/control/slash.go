@@ -3,12 +3,10 @@ package control
 import (
 	"context"
 	"fmt"
-	"os"
 	"strconv"
 	"strings"
 
 	"reasonix/internal/config"
-	"reasonix/internal/hook"
 	"reasonix/internal/i18n"
 	"reasonix/internal/migration"
 	"reasonix/internal/pluginpkg"
@@ -38,58 +36,111 @@ type ArgData struct {
 	DisconnectedMCP []string
 	ModelRefs       []string
 	CurrentModel    string
+	EffortLevels    []string
 	ProviderNames   []string
 	CurrentProvider string
 	PluginNames     []string
+	MemoryRefs      []string
+	MemoryArchives  []string
 }
 
 // SlashArgItems completes the arguments of a management slash command
 // (everything after the command word). It returns the suggestions filtered by
 // the token being typed and the byte offset where that token begins, so a caller
 // replaces just that token. Only structured commands participate (/mcp /model
-// /skills /plugins /hooks /effort /auto-plan /goal /reasoning-language /memory-v5
-// /theme /language);
+// /skills /plugins /hooks /effort /goal /reasoning-language
+// /theme /language /currency /memory);
 // others yield nil. Single source of truth for CLI + desktop.
 func SlashArgItems(line string, d ArgData) ([]SlashItem, int) {
+	items, from, _ := SlashArgItemsLazy(line, func() ArgData { return d })
+	return items, from
+}
+
+// SlashArgItemsLazy is SlashArgItems with deferred dynamic data resolution.
+// The resolver is called only for a supported command whose suggestions depend
+// on ArgData, so free-form and static argument commands stay allocation-only.
+// The final result reports whether the command supports structured arguments,
+// even when filtering leaves no visible suggestions.
+func SlashArgItemsLazy(line string, resolve func() ArgData) ([]SlashItem, int, bool) {
 	cmdEnd := strings.IndexAny(line, " \t")
 	if cmdEnd < 0 {
-		return nil, 0
+		return nil, 0, false
 	}
 	from := strings.LastIndexAny(line, " \t") + 1
 	cur := line[from:]
 	prior := strings.Fields(line[:from]) // committed tokens, including the command word
+	data := func() ArgData {
+		if resolve == nil {
+			return ArgData{}
+		}
+		return resolve()
+	}
 	var raw []SlashItem
 	switch line[:cmdEnd] {
 	case "/mcp":
-		raw = mcpArgItems(prior, cur, d)
+		raw = mcpArgItems(prior, cur, data())
 	case "/model":
-		raw = modelArgItems(prior, d)
+		raw = modelArgItems(prior, data())
 	case "/provider":
-		raw = providerArgItems(prior, d)
+		raw = providerArgItems(prior, data())
 	case "/skill", "/skills":
-		raw = skillArgItems(prior, d)
+		raw = skillArgItems(prior, data())
 	case "/plugin", "/plugins":
-		raw = pluginArgItems(prior, d)
+		raw = pluginArgItems(prior, data())
 	case "/hooks":
 		raw = hooksArgItems(prior)
 	case "/effort":
-		raw = effortArgItems(prior, d)
-	case "/auto-plan":
-		raw = autoPlanArgItems(prior)
+		raw = effortArgItems(prior, data())
 	case "/goal":
 		raw = goalArgItems(prior)
 	case "/reasoning-language":
 		raw = reasoningLanguageArgItems(prior)
-	case "/memory-v5":
-		raw = memoryV5ArgItems(prior)
 	case "/theme":
 		raw = themeArgItems(prior)
 	case "/language":
 		raw = languageArgItems(prior)
+	case "/currency":
+		raw = currencyArgItems(prior)
+	case "/memory":
+		raw = memoryArgItems(prior, data())
 	default:
-		return nil, from
+		return nil, from, false
 	}
-	return filterSlash(raw, line, from, cur), from
+	return filterSlash(raw, line, from, cur), from, true
+}
+
+func memoryArgItems(prior []string, d ArgData) []SlashItem {
+	if len(prior) <= 1 {
+		return []SlashItem{
+			{Label: "recall", Insert: "recall", Hint: "show the latest automatic recall decision"},
+			{Label: "revisions", Insert: "revisions ", Hint: "show revision history", Descend: true},
+			{Label: "restore", Insert: "restore ", Hint: "restore an older revision", Descend: true},
+			{Label: "archived", Insert: "archived", Hint: "show archived facts"},
+			{Label: "recover", Insert: "recover ", Hint: "recover an archived fact", Descend: true},
+			{Label: "instructions", Insert: "instructions", Hint: "show precedence, imports, and diagnostics"},
+		}
+	}
+	switch prior[1] {
+	case "revisions", "restore":
+		if len(prior) != 2 {
+			return nil
+		}
+		items := make([]SlashItem, 0, len(d.MemoryRefs))
+		for _, ref := range d.MemoryRefs {
+			items = append(items, SlashItem{Label: ref, Insert: ref})
+		}
+		return items
+	case "recover":
+		if len(prior) != 2 {
+			return nil
+		}
+		items := make([]SlashItem, 0, len(d.MemoryArchives))
+		for _, path := range d.MemoryArchives {
+			items = append(items, SlashItem{Label: path, Insert: `"` + path + `"`})
+		}
+		return items
+	}
+	return nil
 }
 
 func goalArgItems(prior []string) []SlashItem {
@@ -97,20 +148,10 @@ func goalArgItems(prior []string) []SlashItem {
 		return nil
 	}
 	return []SlashItem{
-		{Label: "--research", Insert: "--research ", Hint: "force durable AutoResearch state"},
-		{Label: "--simple", Insert: "--simple ", Hint: "force lightweight Goal"},
-		{Label: "status", Insert: "status", Hint: "show active goal"},
+		{Label: "status", Insert: "status", Hint: "show active goal and budget runtime"},
+		{Label: "pause", Insert: "pause", Hint: "pause the running goal (keeps all state)"},
+		{Label: "resume", Insert: "resume", Hint: "resume a paused goal (adds one turn slice)"},
 		{Label: "clear", Insert: "clear", Hint: "stop goal mode"},
-	}
-}
-
-func autoPlanArgItems(prior []string) []SlashItem {
-	if len(prior) > 1 {
-		return nil
-	}
-	return []SlashItem{
-		{Label: "off", Insert: "off", Hint: "manual plan mode only"},
-		{Label: "on", Insert: "on", Hint: "auto-enter plan mode for complex tasks"},
 	}
 }
 
@@ -125,19 +166,6 @@ func reasoningLanguageArgItems(prior []string) []SlashItem {
 	}
 }
 
-func memoryV5ArgItems(prior []string) []SlashItem {
-	if len(prior) > 1 {
-		return nil
-	}
-	return []SlashItem{
-		{Label: "status", Insert: "status", Hint: "show current Memory v5 state"},
-		{Label: "off", Insert: "off", Hint: "disable Memory v5 for future turns"},
-		{Label: "observe", Insert: "observe", Hint: "learn without injecting IR"},
-		{Label: "compact", Insert: "compact", Hint: "inject compact execution contracts"},
-		{Label: "on", Insert: "on", Hint: "alias for compact"},
-	}
-}
-
 func languageArgItems(prior []string) []SlashItem {
 	if len(prior) > 1 {
 		return nil
@@ -146,6 +174,17 @@ func languageArgItems(prior []string) []SlashItem {
 		{Label: "auto", Insert: "auto", Hint: i18n.M.ArgLanguageAuto},
 		{Label: "en", Insert: "en", Hint: i18n.M.ArgLanguageEn},
 		{Label: "zh", Insert: "zh", Hint: i18n.M.ArgLanguageZh},
+	}
+}
+
+func currencyArgItems(prior []string) []SlashItem {
+	if len(prior) != 1 {
+		return nil
+	}
+	return []SlashItem{
+		{Label: "auto", Insert: "auto", Hint: "follow the resolved CLI locale"},
+		{Label: "CNY", Insert: "CNY", Hint: "Chinese yuan pricing"},
+		{Label: "USD", Insert: "USD", Hint: "US dollar pricing"},
 	}
 }
 
@@ -179,10 +218,8 @@ func themeArgItems(prior []string) []SlashItem {
 
 func effortArgItems(prior []string, d ArgData) []SlashItem {
 	if len(prior) <= 1 {
-		entry := currentEffortEntry(d)
-		cap := config.EffortCapabilityForEntry(entry)
 		var out []SlashItem
-		for _, level := range cap.Levels {
+		for _, level := range d.EffortLevels {
 			hint := ""
 			switch level {
 			case "auto":
@@ -203,18 +240,6 @@ func effortArgItems(prior []string, d ArgData) []SlashItem {
 		return out
 	}
 	return nil
-}
-
-func currentEffortEntry(d ArgData) *config.ProviderEntry {
-	if strings.TrimSpace(d.CurrentModel) == "" {
-		return nil
-	}
-	cfg, err := config.Load()
-	if err != nil {
-		return nil
-	}
-	entry, _ := cfg.ResolveModel(d.CurrentModel)
-	return entry
 }
 
 func mcpArgItems(prior []string, cur string, d ArgData) []SlashItem {
@@ -368,7 +393,6 @@ func hooksArgItems(prior []string) []SlashItem {
 	if len(prior) <= 1 {
 		return []SlashItem{
 			{Label: "list", Insert: "list", Hint: i18n.M.ArgHooksList},
-			{Label: "trust", Insert: "trust", Hint: i18n.M.ArgHooksTrust},
 		}
 	}
 	return nil
@@ -415,9 +439,8 @@ func (c *Controller) managementNotice(trimmed string) bool {
 			c.notice(c.providerListText())
 		}
 	case "/memory":
-		c.notice(c.memoryListText())
-	case "/memory-v5":
-		c.memoryV5Notice(fields)
+		args := strings.TrimSpace(strings.TrimPrefix(trimmed, fields[0]))
+		c.notice(MemoryCommandText(c, args))
 	case "/migrate", "/migration":
 		args := strings.TrimSpace(strings.TrimPrefix(trimmed, fields[0]))
 		migration.RunLegacyRescueCommand(args, c.sink)
@@ -473,7 +496,13 @@ func (c *Controller) managementNotice(trimmed string) bool {
 		if err := c.ReloadCommands(context.Background()); err != nil {
 			c.notice("reload-cmd: " + err.Error())
 		} else {
-			c.notice("commands reloaded (" + strconv.Itoa(len(c.Commands())) + " available)")
+			visible := 0
+			for _, cmd := range c.Commands() {
+				if !cmd.Hidden {
+					visible++
+				}
+			}
+			c.notice("commands reloaded (" + strconv.Itoa(visible) + " available)")
 		}
 	case "/hooks":
 		sub := ""
@@ -484,17 +513,10 @@ func (c *Controller) managementNotice(trimmed string) bool {
 		case "", "list", "ls":
 			c.notice(c.hookListText())
 		case "trust":
-			root := c.workspaceRoot
-			if root == "" {
-				root, _ = os.Getwd()
-			}
-			if err := hook.Trust(root, ""); err != nil {
-				c.notice("hooks trust: " + err.Error())
-			} else {
-				c.notice("trusted this project's hooks — restart Reasonix to load them")
-			}
+			// Backward-compatible response for old clients and saved commands.
+			c.notice("project hooks are enabled automatically; no trust action is required")
 		default:
-			c.notice("unknown /hooks subcommand " + fields[1] + " — try: /hooks, /hooks trust")
+			c.notice("unknown /hooks subcommand " + fields[1] + " — try: /hooks or /hooks list")
 		}
 	case "/mcp":
 		if len(fields) >= 3 && fields[1] == "connect" {
@@ -511,90 +533,6 @@ func (c *Controller) managementNotice(trimmed string) bool {
 		return false
 	}
 	return true
-}
-
-func (c *Controller) memoryV5Notice(fields []string) {
-	if len(fields) > 2 {
-		c.notice("usage: /memory-v5 off|observe|compact|on|status")
-		return
-	}
-	if len(fields) < 2 || strings.EqualFold(fields[1], "status") {
-		cfg, err := config.Load()
-		if err != nil {
-			c.notice("memory-v5: " + err.Error())
-			return
-		}
-		c.notice(fmt.Sprintf("memory-v5: %s (usage: /memory-v5 off|observe|compact|on|status)", memoryV5Mode(cfg.MemoryCompilerEnabled(), cfg.MemoryCompilerVerbosity())))
-		return
-	}
-	if c.Running() {
-		c.notice("finish or cancel the current turn before changing memory-v5")
-		return
-	}
-	setting, err := parseMemoryV5Setting(fields[1])
-	if err != nil {
-		c.notice("memory-v5: " + err.Error())
-		return
-	}
-	path := config.UserConfigPath()
-	if path == "" {
-		c.notice("memory-v5: cannot resolve config path")
-		return
-	}
-	// Lock only the load-modify-save cycle; the controller updates below run
-	// off-lock.
-	edit, err := func() (*config.Config, error) {
-		unlock := config.LockUserConfigEdits()
-		defer unlock()
-		edit := config.LoadForEdit(path)
-		if err := edit.SetMemoryCompilerEnabled(setting.enabled); err != nil {
-			return nil, err
-		}
-		if setting.setVerbosity {
-			if err := edit.SetMemoryCompilerVerbosity(setting.verbosity); err != nil {
-				return nil, err
-			}
-		}
-		if err := edit.SaveTo(path); err != nil {
-			return nil, err
-		}
-		return edit, nil
-	}()
-	if err != nil {
-		c.notice("memory-v5: " + err.Error())
-		return
-	}
-	c.SetMemoryCompilerEnabled(setting.enabled)
-	if setting.setVerbosity {
-		c.SetMemoryCompilerVerbosity(setting.verbosity)
-	}
-	c.notice(fmt.Sprintf("memory-v5 set to %s", memoryV5Mode(edit.MemoryCompilerEnabled(), edit.MemoryCompilerVerbosity())))
-}
-
-type memoryV5Setting struct {
-	enabled      bool
-	verbosity    string
-	setVerbosity bool
-}
-
-func parseMemoryV5Setting(mode string) (memoryV5Setting, error) {
-	switch strings.ToLower(strings.TrimSpace(mode)) {
-	case "off":
-		return memoryV5Setting{enabled: false}, nil
-	case "observe", "silent", "minimal":
-		return memoryV5Setting{enabled: true, verbosity: config.MemoryCompilerVerbosityObserve, setVerbosity: true}, nil
-	case "on", "compact", "inject", "contract":
-		return memoryV5Setting{enabled: true, verbosity: config.MemoryCompilerVerbosityCompact, setVerbosity: true}, nil
-	default:
-		return memoryV5Setting{}, fmt.Errorf("memory-v5 %q: must be off|observe|compact|on|status", mode)
-	}
-}
-
-func memoryV5Mode(enabled bool, verbosity string) string {
-	if !enabled {
-		return "off"
-	}
-	return config.NormalizeMemoryCompilerVerbosity(verbosity)
 }
 
 func (c *Controller) modelListText() string {
@@ -677,61 +615,8 @@ func (c *Controller) providerSwitchText(name string) string {
 	return fmt.Sprintf(i18n.M.ProviderUnknownFmt, name)
 }
 
-func (c *Controller) memoryListText() string {
-	mem := c.memory.current()
-	if mem == nil {
-		return i18n.M.ListMemoryNone
-	}
-	saved := mem.Store.List()
-	archived := mem.Store.ListArchived()
-	if len(mem.Docs) == 0 && len(saved) == 0 && len(archived) == 0 {
-		return i18n.M.ListMemoryNone
-	}
-	var b strings.Builder
-	if len(mem.Docs) > 0 {
-		b.WriteString(i18n.M.ListMemoryHeader + "\n")
-		for _, d := range mem.Docs {
-			fmt.Fprintf(&b, "  (%s) %s\n", d.Scope, d.Path)
-		}
-	}
-	if len(saved) > 0 {
-		if b.Len() > 0 {
-			b.WriteString("\n")
-		}
-		b.WriteString(i18n.M.ListMemorySaved + "\n")
-		for _, m := range saved {
-			fmt.Fprintf(&b, "  [%s](%s.md) (%s) %s\n", memoryDisplayTitle(m.Title, m.Name), m.Name, m.Type, memoryOneLine(m.Description))
-		}
-	}
-	if len(archived) > 0 {
-		if b.Len() > 0 {
-			b.WriteString("\n")
-		}
-		b.WriteString(i18n.M.ListMemoryArchived + "\n")
-		for _, m := range archived {
-			when := ""
-			if !m.ArchivedAt.IsZero() {
-				when = " — " + m.ArchivedAt.Format("2006-01-02 15:04:05Z")
-			}
-			fmt.Fprintf(&b, "  [%s](%s) (%s)%s %s\n", memoryDisplayTitle(m.Title, m.Name), m.Path, m.Type, when, memoryOneLine(m.Description))
-		}
-	}
-	return strings.TrimRight(b.String(), "\n")
-}
-
-func memoryDisplayTitle(title, name string) string {
-	if t := memoryOneLine(title); t != "" {
-		return t
-	}
-	return strings.ReplaceAll(name, "-", " ")
-}
-
-func memoryOneLine(s string) string {
-	return strings.Join(strings.Fields(s), " ")
-}
-
 func (c *Controller) skillListText() string {
-	skills := c.skills.discovered()
+	skills := c.skills.list()
 	if len(skills) == 0 {
 		return i18n.M.ListSkillsNone
 	}

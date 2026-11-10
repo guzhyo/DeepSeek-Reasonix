@@ -6,8 +6,6 @@ package installsource
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -67,6 +65,12 @@ type installSourceTool struct {
 	connectMCP   MCPConnector
 	onDisconnect OnDisconnectFunc
 	approval     ApprovalFunc
+	// preparePlugin overrides plugin source preparation in tests. nil uses
+	// preparePluginSource. Plan and apply both resolve the source through the
+	// same function, and git sources additionally report the resolved commit,
+	// so the capability set the approval covers is by construction the one
+	// that gets installed (apply pins the approved commit on divergence).
+	preparePlugin func(ctx context.Context, source, mode string) (root, commit string, cleanup func(), err error)
 }
 
 // NewTool returns a tool.Tool that callers register with the agent's
@@ -115,7 +119,7 @@ func NewTool(opts Options) tool.Tool {
 	}
 }
 
-func (*installSourceTool) Name() string   { return "install_source" }
+func (*installSourceTool) Name() string   { return tool.HostInstallSource }
 func (*installSourceTool) ReadOnly() bool { return false }
 
 func (*installSourceTool) Description() string {
@@ -182,9 +186,24 @@ func (t *installSourceTool) Execute(ctx context.Context, raw json.RawMessage) (s
 
 	actions, warnings, err := t.plan(ctx, req)
 	if err != nil {
+		if errors.Is(err, ErrNoCompatibleCapabilities) {
+			return marshalJSON(response{
+				OK: false, Status: "blocked", Op: req.Op, Applied: false,
+				Source: req.Source, Kind: "plugin", Scope: req.Scope, Mode: req.Mode,
+				Warnings: warnings, Error: err.Error(),
+				Next: "Choose a plugin that exports a supported skill, command, agent, hook, or MCP server.",
+			}), nil
+		}
 		return "", err
 	}
-	planID := computePlanID(req, actions)
+	// Marketplace planning may keep one temporary clone alive so apply can
+	// reuse the exact approved snapshot. Clean it on every exit path, including
+	// plan-ID mismatch or host approval denial before executeApply runs.
+	defer cleanupActionResources(actions)
+	planID, err := computePlanID(req, actions)
+	if err != nil {
+		return "", fmt.Errorf("create install approval identity: %w", err)
+	}
 	if len(actions) == 0 {
 		out := response{
 			OK:       false,
@@ -297,6 +316,15 @@ func (t *installSourceTool) executeApply(ctx context.Context, req request, actio
 		Warnings: warnings,
 		Next:     next,
 	})
+}
+
+func cleanupActionResources(actions []action) {
+	for i := range actions {
+		if actions[i].cleanup != nil {
+			actions[i].cleanup()
+			actions[i].cleanup = nil
+		}
+	}
 }
 
 // executeUninstall handles op=uninstall. It locates the named entry in the
@@ -607,8 +635,13 @@ func (t *installSourceTool) resolvePath(p string) string {
 // same plan. It intentionally excludes Apply and PlanID; everything that changes
 // what will be written/connected must live either in req's planning fields or in
 // the action DTO.
-func computePlanID(req request, actions []action) string {
+func computePlanID(req request, actions []action) (string, error) {
 	public := publicActions(actions)
+	// Approval binds the execution inputs, independently of display redaction.
+	for i := range actions {
+		public[i].Env = actions[i].Env
+		public[i].Headers = actions[i].Headers
+	}
 	sort.Slice(public, func(i, j int) bool {
 		return actionPlanKey(public[i]) < actionPlanKey(public[j])
 	})
@@ -645,10 +678,11 @@ func computePlanID(req request, actions []action) string {
 		Strict:    req.strict(),
 		Actions:   public,
 	}
-	body, _ := json.Marshal(payload)
-	h := sha256.New()
-	h.Write(body)
-	return "sha256:" + hex.EncodeToString(h.Sum(nil)[:16])
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return "", err
+	}
+	return config.ModelSettingsRequestDigest(body)
 }
 
 // kindCounts tallies the per-kind action count for the response. Skill
